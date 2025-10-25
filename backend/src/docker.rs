@@ -96,8 +96,16 @@ pub fn spawn_server_task(
         {
             set_status_with_context(&pool, server_id, "cloning", "preparing git build").await;
             match build::build_from_git(&pool, server_id, repo, branch).await {
-                Ok(Some(tag)) => {
-                    image = tag;
+                Ok(Some(artifacts)) => {
+                    if let Some(remote) = artifacts.registry_image.as_ref() {
+                        tracing::info!(
+                            target: "registry.push",
+                            %server_id,
+                            remote_image = %remote,
+                            "docker runtime will reuse pushed image",
+                        );
+                    }
+                    image = artifacts.local_image;
                 }
                 Ok(None) => {
                     return;

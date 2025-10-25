@@ -2,6 +2,7 @@ use crate::error::{AppError, AppResult};
 use crate::extractor::AuthUser;
 use crate::invocations::record_invocation;
 use crate::runtime::ContainerRuntime;
+use crate::telemetry::{validate_metric_details, Metric, MetricError};
 use axum::{
     extract::{Extension, Path},
     http::StatusCode,
@@ -60,14 +61,6 @@ pub struct LogEntry {
     pub id: i32,
     pub collected_at: chrono::DateTime<chrono::Utc>,
     pub log_text: String,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub struct Metric {
-    pub id: i32,
-    pub timestamp: chrono::DateTime<chrono::Utc>,
-    pub event_type: String,
-    pub details: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -204,20 +197,10 @@ mod tests {
             .details
             .as_ref()
             .expect("details should be preserved");
+        assert_eq!(details.get("attempt").and_then(Value::as_i64), Some(2));
+        assert_eq!(details.get("retry_limit").and_then(Value::as_i64), Some(5));
         assert_eq!(
-            details.get("attempt").and_then(Value::as_i64),
-            Some(2)
-        );
-        assert_eq!(
-            details
-                .get("retry_limit")
-                .and_then(Value::as_i64),
-            Some(5)
-        );
-        assert_eq!(
-            details
-                .get("registry_endpoint")
-                .and_then(Value::as_str),
+            details.get("registry_endpoint").and_then(Value::as_str),
             Some("registry.test/project")
         );
         assert_eq!(
@@ -229,10 +212,10 @@ mod tests {
             Some(false)
         );
 
-        let serialized = serde_json::to_string(&received)
-            .expect("metric serialization should succeed");
-        let round_trip: Value = serde_json::from_str(&serialized)
-            .expect("serialized metric should decode");
+        let serialized =
+            serde_json::to_string(&received).expect("metric serialization should succeed");
+        let round_trip: Value =
+            serde_json::from_str(&serialized).expect("serialized metric should decode");
         assert_eq!(round_trip["event_type"].as_str(), Some("push_failed"));
         assert_eq!(round_trip["details"]["attempt"].as_i64(), Some(2));
         assert_eq!(round_trip["details"]["retry_limit"].as_i64(), Some(5));
@@ -240,10 +223,7 @@ mod tests {
             round_trip["details"]["registry_endpoint"].as_str(),
             Some("registry.test/project")
         );
-        assert_eq!(
-            round_trip["details"]["auth_expired"].as_bool(),
-            Some(false)
-        );
+        assert_eq!(round_trip["details"]["auth_expired"].as_bool(), Some(false));
 
         METRIC_CHANNELS.remove(&server_id);
     }
@@ -725,7 +705,10 @@ pub async fn add_metric(
     server_id: i32,
     event_type: &str,
     details: Option<&serde_json::Value>,
-) -> Result<Metric, sqlx::Error> {
+) -> Result<Metric, MetricError> {
+    if let Err(err) = validate_metric_details(event_type, details) {
+        return Err(MetricError::Validation(err));
+    }
     let rec = sqlx::query(
         "INSERT INTO usage_metrics (server_id, event_type, details) VALUES ($1, $2, $3) RETURNING id, timestamp, event_type, details",
     )
@@ -733,7 +716,8 @@ pub async fn add_metric(
     .bind(event_type)
     .bind(details)
     .fetch_one(pool)
-    .await?;
+    .await
+    .map_err(MetricError::from)?;
     let metric = Metric {
         id: rec.get("id"),
         timestamp: rec.get("timestamp"),
@@ -801,12 +785,17 @@ pub async fn post_metric(
     let Some(_) = rec else {
         return Err(AppError::NotFound);
     };
-    add_metric(&pool, id, &payload.event_type, payload.details.as_ref())
-        .await
-        .map_err(|e| {
-            error!(?e, "DB error inserting metric");
-            AppError::Db(e)
-        })?;
+    match add_metric(&pool, id, &payload.event_type, payload.details.as_ref()).await {
+        Ok(_) => {}
+        Err(MetricError::Database(db_err)) => {
+            error!(?db_err, "DB error inserting metric");
+            return Err(AppError::Db(db_err));
+        }
+        Err(MetricError::Validation(validation)) => {
+            error!(?validation, "metric validation failed");
+            return Err(AppError::Message(validation.to_string()));
+        }
+    }
     Ok(StatusCode::CREATED)
 }
 

@@ -37,3 +37,18 @@
     - 2025-10-29 09:05:00 UTC: Audited build.rs retry loop to map insertion points for credential refresh hooks and metric emission.
     - 2025-10-29 10:10:00 UTC: Implemented shared Docker client guard, auth-refresh callbacks, and extended push_retry telemetry with auth-refresh context plus README/runbook updates.
     - 2025-10-29 11:00:00 UTC: Added unit tests covering refresh success/failure flows and recorded new metrics contracts before closing the task.
+- ID: BE-BUILD-006
+  Status: DONE
+  Task: Refactor Kubernetes runtime to reuse registry push pipeline with auth refresh support.
+  Hypothesis: Sharing the authenticated push helper between Docker and Kubernetes ensures consistent retries, telemetry, and secret refresh behaviour across runtimes.
+  Log:
+    - 2025-10-30 09:10:00 UTC: Extracted `BuildArtifacts` from `build_from_git`, teaching Docker to consume the local image while surfacing remote tags.
+    - 2025-10-30 10:05:00 UTC: Updated Kubernetes runtime to require registry pushes for git builds, patch image pull secrets after refresh, and document the new env vars.
+    - 2025-10-30 11:20:00 UTC: Added shared auth refresh outcome plumbing and regression tests before marking parity complete.
+- ID: BE-OBS-001
+  Status: DONE
+  Task: Add contract tests and schema guards for telemetry APIs.
+  Hypothesis: Snapshot-style tests for REST and SSE endpoints will prevent schema drift for registry metrics as new fields ship.
+  Log:
+    - 2025-10-30 09:45:00 UTC: Introduced telemetry module with schema validation and wired it into `add_metric` for defensive checks.
+    - 2025-10-30 11:45:00 UTC: Landed integration tests for REST and SSE payloads plus README updates documenting the guardrails.

@@ -1,4 +1,7 @@
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as Base64Engine;
+use base64::Engine;
+use chrono::Utc;
 use sqlx::PgPool;
 use tokio::sync::mpsc::Receiver;
 
@@ -80,7 +83,7 @@ impl ContainerRuntime for KubernetesRuntime {
     ) {
         use k8s_openapi::api::core::v1 as corev1;
         use kube::{
-            api::{DeleteParams, PostParams},
+            api::{DeleteParams, Patch, PatchParams, PostParams},
             Api,
         };
         use std::collections::BTreeMap;
@@ -116,8 +119,73 @@ impl ContainerRuntime for KubernetesRuntime {
                     tracing::error!(?err, %server_id, "failed to set status to cloning");
                 }
                 match crate::build::build_from_git(&pool, server_id, repo, branch).await {
-                    Ok(Some(tag)) => {
-                        image = tag;
+                    Ok(Some(artifacts)) => {
+                        if let Some(remote_image) = artifacts.registry_image {
+                            if artifacts.auth_refresh_attempted && artifacts.auth_refresh_succeeded
+                            {
+                                if let (Some(secret_name), Some(config_path)) = (
+                                    crate::config::K8S_REGISTRY_SECRET_NAME.as_ref(),
+                                    crate::config::REGISTRY_AUTH_DOCKERCONFIG.as_ref(),
+                                ) {
+                                    match sync_image_pull_secret(
+                                        client.clone(),
+                                        &namespace,
+                                        secret_name,
+                                        config_path,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            tracing::info!(
+                                                target: "registry.push",
+                                                %server_id,
+                                                secret = %secret_name,
+                                                "kubernetes pull secret synchronized after auth refresh",
+                                            );
+                                        }
+                                        Err(err) => {
+                                            tracing::error!(
+                                                ?err,
+                                                %server_id,
+                                                secret = %secret_name,
+                                                "failed to sync kubernetes registry secret",
+                                            );
+                                            let _ = sqlx::query(
+                                                "INSERT INTO server_logs (server_id, log_text) VALUES ($1, $2)",
+                                            )
+                                            .bind(server_id)
+                                            .bind("Registry credentials refreshed but Kubernetes secret sync failed")
+                                            .execute(&pool)
+                                            .await;
+                                        }
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        %server_id,
+                                        "registry credentials refreshed but K8S_REGISTRY_SECRET_NAME or REGISTRY_AUTH_DOCKERCONFIG not configured",
+                                    );
+                                }
+                            }
+                            image = remote_image;
+                        } else {
+                            tracing::error!(
+                                %server_id,
+                                "kubernetes runtime requires registry push but no registry image was produced",
+                            );
+                            let _ = sqlx::query(
+                                "INSERT INTO server_logs (server_id, log_text) VALUES ($1, $2)",
+                            )
+                            .bind(server_id)
+                            .bind("Kubernetes runtime requires REGISTRY to be configured for git builds")
+                            .execute(&pool)
+                            .await;
+                            if let Err(err) =
+                                crate::servers::set_status(&pool, server_id, "error").await
+                            {
+                                tracing::error!(?err, %server_id, "failed to set error status after missing registry image");
+                            }
+                            return;
+                        }
                     }
                     Ok(None) => {
                         return;
@@ -363,4 +431,40 @@ impl ContainerRuntime for KubernetesRuntime {
         });
         Some(rx)
     }
+}
+
+async fn sync_image_pull_secret(
+    client: kube::Client,
+    namespace: &str,
+    secret_name: &str,
+    dockerconfig_path: &str,
+) -> anyhow::Result<()> {
+    use k8s_openapi::api::core::v1::Secret;
+    use kube::api::{Api, Patch, PatchParams};
+
+    let contents = tokio::fs::read(dockerconfig_path).await.map_err(|err| {
+        anyhow::anyhow!(
+            "failed to read docker config from {}: {}",
+            dockerconfig_path,
+            err
+        )
+    })?;
+    let encoded = Base64Engine.encode(contents);
+    let patch = serde_json::json!({
+        "data": {
+            ".dockerconfigjson": encoded,
+        },
+        "type": "kubernetes.io/dockerconfigjson",
+        "metadata": {
+            "annotations": {
+                "mcp.anycontext.dev/registry-synced-at": Utc::now().to_rfc3339(),
+            }
+        }
+    });
+
+    let secrets: Api<Secret> = Api::namespaced(client, namespace);
+    secrets
+        .patch(secret_name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
+    Ok(())
 }
