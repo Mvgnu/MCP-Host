@@ -649,3 +649,4 @@ This document tracks development progress and high level notes from the planning
 - Replaced Docker CLI tagging/pushing with Bollard APIs that stream registry progress into build logs.
 - Registry failures now bubble structured errors so build status flips to error with actionable messaging.
 - Introduced a logging sink trait and registry push tests to cover success and failure flows.
+- Hardened registry push telemetry with scope-aware tracing, digest logging, and retry logic plus auth-expiration handling tests.

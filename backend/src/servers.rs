@@ -1,25 +1,26 @@
-use crate::runtime::ContainerRuntime;
+use crate::error::{AppError, AppResult};
 use crate::extractor::AuthUser;
+use crate::invocations::record_invocation;
+use crate::runtime::ContainerRuntime;
 use axum::{
     extract::{Extension, Path},
     http::StatusCode,
     response::sse::{Event, Sse},
     Json,
 };
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use once_cell::sync::Lazy;
-use dashmap::DashMap;
-use tokio::sync::broadcast;
-use serde_json;
+use reqwest;
 use serde::{Deserialize, Serialize};
+use serde_json;
 use sqlx::{PgPool, Row};
 use std::convert::Infallible;
+use thiserror::Error;
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tracing::error;
-use crate::error::{AppError, AppResult};
-use crate::invocations::record_invocation;
 use uuid::Uuid;
-use reqwest;
 
 #[derive(Serialize)]
 pub struct Server {
@@ -83,7 +84,25 @@ pub struct StatusUpdate {
     pub status: String,
 }
 
-static STATUS_CHANNELS: Lazy<DashMap<i32, broadcast::Sender<StatusUpdate>>> = Lazy::new(DashMap::new);
+static STATUS_CHANNELS: Lazy<DashMap<i32, broadcast::Sender<StatusUpdate>>> =
+    Lazy::new(DashMap::new);
+
+#[derive(Debug, Error)]
+pub enum SetStatusError {
+    #[error("failed to update status for server {server_id} to {status}: {source}")]
+    Database {
+        #[source]
+        source: sqlx::Error,
+        server_id: i32,
+        status: String,
+    },
+}
+
+async fn set_status_guard(pool: &PgPool, server_id: i32, status: &str, context: &str) {
+    if let Err(err) = set_status(pool, server_id, status).await {
+        error!(?err, %server_id, status = %status, context, "failed to persist status update");
+    }
+}
 
 fn subscribe_status(user_id: i32) -> broadcast::Receiver<StatusUpdate> {
     use dashmap::mapref::entry::Entry;
@@ -109,22 +128,27 @@ fn subscribe_metrics(server_id: i32) -> broadcast::Receiver<Metric> {
     }
 }
 
-pub async fn set_status(pool: &PgPool, server_id: i32, status: &str) {
-    if let Ok(row) = sqlx::query(
-        "UPDATE mcp_servers SET status = $1 WHERE id = $2 RETURNING owner_id",
-    )
-    .bind(status)
-    .bind(server_id)
-    .fetch_one(pool)
-    .await
-    {
-        let owner_id: i32 = row.get("owner_id");
-        if let Some(tx) = STATUS_CHANNELS.get(&owner_id) {
-            let _ = tx.send(StatusUpdate { id: server_id, status: status.into() });
-        }
-    } else {
-        tracing::error!(server_id, status, "failed to update status");
+pub async fn set_status(pool: &PgPool, server_id: i32, status: &str) -> Result<(), SetStatusError> {
+    let row = sqlx::query("UPDATE mcp_servers SET status = $1 WHERE id = $2 RETURNING owner_id")
+        .bind(status)
+        .bind(server_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|source| SetStatusError::Database {
+            source,
+            server_id,
+            status: status.to_string(),
+        })?;
+
+    let owner_id: i32 = row.get("owner_id");
+    if let Some(tx) = STATUS_CHANNELS.get(&owner_id) {
+        let _ = tx.send(StatusUpdate {
+            id: server_id,
+            status: status.into(),
+        });
     }
+
+    Ok(())
 }
 
 pub async fn list_servers(
@@ -132,19 +156,19 @@ pub async fn list_servers(
     AuthUser { user_id, role }: AuthUser,
 ) -> AppResult<Json<Vec<Server>>> {
     let query = if role == "admin" {
-        sqlx::query("SELECT id, name, server_type, status, use_gpu, organization_id FROM mcp_servers")
-            .fetch_all(&pool)
+        sqlx::query(
+            "SELECT id, name, server_type, status, use_gpu, organization_id FROM mcp_servers",
+        )
+        .fetch_all(&pool)
     } else {
         sqlx::query("SELECT id, name, server_type, status, use_gpu, organization_id FROM mcp_servers WHERE owner_id = $1")
             .bind(user_id)
             .fetch_all(&pool)
     };
-    let rows = query
-        .await
-        .map_err(|e| {
-            error!(?e, "DB error listing servers");
-            AppError::Db(e)
-        })?;
+    let rows = query.await.map_err(|e| {
+        error!(?e, "DB error listing servers");
+        AppError::Db(e)
+    })?;
     let servers = rows
         .into_iter()
         .map(|r| Server {
@@ -244,7 +268,7 @@ pub async fn create_server(
     Ok(Json(info))
 }
 
-use crate::job_queue::{Job, enqueue_job};
+use crate::job_queue::{enqueue_job, Job};
 
 pub async fn start_server(
     Extension(pool): Extension<PgPool>,
@@ -277,7 +301,7 @@ pub async fn start_server(
     let api_key: String = rec.get("api_key");
     let use_gpu: bool = rec.get("use_gpu");
 
-    set_status(&pool, id, "starting").await;
+    set_status_guard(&pool, id, "starting", "user start request").await;
 
     let job = Job::Start {
         server_id: id,
@@ -315,7 +339,7 @@ pub async fn stop_server(
         return Err(AppError::BadRequest("Server not running".into()));
     }
 
-    set_status(&pool, id, "stopping").await;
+    set_status_guard(&pool, id, "stopping", "user stop request").await;
 
     let job = Job::Stop { server_id: id };
     enqueue_job(&pool, &job).await;
@@ -374,7 +398,7 @@ pub async fn redeploy_server(
     let api_key: String = rec.get("api_key");
     let use_gpu: bool = rec.get("use_gpu");
 
-    set_status(&pool, id, "redeploying").await;
+    set_status_guard(&pool, id, "redeploying", "user redeploy request").await;
 
     let job = Job::Start {
         server_id: id,
@@ -421,7 +445,7 @@ pub async fn webhook_redeploy(
     let api_key: String = rec.get("api_key");
     let use_gpu: bool = rec.get("use_gpu");
 
-    set_status(&pool, id, "redeploying").await;
+    set_status_guard(&pool, id, "redeploying", "webhook redeploy request").await;
 
     let job = Job::Start {
         server_id: id,
@@ -466,12 +490,10 @@ pub async fn github_webhook(
         .get("x-hub-signature-256")
         .or_else(|| headers.get("x-hub-signature"))
         .ok_or(AppError::BadRequest("Missing signature".into()))?;
-    let sig = sig_header
-        .to_str()
-        .map_err(|e| {
-            error!(?e, "Signature parse error");
-            AppError::BadRequest("Bad signature".into())
-        })?;
+    let sig = sig_header.to_str().map_err(|e| {
+        error!(?e, "Signature parse error");
+        AppError::BadRequest("Bad signature".into())
+    })?;
     let expected = {
         let mut mac =
             Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC can use any key length");
@@ -482,11 +504,7 @@ pub async fn github_webhook(
         return Err(AppError::Unauthorized);
     }
 
-    if headers
-        .get("x-github-event")
-        .and_then(|v| v.to_str().ok())
-        != Some("push")
-    {
+    if headers.get("x-github-event").and_then(|v| v.to_str().ok()) != Some("push") {
         return Ok(StatusCode::OK); // ignore other events
     }
 
@@ -495,7 +513,7 @@ pub async fn github_webhook(
     let api_key: String = rec.get("api_key");
     let use_gpu: bool = rec.get("use_gpu");
 
-    set_status(&pool, id, "redeploying").await;
+    set_status_guard(&pool, id, "redeploying", "github webhook").await;
 
     let job = Job::Start {
         server_id: id,
@@ -583,8 +601,7 @@ pub async fn stream_logs(
     Extension(runtime): Extension<std::sync::Arc<dyn ContainerRuntime>>,
     AuthUser { user_id, .. }: AuthUser,
     Path(id): Path<i32>,
-) -> AppResult<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>>
-{
+) -> AppResult<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>> {
     let rec = sqlx::query("SELECT id FROM mcp_servers WHERE id = $1 AND owner_id = $2")
         .bind(id)
         .bind(user_id)
@@ -715,15 +732,13 @@ pub async fn stream_metrics(
     let rx = subscribe_metrics(id);
     let stream = BroadcastStream::new(rx).filter_map(|res| async move {
         match res {
-            Ok(metric) => {
-                match serde_json::to_string(&metric) {
-                    Ok(data) => Some(Ok(Event::default().data(data))),
-                    Err(e) => {
-                        tracing::error!(?e, "metric serialization failed");
-                        None
-                    }
+            Ok(metric) => match serde_json::to_string(&metric) {
+                Ok(data) => Some(Ok(Event::default().data(data))),
+                Err(e) => {
+                    tracing::error!(?e, "metric serialization failed");
+                    None
                 }
-            }
+            },
             Err(_) => None,
         }
     });
@@ -823,33 +838,31 @@ pub async fn client_config(
     AuthUser { user_id, .. }: AuthUser,
     Path(id): Path<i32>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let row = sqlx::query(
-        "SELECT api_key, manifest FROM mcp_servers WHERE id = $1 AND owner_id = $2",
-    )
-    .bind(id)
-    .bind(user_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| {
-            error!(?e, "DB error fetching API key");
-            AppError::Db(e)
-        })?;
+    let row =
+        sqlx::query("SELECT api_key, manifest FROM mcp_servers WHERE id = $1 AND owner_id = $2")
+            .bind(id)
+            .bind(user_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| {
+                error!(?e, "DB error fetching API key");
+                AppError::Db(e)
+            })?;
     let Some(row) = row else {
         return Err(AppError::NotFound);
     };
     let api_key: String = row.get("api_key");
     let manifest: Option<serde_json::Value> = row.try_get("manifest").ok();
 
-    let domain_row = sqlx::query(
-        "SELECT domain FROM custom_domains WHERE server_id = $1 ORDER BY id LIMIT 1",
-    )
-    .bind(id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!(?e, "DB error fetching custom domain");
-        AppError::Db(e)
-    })?;
+    let domain_row =
+        sqlx::query("SELECT domain FROM custom_domains WHERE server_id = $1 ORDER BY id LIMIT 1")
+            .bind(id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| {
+                error!(?e, "DB error fetching custom domain");
+                AppError::Db(e)
+            })?;
     let invoke_url = if let Some(domain_row) = domain_row {
         let domain: String = domain_row.get("domain");
         format!("https://{}/invoke", domain)
@@ -882,7 +895,9 @@ pub async fn invoke_server_internal(
             error!(?e, "DB error verifying server ownership");
             (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
         })?;
-    let Some(rec) = rec else { return Err((StatusCode::NOT_FOUND, "Server not found".into())); };
+    let Some(rec) = rec else {
+        return Err((StatusCode::NOT_FOUND, "Server not found".into()));
+    };
     let api_key: String = rec.get("api_key");
     let client = reqwest::Client::new();
     match client

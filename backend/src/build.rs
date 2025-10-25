@@ -14,6 +14,7 @@ use std::path::Path;
 use tar::Builder as TarBuilder;
 use tempfile::tempdir;
 use tokio::fs;
+use tokio::time::{sleep, Duration};
 
 #[derive(Clone, Copy)]
 enum LangBuilder {
@@ -46,6 +47,7 @@ enum RegistryPushError {
     Tag(bollard::errors::Error),
     Push(bollard::errors::Error),
     Remote(String),
+    AuthExpired(String),
 }
 
 impl fmt::Display for RegistryPushError {
@@ -54,8 +56,55 @@ impl fmt::Display for RegistryPushError {
             RegistryPushError::Tag(err) => write!(f, "docker tag failed: {err}"),
             RegistryPushError::Push(err) => write!(f, "docker push failed: {err}"),
             RegistryPushError::Remote(msg) => write!(f, "registry rejected image: {msg}"),
+            RegistryPushError::AuthExpired(msg) => {
+                write!(f, "registry authentication expired: {msg}")
+            }
         }
     }
+}
+
+const DEFAULT_REGISTRY_PUSH_RETRIES: usize = 3;
+
+fn registry_push_retry_limit() -> usize {
+    std::env::var("REGISTRY_PUSH_RETRIES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_REGISTRY_PUSH_RETRIES)
+}
+
+fn registry_scopes(repository: &str) -> Vec<String> {
+    vec![
+        format!("repository:{repository}:push"),
+        format!("repository:{repository}:pull"),
+    ]
+}
+
+fn is_retryable_push_error(err: &bollard::errors::Error) -> bool {
+    use bollard::errors::Error;
+    matches!(
+        err,
+        Error::IOError { .. }
+            | Error::HyperResponseError { .. }
+            | Error::HttpClientError { .. }
+            | Error::RequestTimeoutError
+    )
+}
+
+fn should_refresh_auth(detail_code: Option<i64>, message: Option<&str>) -> bool {
+    matches!(detail_code, Some(401) | Some(403))
+        || message
+            .map(|msg| msg.contains("authentication required") || msg.contains("token has expired"))
+            .unwrap_or(false)
+}
+
+fn extract_digest(line: &str) -> Option<String> {
+    line.split("digest:")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .map(|digest| digest.trim_matches(','))
+        .filter(|digest| digest.starts_with("sha256:"))
+        .map(ToString::to_string)
 }
 
 fn dockerfile_exposes_8080(content: &str) -> bool {
@@ -121,6 +170,8 @@ impl BuildLogSink for PgPool {
 async fn stream_push_progress<L, S>(
     logger: &L,
     server_id: i32,
+    registry_endpoint: &str,
+    scopes: &[String],
     mut stream: S,
 ) -> Result<(), RegistryPushError>
 where
@@ -131,17 +182,39 @@ where
         match item {
             Ok(info) => {
                 if let Some(detail) = info.error_detail {
-                    let message = detail
-                        .message
-                        .unwrap_or_else(|| "Unknown registry error".to_string());
-                    let message = if let Some(code) = detail.code {
-                        format!("{message} (code {code})")
+                    let detail_code = detail.code;
+                    let detail_message = detail.message.clone();
+                    let base_message = detail_message
+                        .as_deref()
+                        .unwrap_or("Unknown registry error")
+                        .to_string();
+                    if should_refresh_auth(detail_code, detail_message.as_deref()) {
+                        return Err(RegistryPushError::AuthExpired(base_message));
+                    }
+                    let message = if let Some(code) = detail_code {
+                        format!("{base_message} (code {code})")
                     } else {
-                        message
+                        base_message
                     };
+                    tracing::error!(
+                        target: "registry.push",
+                        %registry_endpoint,
+                        %server_id,
+                        scopes = ?scopes,
+                        %message,
+                        "registry error detail"
+                    );
                     return Err(RegistryPushError::Remote(message));
                 }
                 if let Some(error) = info.error {
+                    tracing::error!(
+                        target: "registry.push",
+                        %registry_endpoint,
+                        %server_id,
+                        scopes = ?scopes,
+                        %error,
+                        "registry returned error"
+                    );
                     return Err(RegistryPushError::Remote(error));
                 }
                 if let Some(status) = info.status {
@@ -156,15 +229,127 @@ where
                         }
                     }
                     if !line.is_empty() {
+                        if let Some(digest) = extract_digest(&line) {
+                            let digest_message = format!("Manifest published with digest {digest}");
+                            tracing::info!(
+                                target: "registry.push",
+                                %registry_endpoint,
+                                %server_id,
+                                scopes = ?scopes,
+                                %digest,
+                                "registry reported digest"
+                            );
+                            insert_log(logger, server_id, &digest_message).await;
+                        }
+                        tracing::info!(
+                            target: "registry.push",
+                            %registry_endpoint,
+                            %server_id,
+                            scopes = ?scopes,
+                            status = %line,
+                            "registry push status"
+                        );
                         insert_log(logger, server_id, &line).await;
                     }
                 }
             }
-            Err(err) => return Err(RegistryPushError::Push(err)),
+            Err(err) => {
+                tracing::warn!(
+                    target: "registry.push",
+                    %registry_endpoint,
+                    %server_id,
+                    scopes = ?scopes,
+                    error = %err,
+                    "registry push stream error"
+                );
+                return Err(RegistryPushError::Push(err));
+            }
         }
     }
 
     Ok(())
+}
+
+async fn push_stream_with_retry<L, F, S>(
+    logger: &L,
+    server_id: i32,
+    registry_endpoint: &str,
+    scopes: &[String],
+    mut make_stream: F,
+    retry_limit: usize,
+) -> Result<(), RegistryPushError>
+where
+    L: BuildLogSink + ?Sized,
+    F: FnMut() -> S,
+    S: futures_util::Stream<Item = Result<PushImageInfo, bollard::errors::Error>> + Unpin,
+{
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        tracing::info!(
+            target: "registry.push",
+            %registry_endpoint,
+            %server_id,
+            scopes = ?scopes,
+            attempt,
+            retry_limit,
+            "starting registry push attempt"
+        );
+        insert_log(
+            logger,
+            server_id,
+            &format!("Registry push attempt {attempt}/{retry_limit} for {registry_endpoint}"),
+        )
+        .await;
+
+        match stream_push_progress(logger, server_id, registry_endpoint, scopes, make_stream())
+            .await
+        {
+            Ok(()) => {
+                if attempt > 1 {
+                    tracing::info!(
+                        target: "registry.push",
+                        %registry_endpoint,
+                        %server_id,
+                        scopes = ?scopes,
+                        attempt,
+                        "registry push succeeded after retry"
+                    );
+                }
+                return Ok(());
+            }
+            Err(RegistryPushError::Push(err))
+                if attempt < retry_limit && is_retryable_push_error(&err) =>
+            {
+                tracing::warn!(
+                    target: "registry.push",
+                    %registry_endpoint,
+                    %server_id,
+                    scopes = ?scopes,
+                    attempt,
+                    retry_limit,
+                    error = %err,
+                    "retryable registry push error"
+                );
+                let backoff = Duration::from_millis(100 * attempt as u64);
+                sleep(backoff).await;
+                continue;
+            }
+            Err(err) => {
+                tracing::error!(
+                    target: "registry.push",
+                    %registry_endpoint,
+                    %server_id,
+                    scopes = ?scopes,
+                    attempt,
+                    retry_limit,
+                    error = %err,
+                    "registry push failed"
+                );
+                return Err(err);
+            }
+        }
+    }
 }
 
 async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
@@ -175,12 +360,21 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
     registry: &str,
 ) -> Result<(), RegistryPushError> {
     let reference = build_registry_reference(registry, image_tag);
+    let scopes = registry_scopes(&reference.repository);
     insert_log(
         logger,
         server_id,
         &format!("Tagging image as {}", reference.display_name()),
     )
     .await;
+    tracing::info!(
+        target: "registry.push",
+        registry_endpoint = %reference.repository,
+        %server_id,
+        scopes = ?scopes,
+        tag = %reference.tag,
+        "tagging image for registry push"
+    );
 
     let tag_opts = TagImageOptionsBuilder::new()
         .repo(&reference.repository)
@@ -192,16 +386,54 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
         .map_err(RegistryPushError::Tag)?;
 
     insert_log(logger, server_id, "Pushing image to registry").await;
-    let push_opts = PushImageOptionsBuilder::new().tag(&reference.tag).build();
-    let stream = docker.push_image(&reference.repository, Some(push_opts), None);
-    stream_push_progress(logger, server_id, stream).await?;
+    tracing::info!(
+        target: "registry.push",
+        registry_endpoint = %reference.repository,
+        %server_id,
+        scopes = ?scopes,
+        tag = %reference.tag,
+        "starting registry push"
+    );
+
+    let retry_limit = registry_push_retry_limit();
+    push_stream_with_retry(
+        logger,
+        server_id,
+        &reference.repository,
+        &scopes,
+        || {
+            let push_opts = PushImageOptionsBuilder::new().tag(&reference.tag).build();
+            docker.push_image(&reference.repository, Some(push_opts), None)
+        },
+        retry_limit,
+    )
+    .await?;
+
     insert_log(logger, server_id, "Image pushed to registry").await;
+    tracing::info!(
+        target: "registry.push",
+        registry_endpoint = %reference.repository,
+        %server_id,
+        scopes = ?scopes,
+        "registry push completed"
+    );
 
     Ok(())
 }
 
 async fn insert_log<L: BuildLogSink + ?Sized>(logger: &L, server_id: i32, text: &str) {
     logger.log(server_id, text).await;
+}
+
+async fn set_status_or_log(pool: &PgPool, server_id: i32, status: &str) {
+    if let Err(err) = set_status(pool, server_id, status).await {
+        tracing::error!(
+            ?err,
+            %server_id,
+            status = %status,
+            "failed to update server status after build operation"
+        );
+    }
 }
 
 /// Clone a git repository and build a Docker image.
@@ -217,7 +449,7 @@ pub async fn build_from_git(
         Ok(t) => t,
         Err(e) => {
             tracing::error!(?e, "tempdir failed");
-            set_status(pool, server_id, "error").await;
+            set_status_or_log(pool, server_id, "error").await;
             insert_log(pool, server_id, "Failed to create build dir").await;
             return None;
         }
@@ -238,7 +470,7 @@ pub async fn build_from_git(
     {
         tracing::error!(?e, "git clone failed");
         insert_log(pool, server_id, "Git clone failed").await;
-        set_status(pool, server_id, "error").await;
+        set_status_or_log(pool, server_id, "error").await;
         return None;
     }
 
@@ -260,7 +492,7 @@ pub async fn build_from_git(
         Err(e) => {
             tracing::error!(?e, "Failed to connect to Docker");
             insert_log(pool, server_id, "Docker connection failed").await;
-            set_status(pool, server_id, "error").await;
+            set_status_or_log(pool, server_id, "error").await;
             return None;
         }
     };
@@ -281,7 +513,7 @@ pub async fn build_from_git(
         Err(e) => {
             tracing::error!(?e, "Failed to create tar");
             insert_log(pool, server_id, "Failed to create build context").await;
-            set_status(pool, server_id, "error").await;
+            set_status_or_log(pool, server_id, "error").await;
             return None;
         }
     };
@@ -307,7 +539,7 @@ pub async fn build_from_git(
             Err(e) => {
                 tracing::error!(?e, "docker build error");
                 insert_log(pool, server_id, "Image build failed").await;
-                set_status(pool, server_id, "error").await;
+                set_status_or_log(pool, server_id, "error").await;
                 return None;
             }
         }
@@ -330,7 +562,7 @@ pub async fn build_from_git(
             {
                 tracing::error!(?err, %registry, %server_id, "registry push failed");
                 insert_log(pool, server_id, &format!("Registry push failed: {err}")).await;
-                set_status(pool, server_id, "error").await;
+                set_status_or_log(pool, server_id, "error").await;
                 return None;
             }
         }
@@ -420,9 +652,15 @@ mod tests {
             }),
         ];
 
-        stream_push_progress(&logger, 7, stream::iter(entries))
-            .await
-            .expect("stream should complete");
+        stream_push_progress(
+            &logger,
+            7,
+            "test/example",
+            &["scope".to_string()],
+            stream::iter(entries),
+        )
+        .await
+        .expect("stream should complete");
 
         let messages = logger.messages().await;
         assert!(messages.iter().any(|m| m.contains("Preparing 1/2")));
@@ -437,9 +675,15 @@ mod tests {
             ..Default::default()
         })];
 
-        let err = stream_push_progress(&logger, 7, stream::iter(entries))
-            .await
-            .expect_err("expected remote error");
+        let err = stream_push_progress(
+            &logger,
+            7,
+            "test/example",
+            &["scope".to_string()],
+            stream::iter(entries),
+        )
+        .await
+        .expect_err("expected remote error");
 
         match err {
             RegistryPushError::Remote(msg) => assert!(msg.contains("denied")),
@@ -455,16 +699,100 @@ mod tests {
             code: Some(401),
             message: Some("authentication required".to_string()),
         });
-        let err = stream_push_progress(&logger, 7, stream::iter(vec![Ok(info)]))
-            .await
-            .expect_err("expected detail error");
+        let err = stream_push_progress(
+            &logger,
+            7,
+            "test/example",
+            &["scope".to_string()],
+            stream::iter(vec![Ok(info)]),
+        )
+        .await
+        .expect_err("expected detail error");
 
         match err {
-            RegistryPushError::Remote(msg) => {
-                assert!(msg.contains("authentication required"));
-                assert!(msg.contains("401"));
-            }
+            RegistryPushError::AuthExpired(msg) => assert!(msg.contains("authentication required")),
             other => panic!("expected remote error detail, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn stream_progress_logs_digest_from_status() {
+        let logger = RecordingLog::default();
+        stream_push_progress(
+            &logger,
+            42,
+            "registry.test/example",
+            &["scope".to_string()],
+            stream::iter(vec![Ok(PushImageInfo {
+                status: Some("latest: digest: sha256:abc123 size: 123".to_string()),
+                ..Default::default()
+            })]),
+        )
+        .await
+        .expect("digest status should succeed");
+
+        let messages = logger.messages().await;
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("Manifest published with digest sha256:abc123")));
+    }
+
+    #[tokio::test]
+    async fn retryable_push_errors_are_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let logger = RecordingLog::default();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+        let scopes = vec!["scope".to_string()];
+
+        push_stream_with_retry(
+            &logger,
+            99,
+            "registry.test/example",
+            &scopes,
+            move || {
+                let attempt = counter_clone.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    stream::iter(vec![Err(bollard::errors::Error::IOError {
+                        err: std::io::Error::new(std::io::ErrorKind::Interrupted, "network hiccup"),
+                    })])
+                } else {
+                    stream::iter(vec![Ok(PushImageInfo {
+                        status: Some("Done".to_string()),
+                        ..Default::default()
+                    })])
+                }
+            },
+            3,
+        )
+        .await
+        .expect("retry should eventually succeed");
+
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_push_errors_bubble() {
+        let logger = RecordingLog::default();
+        let scopes = vec!["scope".to_string()];
+        let err = push_stream_with_retry(
+            &logger,
+            100,
+            "registry.test/example",
+            &scopes,
+            || {
+                stream::iter(vec![Ok(PushImageInfo {
+                    error: Some("denied".to_string()),
+                    ..Default::default()
+                })])
+            },
+            2,
+        )
+        .await
+        .expect_err("remote error should bubble");
+
+        assert!(matches!(err, RegistryPushError::Remote(_)));
     }
 }
