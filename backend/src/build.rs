@@ -10,16 +10,17 @@ use bollard::models::PushImageInfo;
 use bollard::query_parameters::{PushImageOptionsBuilder, TagImageOptionsBuilder};
 use bollard::Docker;
 use bytes::Bytes;
-use once_cell::sync::Lazy;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::StreamExt;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::json;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::fmt;
-use std::future::Future;
 use std::fs as stdfs;
+use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -27,7 +28,7 @@ use tar::Builder as TarBuilder;
 use tempfile::tempdir;
 use thiserror::Error;
 use tokio::fs;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration as TokioDuration};
 use url::Url;
 
 #[derive(Clone, Copy)]
@@ -207,7 +208,10 @@ struct RegistryLocation {
     repository: String,
 }
 
-fn registry_location(registry: &str, image_tag: &str) -> Result<RegistryLocation, ManifestPublishError> {
+fn registry_location(
+    registry: &str,
+    image_tag: &str,
+) -> Result<RegistryLocation, ManifestPublishError> {
     let trimmed = registry.trim().trim_end_matches('/');
     let candidate = if trimmed.contains("://") {
         trimmed.to_string()
@@ -261,8 +265,7 @@ async fn publish_manifest_list<L: BuildLogSink + ?Sized, M: MetricRecorder + ?Si
     let mut manifest_url = location.base.clone();
     manifest_url.set_path(&format!(
         "/v2/{}/manifests/{}",
-        location.repository,
-        manifest_tag
+        location.repository, manifest_tag
     ));
 
     let manifests = entries
@@ -400,6 +403,390 @@ fn registry_scopes(repository: &str) -> Vec<String> {
         format!("repository:{repository}:push"),
         format!("repository:{repository}:pull"),
     ]
+}
+
+const DEFAULT_CREDENTIAL_MAX_AGE_SECS: u64 = 86_400;
+const DEFAULT_CREDENTIAL_ROTATE_LEAD_SECS: u64 = 3_600;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialHealthStatus {
+    Healthy,
+    ExpiringSoon,
+    Expired,
+    Unknown,
+}
+
+impl CredentialHealthStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CredentialHealthStatus::Healthy => "healthy",
+            CredentialHealthStatus::ExpiringSoon => "expiring_soon",
+            CredentialHealthStatus::Expired => "expired",
+            CredentialHealthStatus::Unknown => "unknown",
+        }
+    }
+
+    fn severity(&self) -> u8 {
+        match self {
+            CredentialHealthStatus::Expired => 3,
+            CredentialHealthStatus::ExpiringSoon => 2,
+            CredentialHealthStatus::Healthy => 1,
+            CredentialHealthStatus::Unknown => 0,
+        }
+    }
+
+    pub fn combine(self, other: CredentialHealthStatus) -> CredentialHealthStatus {
+        if self.severity() >= other.severity() {
+            self
+        } else {
+            other
+        }
+    }
+
+    fn requires_rotation(&self) -> bool {
+        matches!(
+            self,
+            CredentialHealthStatus::Expired | CredentialHealthStatus::ExpiringSoon
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CredentialHealthSnapshot {
+    status: CredentialHealthStatus,
+    observed_at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,
+    source_path: Option<String>,
+    message: Option<String>,
+}
+
+impl CredentialHealthSnapshot {
+    fn new(
+        status: CredentialHealthStatus,
+        observed_at: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
+        source_path: Option<String>,
+        message: Option<String>,
+    ) -> Self {
+        Self {
+            status,
+            observed_at,
+            expires_at,
+            source_path,
+            message,
+        }
+    }
+
+    fn seconds_until_expiry(&self) -> Option<i64> {
+        self.expires_at
+            .map(|expiry| (expiry - self.observed_at).num_seconds())
+    }
+
+    fn requires_rotation(&self) -> bool {
+        self.status.requires_rotation()
+    }
+}
+
+fn configured_dockerconfig_path() -> Option<String> {
+    std::env::var("REGISTRY_AUTH_DOCKERCONFIG")
+        .ok()
+        .or_else(|| REGISTRY_AUTH_DOCKERCONFIG.as_ref().cloned())
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn registry_auth_host(registry: &str) -> Option<String> {
+    let trimmed = registry.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let mut parts = without_scheme.split('/');
+    parts
+        .next()
+        .map(|host| host.trim().to_string())
+        .filter(|host| !host.is_empty())
+}
+
+fn credential_max_age() -> std::time::Duration {
+    std::env::var("REGISTRY_AUTH_MAX_AGE_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(DEFAULT_CREDENTIAL_MAX_AGE_SECS))
+}
+
+fn credential_rotation_lead_time() -> std::time::Duration {
+    std::env::var("REGISTRY_AUTH_ROTATE_LEAD_SECONDS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(DEFAULT_CREDENTIAL_ROTATE_LEAD_SECS))
+}
+
+fn chrono_from_std(duration: std::time::Duration) -> ChronoDuration {
+    ChronoDuration::from_std(duration)
+        .unwrap_or_else(|_| ChronoDuration::seconds(duration.as_secs() as i64))
+}
+
+fn compute_credential_health(registry: &str) -> CredentialHealthSnapshot {
+    // key: registry-credential-health-snapshot
+    let observed_at = Utc::now();
+    let path = match configured_dockerconfig_path() {
+        Some(path) => path,
+        None => {
+            return CredentialHealthSnapshot::new(
+                CredentialHealthStatus::Expired,
+                observed_at,
+                None,
+                None,
+                Some("REGISTRY_AUTH_DOCKERCONFIG not configured".to_string()),
+            );
+        }
+    };
+
+    let host = match registry_auth_host(registry) {
+        Some(host) => host,
+        None => {
+            return CredentialHealthSnapshot::new(
+                CredentialHealthStatus::Unknown,
+                observed_at,
+                None,
+                Some(path),
+                Some("Unable to derive registry host from REGISTRY value".to_string()),
+            );
+        }
+    };
+
+    match stdfs::metadata(&path) {
+        Ok(metadata) => {
+            let auth_present = load_registry_auth_header(&host).is_some();
+            if !auth_present {
+                return CredentialHealthSnapshot::new(
+                    CredentialHealthStatus::Expired,
+                    observed_at,
+                    None,
+                    Some(path),
+                    Some(format!("No auth entry for {host} in dockerconfig")),
+                );
+            }
+
+            let expires_at = metadata.modified().ok().map(|modified| {
+                let modified: DateTime<Utc> = modified.into();
+                let expiry_window = chrono_from_std(credential_max_age());
+                modified + expiry_window
+            });
+
+            if let Some(expiry) = expires_at {
+                if expiry <= observed_at {
+                    return CredentialHealthSnapshot::new(
+                        CredentialHealthStatus::Expired,
+                        observed_at,
+                        Some(expiry),
+                        Some(path),
+                        Some("Credentials exceeded configured max age".to_string()),
+                    );
+                }
+                let lead = chrono_from_std(credential_rotation_lead_time());
+                if expiry - observed_at <= lead {
+                    return CredentialHealthSnapshot::new(
+                        CredentialHealthStatus::ExpiringSoon,
+                        observed_at,
+                        Some(expiry),
+                        Some(path),
+                        Some("Credentials approaching rotation window".to_string()),
+                    );
+                }
+                return CredentialHealthSnapshot::new(
+                    CredentialHealthStatus::Healthy,
+                    observed_at,
+                    Some(expiry),
+                    Some(path),
+                    Some("Credentials present and within rotation window".to_string()),
+                );
+            }
+
+            CredentialHealthSnapshot::new(
+                CredentialHealthStatus::Healthy,
+                observed_at,
+                None,
+                Some(path),
+                Some("Credentials present (no modification timestamp)".to_string()),
+            )
+        }
+        Err(err) => CredentialHealthSnapshot::new(
+            CredentialHealthStatus::Expired,
+            observed_at,
+            None,
+            Some(path),
+            Some(format!("Failed to stat dockerconfig: {err}")),
+        ),
+    }
+}
+
+async fn record_credential_health_and_rotate<L, M>(
+    logger: &L,
+    metrics: &M,
+    server_id: i32,
+    registry: &str,
+    repository: &str,
+    platform: &str,
+    mut refresher: Option<&mut dyn RegistryAuthRefresher>,
+) -> (CredentialHealthSnapshot, bool, bool)
+where
+    L: BuildLogSink + ?Sized,
+    M: MetricRecorder + ?Sized,
+{
+    let snapshot = compute_credential_health(registry);
+    let rotation_configured = refresher.is_some();
+    let rotation_recommended = snapshot.requires_rotation();
+    let seconds_until_expiry = snapshot.seconds_until_expiry();
+
+    metrics
+        .record(
+            "auth_health_reported",
+            Some(json!({
+                "registry_endpoint": repository,
+                "registry": registry,
+                "platform": platform,
+                "status": snapshot.status.as_str(),
+                "observed_at": snapshot.observed_at.to_rfc3339(),
+                "expires_at": snapshot.expires_at.map(|dt| dt.to_rfc3339()),
+                "seconds_until_expiry": seconds_until_expiry,
+                "rotation_recommended": rotation_recommended,
+                "rotation_configured": rotation_configured,
+                "source_path": snapshot.source_path.clone(),
+                "message": snapshot.message.clone(),
+            })),
+        )
+        .await;
+
+    let mut rotation_attempted = false;
+    let mut rotation_succeeded = false;
+
+    if rotation_recommended {
+        let log_message = format!(
+            "Registry credentials reported status '{}'{}",
+            snapshot.status.as_str(),
+            snapshot
+                .message
+                .as_ref()
+                .map(|msg| format!(": {msg}"))
+                .unwrap_or_default()
+        );
+        insert_log(logger, server_id, &log_message).await;
+        tracing::warn!(
+            target: "registry.push",
+            %repository,
+            %server_id,
+            %platform,
+            status = snapshot.status.as_str(),
+            rotation_configured,
+            seconds_until_expiry,
+            "registry credentials outside healthy window",
+        );
+
+        if let Some(refresher) = refresher.as_mut() {
+            rotation_attempted = true;
+            metrics
+                .record(
+                    "auth_rotation_started",
+                    Some(json!({
+                        "registry_endpoint": repository,
+                        "registry": registry,
+                        "platform": platform,
+                        "status": snapshot.status.as_str(),
+                        "observed_at": snapshot.observed_at.to_rfc3339(),
+                    })),
+                )
+                .await;
+            match refresher.refresh().await {
+                Ok(()) => {
+                    rotation_succeeded = true;
+                    metrics
+                        .record(
+                            "auth_rotation_succeeded",
+                            Some(json!({
+                                "registry_endpoint": repository,
+                                "registry": registry,
+                                "platform": platform,
+                                "status": snapshot.status.as_str(),
+                                "observed_at": Utc::now().to_rfc3339(),
+                            })),
+                        )
+                        .await;
+                    insert_log(
+                        logger,
+                        server_id,
+                        "Proactively rotated registry credentials",
+                    )
+                    .await;
+                    tracing::info!(
+                        target: "registry.push",
+                        %repository,
+                        %server_id,
+                        %platform,
+                        "proactive registry credential rotation succeeded",
+                    );
+                }
+                Err(err) => {
+                    metrics
+                        .record(
+                            "auth_rotation_failed",
+                            Some(json!({
+                                "registry_endpoint": repository,
+                                "registry": registry,
+                                "platform": platform,
+                                "status": snapshot.status.as_str(),
+                                "error": err,
+                            })),
+                        )
+                        .await;
+                    let failure_message =
+                        format!("Proactive registry credential rotation failed: {err}");
+                    insert_log(logger, server_id, &failure_message).await;
+                    tracing::error!(
+                        target: "registry.push",
+                        %repository,
+                        %server_id,
+                        %platform,
+                        error = %err,
+                        "proactive registry credential rotation failed",
+                    );
+                }
+            }
+        } else {
+            metrics
+                .record(
+                    "auth_rotation_skipped",
+                    Some(json!({
+                        "registry_endpoint": repository,
+                        "registry": registry,
+                        "platform": platform,
+                        "status": snapshot.status.as_str(),
+                        "reason": "refresher_unavailable",
+                    })),
+                )
+                .await;
+            insert_log(
+                logger,
+                server_id,
+                "Registry credentials flagged for rotation but no refresher is configured",
+            )
+            .await;
+            tracing::warn!(
+                target: "registry.push",
+                %repository,
+                %server_id,
+                %platform,
+                "skipping proactive credential rotation: refresher unavailable",
+            );
+        }
+    }
+
+    (snapshot, rotation_attempted, rotation_succeeded)
 }
 
 fn is_retryable_push_error(err: &bollard::errors::Error) -> bool {
@@ -708,7 +1095,6 @@ where
     Ok(last_digest)
 }
 
-
 #[derive(Debug)]
 struct PushStreamOutcome {
     auth_refresh_attempted: bool,
@@ -773,7 +1159,9 @@ where
         )
         .await;
 
-        match stream_push_progress(logger, server_id, registry_endpoint, scopes, make_stream()).await {
+        match stream_push_progress(logger, server_id, registry_endpoint, scopes, make_stream())
+            .await
+        {
             Ok(digest) => {
                 metrics
                     .record(
@@ -917,7 +1305,7 @@ where
                                         })),
                                     )
                                     .await;
-                                let backoff = Duration::from_millis(100 * attempt as u64);
+                                let backoff = TokioDuration::from_millis(100 * attempt as u64);
                                 sleep(backoff).await;
                                 continue;
                             }
@@ -1024,7 +1412,7 @@ where
                                 })),
                             )
                             .await;
-                        let backoff = Duration::from_millis(100 * attempt as u64);
+                        let backoff = TokioDuration::from_millis(100 * attempt as u64);
                         sleep(backoff).await;
                         continue;
                     }
@@ -1052,6 +1440,9 @@ pub struct RegistryPushResult {
     pub platform: String,
     pub auth_refresh_attempted: bool,
     pub auth_refresh_succeeded: bool,
+    pub auth_rotation_attempted: bool,
+    pub auth_rotation_succeeded: bool,
+    pub credential_health_status: CredentialHealthStatus,
 }
 
 async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
@@ -1159,6 +1550,21 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
     let mut refresh_context = credential_refresher
         .map(|refresh_fn| SharedDockerRefresher::new(Arc::clone(&shared_docker), refresh_fn));
 
+    let (health_snapshot, proactive_rotation_attempted, proactive_rotation_succeeded) =
+        record_credential_health_and_rotate(
+            logger,
+            &usage_metrics,
+            server_id,
+            registry,
+            &reference.repository,
+            platform,
+            refresh_context
+                .as_mut()
+                .map(|context| context as &mut dyn RegistryAuthRefresher),
+        )
+        .await;
+    let credential_health_status = health_snapshot.status;
+
     let push_result = push_stream_with_retry(
         logger,
         &usage_metrics,
@@ -1205,8 +1611,10 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
         platform: platform.to_string(),
         auth_refresh_attempted: outcome.auth_refresh_attempted,
         auth_refresh_succeeded: outcome.auth_refresh_succeeded,
+        auth_rotation_attempted: proactive_rotation_attempted,
+        auth_rotation_succeeded: proactive_rotation_succeeded,
+        credential_health_status,
     })
-
 }
 
 async fn insert_log<L: BuildLogSink + ?Sized>(logger: &L, server_id: i32, text: &str) {
@@ -1237,6 +1645,9 @@ pub struct BuildArtifacts {
     pub registry_image: Option<String>,
     pub auth_refresh_attempted: bool,
     pub auth_refresh_succeeded: bool,
+    pub auth_rotation_attempted: bool,
+    pub auth_rotation_succeeded: bool,
+    pub credential_health_status: CredentialHealthStatus,
 }
 
 /// Clone a git repository and build a Docker image.
@@ -1299,6 +1710,9 @@ pub async fn build_from_git(
     let mut registry_image = None;
     let mut auth_refresh_attempted = false;
     let mut auth_refresh_succeeded = false;
+    let mut auth_rotation_attempted = false;
+    let mut auth_rotation_succeeded = false;
+    let mut credential_health_status = CredentialHealthStatus::Unknown;
     let docker = match Docker::connect_with_local_defaults() {
         Ok(d) => d,
         Err(e) => {
@@ -1401,6 +1815,10 @@ pub async fn build_from_git(
                 Ok(result) => {
                     auth_refresh_attempted |= result.auth_refresh_attempted;
                     auth_refresh_succeeded |= result.auth_refresh_succeeded;
+                    auth_rotation_attempted |= result.auth_rotation_attempted;
+                    auth_rotation_succeeded |= result.auth_rotation_succeeded;
+                    credential_health_status =
+                        credential_health_status.combine(result.credential_health_status);
                     platform_pushes.push((target.clone(), result));
                 }
                 Err(err) => {
@@ -1475,6 +1893,9 @@ pub async fn build_from_git(
         registry_image,
         auth_refresh_attempted,
         auth_refresh_succeeded,
+        auth_rotation_attempted,
+        auth_rotation_succeeded,
+        credential_health_status,
     }))
 }
 
@@ -2049,8 +2470,6 @@ mod tests {
         );
     }
 
-
-
     #[tokio::test]
     async fn publish_manifest_list_pushes_payload() {
         let server = MockServer::start_async().await;
@@ -2290,6 +2709,100 @@ mod tests {
             failure_entry.get("attempt").and_then(Value::as_u64),
             Some(1),
         );
+    }
+
+    #[tokio::test]
+    async fn proactive_rotation_skipped_without_refresher() {
+        let logger = RecordingLog::default();
+        let metrics = RecordingMetrics::default();
+        let config = NamedTempFile::new().expect("temp docker config");
+        std::fs::write(
+            config.path(),
+            r#"{"auths": {"example.com": {"auth": "dXNlcjpwYXNz"}}}"#,
+        )
+        .expect("write docker config");
+
+        std::env::set_var("REGISTRY_AUTH_DOCKERCONFIG", config.path());
+        std::env::set_var("REGISTRY_AUTH_MAX_AGE_SECONDS", "0");
+        std::env::set_var("REGISTRY_AUTH_ROTATE_LEAD_SECONDS", "0");
+
+        let (snapshot, attempted, succeeded) = record_credential_health_and_rotate(
+            &logger,
+            &metrics,
+            404,
+            "https://example.com",
+            "example/repo",
+            "linux/amd64",
+            None,
+        )
+        .await;
+
+        assert!(snapshot.status.requires_rotation());
+        assert!(!attempted);
+        assert!(!succeeded);
+
+        let events = metrics.events().await;
+        assert!(events
+            .iter()
+            .any(|(event, _)| event == "auth_health_reported"));
+        let skipped_details = events
+            .iter()
+            .find(|(event, _)| event == "auth_rotation_skipped")
+            .and_then(|(_, details)| details.as_ref())
+            .expect("auth_rotation_skipped recorded");
+        assert_eq!(
+            skipped_details.get("reason").and_then(Value::as_str),
+            Some("refresher_unavailable")
+        );
+
+        std::env::remove_var("REGISTRY_AUTH_MAX_AGE_SECONDS");
+        std::env::remove_var("REGISTRY_AUTH_ROTATE_LEAD_SECONDS");
+        std::env::remove_var("REGISTRY_AUTH_DOCKERCONFIG");
+    }
+
+    #[tokio::test]
+    async fn proactive_rotation_succeeds_with_refresher() {
+        let logger = RecordingLog::default();
+        let metrics = RecordingMetrics::default();
+        let config = NamedTempFile::new().expect("temp docker config");
+        std::fs::write(
+            config.path(),
+            r#"{"auths": {"example.com": {"auth": "dXNlcjpwYXNz"}}}"#,
+        )
+        .expect("write docker config");
+
+        std::env::set_var("REGISTRY_AUTH_DOCKERCONFIG", config.path());
+        std::env::set_var("REGISTRY_AUTH_MAX_AGE_SECONDS", "0");
+        std::env::set_var("REGISTRY_AUTH_ROTATE_LEAD_SECONDS", "0");
+
+        let mut refresher = TestRefresher::succeed();
+
+        let (_, attempted, succeeded) = record_credential_health_and_rotate(
+            &logger,
+            &metrics,
+            405,
+            "https://example.com",
+            "example/repo",
+            "linux/amd64",
+            Some(&mut refresher as &mut dyn RegistryAuthRefresher),
+        )
+        .await;
+
+        assert!(attempted);
+        assert!(succeeded);
+        assert_eq!(refresher.attempts(), 1);
+
+        let events = metrics.events().await;
+        assert!(events
+            .iter()
+            .any(|(event, _)| event == "auth_rotation_started"));
+        assert!(events
+            .iter()
+            .any(|(event, _)| event == "auth_rotation_succeeded"));
+
+        std::env::remove_var("REGISTRY_AUTH_MAX_AGE_SECONDS");
+        std::env::remove_var("REGISTRY_AUTH_ROTATE_LEAD_SECONDS");
+        std::env::remove_var("REGISTRY_AUTH_DOCKERCONFIG");
     }
 
     #[tokio::test]

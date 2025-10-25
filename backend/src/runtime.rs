@@ -120,9 +120,28 @@ impl ContainerRuntime for KubernetesRuntime {
                 }
                 match crate::build::build_from_git(&pool, server_id, repo, branch).await {
                     Ok(Some(artifacts)) => {
+                        let health_status = artifacts.credential_health_status.as_str();
+                        let _ = sqlx::query(
+                            "INSERT INTO server_logs (server_id, log_text) VALUES ($1, $2)",
+                        )
+                        .bind(server_id)
+                        .bind(format!(
+                            "Registry credential health status after build: {health_status}"
+                        ))
+                        .execute(&pool)
+                        .await;
+                        tracing::info!(
+                            target: "registry.push",
+                            %server_id,
+                            credential_health_status = %health_status,
+                            "recorded registry credential health outcome",
+                        );
                         if let Some(remote_image) = artifacts.registry_image {
-                            if artifacts.auth_refresh_attempted && artifacts.auth_refresh_succeeded
-                            {
+                            let secret_sync_required = (artifacts.auth_refresh_attempted
+                                && artifacts.auth_refresh_succeeded)
+                                || (artifacts.auth_rotation_attempted
+                                    && artifacts.auth_rotation_succeeded);
+                            if secret_sync_required {
                                 if let (Some(secret_name), Some(config_path)) = (
                                     crate::config::K8S_REGISTRY_SECRET_NAME.as_ref(),
                                     crate::config::REGISTRY_AUTH_DOCKERCONFIG.as_ref(),
@@ -165,6 +184,18 @@ impl ContainerRuntime for KubernetesRuntime {
                                         "registry credentials refreshed but K8S_REGISTRY_SECRET_NAME or REGISTRY_AUTH_DOCKERCONFIG not configured",
                                     );
                                 }
+                            } else if artifacts.auth_rotation_attempted
+                                && !artifacts.auth_rotation_succeeded
+                            {
+                                let _ = sqlx::query(
+                                    "INSERT INTO server_logs (server_id, log_text) VALUES ($1, $2)",
+                                )
+                                .bind(server_id)
+                                .bind(
+                                    "Proactive registry credential rotation failed; verify credentials manually",
+                                )
+                                .execute(&pool)
+                                .await;
                             }
                             image = remote_image;
                         } else {
