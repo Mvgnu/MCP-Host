@@ -79,7 +79,10 @@ impl ContainerRuntime for KubernetesRuntime {
         pool: PgPool,
     ) {
         use k8s_openapi::api::core::v1 as corev1;
-        use kube::{Api, api::{PostParams, DeleteParams}};
+        use kube::{
+            api::{DeleteParams, PostParams},
+            Api,
+        };
         use std::collections::BTreeMap;
 
         let client = self.client.clone();
@@ -109,8 +112,12 @@ impl ContainerRuntime for KubernetesRuntime {
                 .and_then(|v| v.get("repo_url"))
                 .and_then(|v| v.as_str())
             {
-                crate::servers::set_status(&pool, server_id, "cloning").await;
-                if let Some(tag) = crate::build::build_from_git(&pool, server_id, repo, branch).await {
+                if let Err(err) = crate::servers::set_status(&pool, server_id, "cloning").await {
+                    tracing::error!(?err, %server_id, "failed to set status to cloning");
+                }
+                if let Some(tag) =
+                    crate::build::build_from_git(&pool, server_id, repo, branch).await
+                {
                     image = tag;
                 } else {
                     return;
@@ -129,7 +136,9 @@ impl ContainerRuntime for KubernetesRuntime {
             if let Some(cfg) = config.as_ref() {
                 if let Some(obj) = cfg.as_object() {
                     for (k, v) in obj {
-                        if k == "image" || k == "repo_url" { continue; }
+                        if k == "image" || k == "repo_url" {
+                            continue;
+                        }
                         env_vars.push(corev1::EnvVar {
                             name: format!("CFG_{}", k.to_uppercase()),
                             value: Some(v.to_string()),
@@ -164,7 +173,8 @@ impl ContainerRuntime for KubernetesRuntime {
                             let mut limits = BTreeMap::new();
                             let mut requests = BTreeMap::new();
 
-                            if let Some(cpu) = config.as_ref()
+                            if let Some(cpu) = config
+                                .as_ref()
                                 .and_then(|v| v.get("cpu_limit"))
                                 .and_then(|v| v.as_f64())
                             {
@@ -173,7 +183,8 @@ impl ContainerRuntime for KubernetesRuntime {
                                 requests.insert("cpu".into(), q.clone());
                             }
 
-                            if let Some(mem) = config.as_ref()
+                            if let Some(mem) = config
+                                .as_ref()
                                 .and_then(|v| v.get("memory_limit"))
                                 .and_then(|v| v.as_u64())
                             {
@@ -188,8 +199,16 @@ impl ContainerRuntime for KubernetesRuntime {
 
                             if !limits.is_empty() || !requests.is_empty() {
                                 Some(corev1::ResourceRequirements {
-                                    limits: if limits.is_empty() { None } else { Some(limits) },
-                                    requests: if requests.is_empty() { None } else { Some(requests) },
+                                    limits: if limits.is_empty() {
+                                        None
+                                    } else {
+                                        Some(limits)
+                                    },
+                                    requests: if requests.is_empty() {
+                                        None
+                                    } else {
+                                        Some(requests)
+                                    },
                                     ..Default::default()
                                 })
                             } else {
@@ -219,36 +238,43 @@ impl ContainerRuntime for KubernetesRuntime {
             let _ = pods.delete(&pod_name, &DeleteParams::default()).await; // cleanup any old pod
             match pods.create(&PostParams::default(), &pod).await {
                 Ok(_) => {
-                    crate::servers::set_status(&pool, server_id, "running").await;
+                    if let Err(err) = crate::servers::set_status(&pool, server_id, "running").await
+                    {
+                        tracing::error!(?err, %server_id, "failed to set status to running");
+                    }
                     let _ = crate::servers::add_metric(&pool, server_id, "start", None).await;
                     crate::proxy::rebuild_for_server(&pool, server_id).await;
                 }
                 Err(e) => {
                     tracing::error!(?e, "failed to create pod");
-                    crate::servers::set_status(&pool, server_id, "error").await;
+                    if let Err(err) = crate::servers::set_status(&pool, server_id, "error").await {
+                        tracing::error!(?err, %server_id, "failed to set status to error after runtime failure");
+                    }
                 }
             }
         });
     }
 
     fn stop_server_task(&self, server_id: i32, pool: PgPool) {
-        use kube::{Api, api::DeleteParams};
         use k8s_openapi::api::core::v1::Pod;
+        use kube::{api::DeleteParams, Api};
         let client = self.client.clone();
         let namespace = crate::config::K8S_NAMESPACE.clone();
         tokio::spawn(async move {
             let pods: Api<Pod> = Api::namespaced(client, &namespace);
             let name = format!("mcp-server-{server_id}");
             let _ = pods.delete(&name, &DeleteParams::default()).await;
-            crate::servers::set_status(&pool, server_id, "stopped").await;
+            if let Err(err) = crate::servers::set_status(&pool, server_id, "stopped").await {
+                tracing::error!(?err, %server_id, "failed to set status to stopped");
+            }
             let _ = crate::servers::add_metric(&pool, server_id, "stop", None).await;
             crate::proxy::rebuild_for_server(&pool, server_id).await;
         });
     }
 
     fn delete_server_task(&self, server_id: i32, pool: PgPool) {
-        use kube::{Api, api::DeleteParams};
         use k8s_openapi::api::core::v1::Pod;
+        use kube::{api::DeleteParams, Api};
         let client = self.client.clone();
         let namespace = crate::config::K8S_NAMESPACE.clone();
         tokio::spawn(async move {
@@ -266,11 +292,20 @@ impl ContainerRuntime for KubernetesRuntime {
     }
 
     async fn fetch_logs(&self, server_id: i32) -> Result<String, bollard::errors::Error> {
-        use kube::{Api, api::LogParams};
         use k8s_openapi::api::core::v1::Pod;
+        use kube::{api::LogParams, Api};
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &crate::config::K8S_NAMESPACE);
         let name = format!("mcp-server-{server_id}");
-        match pods.logs(&name, &LogParams { tail_lines: Some(100), ..LogParams::default() }).await {
+        match pods
+            .logs(
+                &name,
+                &LogParams {
+                    tail_lines: Some(100),
+                    ..LogParams::default()
+                },
+            )
+            .await
+        {
             Ok(s) => Ok(s),
             Err(e) => Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 500,
@@ -280,10 +315,10 @@ impl ContainerRuntime for KubernetesRuntime {
     }
 
     fn stream_logs_task(&self, server_id: i32, pool: PgPool) -> Option<Receiver<String>> {
-        use kube::{Api, api::LogParams};
-        use k8s_openapi::api::core::v1::Pod;
         use futures_util::io::AsyncBufReadExt;
         use futures_util::StreamExt;
+        use k8s_openapi::api::core::v1::Pod;
+        use kube::{api::LogParams, Api};
 
         let client = self.client.clone();
         let namespace = crate::config::K8S_NAMESPACE.clone();
@@ -291,16 +326,27 @@ impl ContainerRuntime for KubernetesRuntime {
         tokio::spawn(async move {
             let pods: Api<Pod> = Api::namespaced(client, &namespace);
             let name = format!("mcp-server-{server_id}");
-            match pods.log_stream(&name, &LogParams { follow: true, ..LogParams::default() }).await {
+            match pods
+                .log_stream(
+                    &name,
+                    &LogParams {
+                        follow: true,
+                        ..LogParams::default()
+                    },
+                )
+                .await
+            {
                 Ok(stream) => {
                     let mut lines = stream.lines();
                     while let Some(Ok(line)) = lines.next().await {
                         let _ = tx.send(line.clone()).await;
-                        let _ = sqlx::query("INSERT INTO server_logs (server_id, log_text) VALUES ($1,$2)")
-                            .bind(server_id)
-                            .bind(&line)
-                            .execute(&pool)
-                            .await;
+                        let _ = sqlx::query(
+                            "INSERT INTO server_logs (server_id, log_text) VALUES ($1,$2)",
+                        )
+                        .bind(server_id)
+                        .bind(&line)
+                        .execute(&pool)
+                        .await;
                     }
                 }
                 Err(e) => tracing::error!(?e, "k8s log stream failed"),

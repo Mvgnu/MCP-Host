@@ -1,17 +1,17 @@
-use crate::servers::{add_metric, set_status};
-use crate::proxy;
+use crate::build;
 use crate::capabilities;
+use crate::proxy;
+use crate::servers::{add_metric, set_status};
 use bollard::container::{
     Config as ContainerConfig, CreateContainerOptions, RemoveContainerOptions,
     StartContainerOptions, StopContainerOptions,
 };
 use bollard::models::HostConfig;
 use bollard::Docker;
+use reqwest;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use tokio::sync::mpsc::{self, Receiver};
-use crate::build;
-use reqwest;
 
 async fn insert_log(pool: &PgPool, server_id: i32, text: &str) {
     let _ = sqlx::query("INSERT INTO server_logs (server_id, log_text) VALUES ($1, $2)")
@@ -19,6 +19,18 @@ async fn insert_log(pool: &PgPool, server_id: i32, text: &str) {
         .bind(text)
         .execute(pool)
         .await;
+}
+
+async fn set_status_with_context(pool: &PgPool, server_id: i32, status: &str, context: &str) {
+    if let Err(err) = set_status(pool, server_id, status).await {
+        tracing::error!(
+            ?err,
+            %server_id,
+            status = %status,
+            context,
+            "failed to update server status"
+        );
+    }
 }
 
 /// Spawn a background task to launch an MCP server container.
@@ -41,7 +53,8 @@ pub fn spawn_server_task(
             Ok(d) => d,
             Err(e) => {
                 tracing::error!("Failed to connect to Docker: {e:?}");
-                set_status(&pool, server_id, "error").await;
+                set_status_with_context(&pool, server_id, "error", "initial docker connection")
+                    .await;
                 return;
             }
         };
@@ -81,7 +94,7 @@ pub fn spawn_server_task(
             .and_then(|v| v.get("repo_url"))
             .and_then(|v| v.as_str())
         {
-            set_status(&pool, server_id, "cloning").await;
+            set_status_with_context(&pool, server_id, "cloning", "preparing git build").await;
             if let Some(tag) = build::build_from_git(&pool, server_id, repo, branch).await {
                 image = tag;
             } else {
@@ -142,12 +155,10 @@ pub fn spawn_server_task(
         }
 
         // Inject user-defined secrets
-        if let Ok(rows) = sqlx::query(
-            "SELECT name, value FROM server_secrets WHERE server_id = $1",
-        )
-        .bind(server_id)
-        .fetch_all(&pool)
-        .await
+        if let Ok(rows) = sqlx::query("SELECT name, value FROM server_secrets WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_all(&pool)
+            .await
         {
             for row in rows {
                 let name: String = row.get("name");
@@ -237,21 +248,22 @@ pub fn spawn_server_task(
                     .await
                     .is_ok()
                 {
-                    set_status(&pool, server_id, "running").await;
+                    set_status_with_context(&pool, server_id, "running", "container started").await;
                     let _ = add_metric(&pool, server_id, "start", None).await;
                     insert_log(&pool, server_id, "Container started").await;
                     proxy::rebuild_for_server(&pool, server_id).await;
-                    if let Ok(resp) = reqwest::get(
-                        format!("http://mcp-server-{server_id}:8080/.well-known/mcp.json"),
-                    )
+                    if let Ok(resp) = reqwest::get(format!(
+                        "http://mcp-server-{server_id}:8080/.well-known/mcp.json"
+                    ))
                     .await
                     {
                         if let Ok(json) = resp.json::<serde_json::Value>().await {
-                            let _ = sqlx::query("UPDATE mcp_servers SET manifest = $1 WHERE id = $2")
-                                .bind(&json)
-                                .bind(server_id)
-                                .execute(&pool)
-                                .await;
+                            let _ =
+                                sqlx::query("UPDATE mcp_servers SET manifest = $1 WHERE id = $2")
+                                    .bind(&json)
+                                    .bind(server_id)
+                                    .execute(&pool)
+                                    .await;
                             capabilities::sync_capabilities(&pool, server_id, &json).await;
                         }
                     }
@@ -266,13 +278,15 @@ pub fn spawn_server_task(
                     );
                 } else {
                     tracing::error!("failed to start container {server_id}");
-                    set_status(&pool, server_id, "error").await;
+                    set_status_with_context(&pool, server_id, "error", "container start failure")
+                        .await;
                     insert_log(&pool, server_id, "Failed to start container").await;
                 }
             }
             Err(e) => {
                 tracing::error!("container creation failed: {e:?}");
-                set_status(&pool, server_id, "error").await;
+                set_status_with_context(&pool, server_id, "error", "container creation failure")
+                    .await;
                 insert_log(&pool, server_id, "Container creation failed").await;
             }
         }
@@ -295,7 +309,7 @@ pub fn stop_server_task(server_id: i32, pool: PgPool) {
             .stop_container(&name, Some(StopContainerOptions { t: 5 }))
             .await;
 
-        set_status(&pool, server_id, "stopped").await;
+        set_status_with_context(&pool, server_id, "stopped", "container stopped").await;
         let _ = add_metric(&pool, server_id, "stop", None).await;
         insert_log(&pool, server_id, "Container stopped").await;
         proxy::rebuild_for_server(&pool, server_id).await;
@@ -354,14 +368,20 @@ pub fn spawn_vector_db_task(id: i32, db_type: String, pool: PgPool) {
         let _ = docker
             .remove_container(
                 &name,
-                Some(RemoveContainerOptions { force: true, ..Default::default() }),
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
             )
             .await;
         let image = match db_type.as_str() {
             "chroma" => "ghcr.io/chroma-core/chroma:latest",
             _ => "ghcr.io/chroma-core/chroma:latest",
         };
-        let create_opts = CreateContainerOptions { name: &name, platform: None };
+        let create_opts = CreateContainerOptions {
+            name: &name,
+            platform: None,
+        };
         let host_cfg = HostConfig {
             auto_remove: Some(true),
             ..Default::default()
@@ -371,16 +391,25 @@ pub fn spawn_vector_db_task(id: i32, db_type: String, pool: PgPool) {
             host_config: Some(host_cfg),
             ..Default::default()
         };
-        match docker.create_container(Some(create_opts), container_cfg).await {
+        match docker
+            .create_container(Some(create_opts), container_cfg)
+            .await
+        {
             Ok(info) => {
-                if docker.start_container(&info.id, None::<StartContainerOptions<String>>).await.is_ok() {
+                if docker
+                    .start_container(&info.id, None::<StartContainerOptions<String>>)
+                    .await
+                    .is_ok()
+                {
                     let url = format!("http://{name}:8000");
-                    let _ = sqlx::query("UPDATE vector_dbs SET container_id = $1, url = $2 WHERE id = $3")
-                        .bind(&info.id)
-                        .bind(&url)
-                        .bind(id)
-                        .execute(&pool)
-                        .await;
+                    let _ = sqlx::query(
+                        "UPDATE vector_dbs SET container_id = $1, url = $2 WHERE id = $3",
+                    )
+                    .bind(&info.id)
+                    .bind(&url)
+                    .bind(id)
+                    .execute(&pool)
+                    .await;
                 } else {
                     tracing::error!("failed to start vector db container {id}");
                 }
@@ -403,7 +432,13 @@ pub fn delete_vector_db_task(id: i32, pool: PgPool) {
         };
         let name = format!("mcp-vectordb-{id}");
         let _ = docker
-            .remove_container(&name, Some(RemoveContainerOptions { force: true, ..Default::default() }))
+            .remove_container(
+                &name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
             .await;
         let _ = sqlx::query("DELETE FROM vector_dbs WHERE id = $1")
             .bind(id)
@@ -516,7 +551,7 @@ pub fn monitor_server_task(
                 .unwrap_or(false);
             if !running {
                 insert_log(&pool, server_id, "Container exited; restarting").await;
-                set_status(&pool, server_id, "restarting").await;
+                set_status_with_context(&pool, server_id, "restarting", "container restart").await;
                 let _ = add_metric(&pool, server_id, "restart", None).await;
                 spawn_server_task(
                     server_id,

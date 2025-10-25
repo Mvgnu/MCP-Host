@@ -7,3 +7,10 @@
   Log:
     - 2025-10-25 10:55:35 UTC: Initiated task after auditing backend/src/build.rs shell usage.
     - 2025-10-25 11:08:19 UTC: Completed Bollard registry integration with streaming logs, error propagation, and tests.
+- ID: BE-BUILD-002
+  Status: DONE
+  Task: Harden Bollard registry push flow with telemetry, retries, and documentation.
+  Hypothesis: Structured RegistryPushError propagation plus scoped telemetry and resilience tests will prevent silent registry failures.
+  Log:
+    - 2025-10-25 12:15:00 UTC: Began audit of backend/src/build.rs for registry telemetry and retry coverage gaps.
+    - 2025-10-25 13:05:00 UTC: Added telemetry-rich retries, auth-expiry handling, runbook docs, and tests; cargo test passes.
