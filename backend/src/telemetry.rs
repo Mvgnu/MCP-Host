@@ -41,6 +41,7 @@ pub fn validate_metric_details(
             require_field(payload, event_type, "attempt")?;
             require_field(payload, event_type, "retry_limit")?;
             require_field(payload, event_type, "registry_endpoint")?;
+            require_field(payload, event_type, "platform")?;
             if event_type == "push_failed" {
                 require_field(payload, event_type, "error_kind")?;
                 require_field(payload, event_type, "auth_expired")?;
@@ -55,6 +56,16 @@ pub fn validate_metric_details(
             })?;
             require_field(payload, event_type, "registry_endpoint")?;
             require_field(payload, event_type, "tag")?;
+            require_field(payload, event_type, "platform")?;
+        }
+        "manifest_published" => {
+            let payload = details.ok_or_else(|| MetricValidationError::MissingDetails {
+                event_type: event_type.to_string(),
+            })?;
+            require_field(payload, event_type, "registry_endpoint")?;
+            require_field(payload, event_type, "tag")?;
+            require_field(payload, event_type, "digest")?;
+            require_field(payload, event_type, "architectures")?;
         }
         _ => {}
     }
@@ -87,6 +98,7 @@ mod tests {
             "registry_endpoint": "registry.test/example",
             "error_kind": "remote",
             "auth_expired": false,
+            "platform": "linux/amd64",
         });
 
         assert!(validate_metric_details("push_failed", Some(&payload)).is_ok());
@@ -97,6 +109,7 @@ mod tests {
         let payload = json!({
             "attempt": 1,
             "retry_limit": 3,
+            "platform": "linux/amd64",
         });
 
         let err = validate_metric_details("push_failed", Some(&payload))
@@ -108,5 +121,17 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn manifest_metrics_require_expected_fields() {
+        let payload = json!({
+            "registry_endpoint": "registry.test/example",
+            "tag": "latest",
+            "digest": "sha256:123",
+            "architectures": ["linux/amd64"],
+        });
+
+        assert!(validate_metric_details("manifest_published", Some(&payload)).is_ok());
     }
 }

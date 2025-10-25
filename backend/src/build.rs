@@ -1,26 +1,34 @@
+use crate::config::{REGISTRY_ARCH_TARGETS, REGISTRY_AUTH_DOCKERCONFIG};
 use crate::servers::{add_metric, set_status, SetStatusError};
 use crate::telemetry::MetricError;
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as Base64Engine;
+use base64::Engine;
 use bollard::body_full;
 use bollard::image::BuildImageOptions;
 use bollard::models::PushImageInfo;
 use bollard::query_parameters::{PushImageOptionsBuilder, TagImageOptionsBuilder};
 use bollard::Docker;
 use bytes::Bytes;
+use once_cell::sync::Lazy;
 use futures_util::StreamExt;
 use regex::Regex;
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::json;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::fmt;
 use std::future::Future;
+use std::fs as stdfs;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tar::Builder as TarBuilder;
 use tempfile::tempdir;
+use thiserror::Error;
 use tokio::fs;
 use tokio::time::{sleep, Duration};
+use url::Url;
 
 #[derive(Clone, Copy)]
 enum LangBuilder {
@@ -40,11 +48,11 @@ impl RegistryReference {
     }
 }
 
-fn build_registry_reference(registry: &str, image_tag: &str) -> RegistryReference {
+fn build_registry_reference(registry: &str, image_tag: &str, tag: &str) -> RegistryReference {
     let registry = registry.trim_end_matches('/');
     RegistryReference {
         repository: format!("{registry}/{image_tag}"),
-        tag: "latest".to_string(),
+        tag: tag.to_string(),
     }
 }
 
@@ -69,6 +77,307 @@ impl fmt::Display for RegistryPushError {
     }
 }
 
+#[derive(Debug, Error)]
+enum ManifestPublishError {
+    #[error("manifest publishing requires registry credentials for {0}")]
+    MissingCredentials(String),
+    #[error("failed to parse registry url: {0}")]
+    InvalidRegistryUrl(String),
+    #[error("http error while publishing manifest: {0}")]
+    Http(String),
+    #[error("registry rejected manifest publish: {0}")]
+    Remote(String),
+}
+
+#[derive(Debug, Clone)]
+struct PlatformTarget {
+    spec: String,
+    slug: String,
+    os: String,
+    architecture: String,
+    variant: Option<String>,
+}
+
+impl PlatformTarget {
+    fn parse(spec: &str) -> Option<Self> {
+        let parts: Vec<&str> = spec.split('/').collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        let os = parts[0].trim();
+        let arch = parts[1].trim();
+        if os.is_empty() || arch.is_empty() {
+            return None;
+        }
+        let variant = parts.get(2).and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        let slug = spec
+            .chars()
+            .map(|c| match c {
+                '/' | ':' | '\\' => '_',
+                other => other,
+            })
+            .collect::<String>();
+        Some(Self {
+            spec: spec.to_string(),
+            slug,
+            os: os.to_string(),
+            architecture: arch.to_string(),
+            variant,
+        })
+    }
+
+    fn manifest_platform(&self) -> serde_json::Value {
+        let mut platform = json!({
+            "os": self.os,
+            "architecture": self.architecture,
+        });
+        if let Some(variant) = &self.variant {
+            platform
+                .as_object_mut()
+                .expect("platform json is object")
+                .insert("variant".into(), json!(variant));
+        }
+        platform
+    }
+}
+
+fn desired_platform_targets() -> Vec<PlatformTarget> {
+    REGISTRY_ARCH_TARGETS
+        .iter()
+        .filter_map(|spec| {
+            let spec = spec.trim();
+            if spec.is_empty() {
+                return None;
+            }
+            match PlatformTarget::parse(spec) {
+                Some(target) => Some(target),
+                None => {
+                    tracing::warn!(%spec, "ignoring invalid registry architecture target");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+fn load_registry_auth_header(registry_host: &str) -> Option<String> {
+    let config_path = std::env::var("REGISTRY_AUTH_DOCKERCONFIG")
+        .ok()
+        .or_else(|| REGISTRY_AUTH_DOCKERCONFIG.as_ref().cloned())?;
+    let contents = stdfs::read_to_string(config_path).ok()?;
+    let json: Value = serde_json::from_str(&contents).ok()?;
+    let auths = json.get("auths")?.as_object()?;
+    let candidate_keys = [
+        registry_host.to_string(),
+        format!("https://{registry_host}"),
+        format!("http://{registry_host}"),
+    ];
+    for key in candidate_keys {
+        if let Some(entry) = auths.get(&key) {
+            if let Some(auth) = entry.get("auth").and_then(|v| v.as_str()) {
+                let trimmed = auth.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                return Some(format!("Basic {trimmed}"));
+            }
+            if let (Some(user), Some(pass)) = (
+                entry.get("username").and_then(|v| v.as_str()),
+                entry.get("password").and_then(|v| v.as_str()),
+            ) {
+                let encoded = Base64Engine.encode(format!("{user}:{pass}"));
+                return Some(format!("Basic {encoded}"));
+            }
+        }
+    }
+    None
+}
+
+struct RegistryLocation {
+    base: Url,
+    host: String,
+    auth_host: String,
+    repository: String,
+}
+
+fn registry_location(registry: &str, image_tag: &str) -> Result<RegistryLocation, ManifestPublishError> {
+    let trimmed = registry.trim().trim_end_matches('/');
+    let candidate = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    let base = Url::parse(&candidate)
+        .map_err(|err| ManifestPublishError::InvalidRegistryUrl(err.to_string()))?;
+    let host = base
+        .host_str()
+        .ok_or_else(|| ManifestPublishError::InvalidRegistryUrl(registry.to_string()))?
+        .to_string();
+    let auth_host = if let Some(port) = base.port() {
+        format!("{host}:{port}")
+    } else {
+        host.clone()
+    };
+    let path = base.path().trim_matches('/');
+    let repository = if path.is_empty() {
+        image_tag.to_string()
+    } else {
+        format!("{path}/{image_tag}")
+    };
+    Ok(RegistryLocation {
+        base,
+        host,
+        auth_host,
+        repository,
+    })
+}
+
+async fn publish_manifest_list<L: BuildLogSink + ?Sized, M: MetricRecorder + ?Sized>(
+    logger: &L,
+    metrics: &M,
+    server_id: i32,
+    registry: &str,
+    image_tag: &str,
+    manifest_tag: &str,
+    entries: &[(PlatformTarget, String)],
+) -> Result<String, ManifestPublishError> {
+    if entries.is_empty() {
+        return Err(ManifestPublishError::Remote(
+            "no architecture digests available for manifest publish".to_string(),
+        ));
+    }
+
+    let location = registry_location(registry, image_tag)?;
+    let auth = load_registry_auth_header(&location.auth_host)
+        .ok_or_else(|| ManifestPublishError::MissingCredentials(location.host.clone()))?;
+
+    let mut manifest_url = location.base.clone();
+    manifest_url.set_path(&format!(
+        "/v2/{}/manifests/{}",
+        location.repository,
+        manifest_tag
+    ));
+
+    let manifests = entries
+        .iter()
+        .map(|(platform, digest)| {
+            json!({
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "digest": digest,
+                "platform": platform.manifest_platform(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let payload = json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+        "manifests": manifests,
+    });
+
+    let body = serde_json::to_string(&payload)
+        .map_err(|err| ManifestPublishError::Http(err.to_string()))?;
+
+    logger
+        .log(
+            server_id,
+            &format!(
+                "Publishing manifest list for {}:{}",
+                location.repository, manifest_tag
+            ),
+        )
+        .await;
+    tracing::info!(
+        target: "registry.push",
+        %server_id,
+        repository = %location.repository,
+        %manifest_tag,
+        "publishing manifest list",
+    );
+
+    let response = MANIFEST_HTTP_CLIENT
+        .put(manifest_url.clone())
+        .header(AUTHORIZATION, auth)
+        .header(
+            CONTENT_TYPE,
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+        )
+        .header(
+            ACCEPT,
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+        )
+        .body(body)
+        .send()
+        .await
+        .map_err(|err| ManifestPublishError::Http(err.to_string()))?;
+
+    let status = response.status();
+    let headers = response.headers().clone();
+    let response_text = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<unavailable>".to_string());
+
+    if !status.is_success() {
+        tracing::error!(
+            target: "registry.push",
+            %server_id,
+            repository = %location.repository,
+            %manifest_tag,
+            status = %status,
+            body = %response_text,
+            "manifest publish failed",
+        );
+        return Err(ManifestPublishError::Remote(format!(
+            "{status}: {response_text}"
+        )));
+    }
+
+    let digest = headers
+        .get("Docker-Content-Digest")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+
+    metrics
+        .record(
+            "manifest_published",
+            Some(json!({
+                "registry_endpoint": format!(
+                    "{}/{}",
+                    registry.trim_end_matches('/'),
+                    image_tag
+                ),
+                "tag": manifest_tag,
+                "digest": digest,
+                "architectures": entries
+                    .iter()
+                    .map(|(platform, _)| platform.spec.clone())
+                    .collect::<Vec<_>>(),
+            })),
+        )
+        .await;
+
+    logger
+        .log(
+            server_id,
+            &format!(
+                "Manifest list published for {}:{}",
+                location.repository, manifest_tag
+            ),
+        )
+        .await;
+
+    Ok(digest)
+}
+
 const DEFAULT_REGISTRY_PUSH_RETRIES: usize = 3;
 
 fn registry_push_retry_limit() -> usize {
@@ -78,6 +387,13 @@ fn registry_push_retry_limit() -> usize {
         .filter(|&value| value > 0)
         .unwrap_or(DEFAULT_REGISTRY_PUSH_RETRIES)
 }
+
+static MANIFEST_HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .user_agent("mcp-host-manifest-publisher/1.0")
+        .build()
+        .expect("failed to construct manifest HTTP client")
+});
 
 fn registry_scopes(repository: &str) -> Vec<String> {
     vec![
@@ -268,6 +584,7 @@ async fn record_push_failure<M: MetricRecorder + ?Sized>(
     error_kind: &str,
     error_message: &str,
     auth_expired: bool,
+    platform: &str,
 ) {
     // telemetry: registry_push_failure
     metrics
@@ -280,6 +597,7 @@ async fn record_push_failure<M: MetricRecorder + ?Sized>(
                 "error": error_message,
                 "error_kind": error_kind,
                 "auth_expired": auth_expired,
+                "platform": platform,
             })),
         )
         .await;
@@ -291,11 +609,12 @@ async fn stream_push_progress<L, S>(
     registry_endpoint: &str,
     scopes: &[String],
     mut stream: S,
-) -> Result<(), RegistryPushError>
+) -> Result<Option<String>, RegistryPushError>
 where
     L: BuildLogSink + ?Sized,
     S: futures_util::Stream<Item = Result<PushImageInfo, bollard::errors::Error>> + Unpin,
 {
+    let mut last_digest: Option<String> = None;
     while let Some(item) = stream.next().await {
         match item {
             Ok(info) => {
@@ -320,7 +639,7 @@ where
                         %server_id,
                         scopes = ?scopes,
                         %message,
-                        "registry error detail"
+                        "registry error detail",
                     );
                     return Err(RegistryPushError::Remote(message));
                 }
@@ -331,7 +650,7 @@ where
                         %server_id,
                         scopes = ?scopes,
                         %error,
-                        "registry returned error"
+                        "registry returned error",
                     );
                     return Err(RegistryPushError::Remote(error));
                 }
@@ -355,8 +674,9 @@ where
                                 %server_id,
                                 scopes = ?scopes,
                                 %digest,
-                                "registry reported digest"
+                                "registry reported digest",
                             );
+                            last_digest = Some(digest);
                             insert_log(logger, server_id, &digest_message).await;
                         }
                         tracing::info!(
@@ -365,7 +685,7 @@ where
                             %server_id,
                             scopes = ?scopes,
                             status = %line,
-                            "registry push status"
+                            "registry push status",
                         );
                         insert_log(logger, server_id, &line).await;
                     }
@@ -378,20 +698,27 @@ where
                     %server_id,
                     scopes = ?scopes,
                     error = %err,
-                    "registry push stream error"
+                    "registry push stream error",
                 );
                 return Err(RegistryPushError::Push(err));
             }
         }
     }
 
-    Ok(())
+    Ok(last_digest)
 }
+
 
 #[derive(Debug)]
 struct PushStreamOutcome {
     auth_refresh_attempted: bool,
     auth_refresh_succeeded: bool,
+}
+
+#[derive(Debug)]
+struct PushStreamResult {
+    outcome: PushStreamOutcome,
+    digest: Option<String>,
 }
 
 async fn push_stream_with_retry<L, M, F, S>(
@@ -402,8 +729,9 @@ async fn push_stream_with_retry<L, M, F, S>(
     scopes: &[String],
     mut make_stream: F,
     retry_limit: usize,
+    platform: &str,
     mut auth_refresher: Option<&mut dyn RegistryAuthRefresher>,
-) -> Result<PushStreamOutcome, RegistryPushError>
+) -> Result<PushStreamResult, RegistryPushError>
 where
     L: BuildLogSink + ?Sized,
     M: MetricRecorder + ?Sized,
@@ -423,6 +751,7 @@ where
                         "attempt": attempt,
                         "retry_limit": retry_limit,
                         "registry_endpoint": registry_endpoint,
+                        "platform": platform,
                     })),
                 )
                 .await;
@@ -434,7 +763,8 @@ where
             scopes = ?scopes,
             attempt,
             retry_limit,
-            "starting registry push attempt"
+            platform = %platform,
+            "starting registry push attempt",
         );
         insert_log(
             logger,
@@ -443,20 +773,8 @@ where
         )
         .await;
 
-        match stream_push_progress(logger, server_id, registry_endpoint, scopes, make_stream())
-            .await
-        {
-            Ok(()) => {
-                if attempt > 1 {
-                    tracing::info!(
-                        target: "registry.push",
-                        %registry_endpoint,
-                        %server_id,
-                        scopes = ?scopes,
-                        attempt,
-                        "registry push succeeded after retry"
-                    );
-                }
+        match stream_push_progress(logger, server_id, registry_endpoint, scopes, make_stream()).await {
+            Ok(digest) => {
                 metrics
                     .record(
                         "push_succeeded",
@@ -464,202 +782,42 @@ where
                             "attempt": attempt,
                             "retry_limit": retry_limit,
                             "registry_endpoint": registry_endpoint,
+                            "platform": platform,
                         })),
                     )
                     .await;
-                return Ok(PushStreamOutcome {
-                    auth_refresh_attempted: refresh_attempted,
-                    auth_refresh_succeeded: refresh_succeeded,
-                });
-            }
-            Err(RegistryPushError::Push(err))
-                if attempt < retry_limit && is_retryable_push_error(&err) =>
-            {
-                tracing::warn!(
+                tracing::info!(
                     target: "registry.push",
                     %registry_endpoint,
                     %server_id,
                     scopes = ?scopes,
                     attempt,
                     retry_limit,
-                    error = %err,
-                    "retryable registry push error"
+                    platform = %platform,
+                    "registry push succeeded",
                 );
-                metrics
-                    .record(
-                        "push_retry",
-                        Some(json!({
-                            "attempt": attempt,
-                            "retry_limit": retry_limit,
-                            "registry_endpoint": registry_endpoint,
-                            "error": err.to_string(),
-                        })),
-                    )
-                    .await;
-                let backoff = Duration::from_millis(100 * attempt as u64);
-                sleep(backoff).await;
-                continue;
-            }
-            Err(RegistryPushError::AuthExpired(message)) => {
-                if let Some(ref mut refresher) = auth_refresher {
-                    refresh_attempted = true;
-                    metrics
-                        .record(
-                            "auth_refresh_started",
-                            Some(json!({
-                                "attempt": attempt,
-                                "retry_limit": retry_limit,
-                                "registry_endpoint": registry_endpoint,
-                            })),
-                        )
-                        .await;
-                    insert_log(
-                        logger,
-                        server_id,
-                        "Refreshing registry credentials after authentication expiry",
-                    )
-                    .await;
-                    tracing::warn!(
-                        target: "registry.push",
-                        %registry_endpoint,
-                        %server_id,
-                        scopes = ?scopes,
-                        attempt,
-                        retry_limit,
-                        error = %message,
-                        "registry authentication expired; attempting credential refresh",
-                    );
-
-                    match refresher.refresh().await {
-                        Ok(()) => {
-                            refresh_succeeded = true;
-                            metrics
-                                .record(
-                                    "auth_refresh_succeeded",
-                                    Some(json!({
-                                        "attempt": attempt,
-                                        "retry_limit": retry_limit,
-                                        "registry_endpoint": registry_endpoint,
-                                    })),
-                                )
-                                .await;
-                            insert_log(
-                                logger,
-                                server_id,
-                                "Registry credentials refreshed; retrying push",
-                            )
-                            .await;
-                            tracing::info!(
-                                target: "registry.push",
-                                %registry_endpoint,
-                                %server_id,
-                                scopes = ?scopes,
-                                attempt,
-                                retry_limit,
-                                "registry auth refresh succeeded; retrying push",
-                            );
-                            metrics
-                                .record(
-                                    "push_retry",
-                                    Some(json!({
-                                        "attempt": attempt,
-                                        "retry_limit": retry_limit,
-                                        "registry_endpoint": registry_endpoint,
-                                        "reason": "auth_refresh",
-                                        "error": message,
-                                    })),
-                                )
-                                .await;
-                            let backoff = Duration::from_millis(100 * attempt as u64);
-                            sleep(backoff).await;
-                            continue;
-                        }
-                        Err(refresh_err) => {
-                            metrics
-                                .record(
-                                    "auth_refresh_failed",
-                                    Some(json!({
-                                        "attempt": attempt,
-                                        "retry_limit": retry_limit,
-                                        "registry_endpoint": registry_endpoint,
-                                        "error": refresh_err,
-                                    })),
-                                )
-                                .await;
-                            insert_log(
-                                logger,
-                                server_id,
-                                "Registry auth refresh failed; aborting push",
-                            )
-                            .await;
-                            tracing::error!(
-                                target: "registry.push",
-                                %registry_endpoint,
-                                %server_id,
-                                scopes = ?scopes,
-                                attempt,
-                                retry_limit,
-                                error = %refresh_err,
-                                "registry auth refresh failed",
-                            );
-                            let err = RegistryPushError::AuthExpired(format!(
-                                "{message}; auth refresh failed: {refresh_err}"
-                            ));
-                            let (error_kind, auth_expired) = classify_registry_push_error(&err);
-                            let error_message = err.to_string();
-                            record_push_failure(
-                                metrics,
-                                registry_endpoint,
-                                attempt,
-                                retry_limit,
-                                error_kind,
-                                &error_message,
-                                auth_expired,
-                            )
-                            .await;
-                            tracing::error!(
-                                target: "registry.push",
-                                %registry_endpoint,
-                                %server_id,
-                                scopes = ?scopes,
-                                attempt,
-                                retry_limit,
-                                error = %error_message,
-                                "registry push failed",
-                            );
-                            return Err(err);
-                        }
-                    }
-                } else {
-                    let err = RegistryPushError::AuthExpired(message);
-                    let (error_kind, auth_expired) = classify_registry_push_error(&err);
-                    let error_message = err.to_string();
-                    record_push_failure(
-                        metrics,
-                        registry_endpoint,
-                        attempt,
-                        retry_limit,
-                        error_kind,
-                        &error_message,
-                        auth_expired,
-                    )
-                    .await;
-                    tracing::error!(
-                        target: "registry.push",
-                        %registry_endpoint,
-                        %server_id,
-                        scopes = ?scopes,
-                        attempt,
-                        retry_limit,
-                        error = %error_message,
-                        "registry push failed",
-                    );
-                    return Err(err);
+                insert_log(
+                    logger,
+                    server_id,
+                    &format!(
+                        "Registry push succeeded after {attempt} attempt(s) for {registry_endpoint}"
+                    ),
+                )
+                .await;
+                return Ok(PushStreamOutcome {
+                    auth_refresh_attempted: refresh_attempted,
+                    auth_refresh_succeeded: refresh_succeeded,
                 }
+                .into_with_digest(digest));
             }
             Err(err) => {
                 let (error_kind, auth_expired) = classify_registry_push_error(&err);
                 let error_message = err.to_string();
+                let retryable = matches!(
+                    &err,
+                    RegistryPushError::Push(inner) | RegistryPushError::Tag(inner)
+                        if is_retryable_push_error(inner)
+                );
                 record_push_failure(
                     metrics,
                     registry_endpoint,
@@ -668,6 +826,7 @@ where
                     error_kind,
                     &error_message,
                     auth_expired,
+                    platform,
                 )
                 .await;
                 tracing::error!(
@@ -677,17 +836,220 @@ where
                     scopes = ?scopes,
                     attempt,
                     retry_limit,
+                    platform = %platform,
                     error = %error_message,
                     "registry push failed",
                 );
-                return Err(err);
+
+                if auth_expired {
+                    refresh_attempted = true;
+                    if let Some(refresher) = auth_refresher.as_mut() {
+                        insert_log(
+                            logger,
+                            server_id,
+                            "Refreshing registry credentials after authentication expiry",
+                        )
+                        .await;
+                        tracing::warn!(
+                            target: "registry.push",
+                            %registry_endpoint,
+                            %server_id,
+                            scopes = ?scopes,
+                            attempt,
+                            retry_limit,
+                            platform = %platform,
+                            error = %error_message,
+                            "registry authentication expired; attempting credential refresh",
+                        );
+
+                        metrics
+                            .record(
+                                "auth_refresh_started",
+                                Some(json!({
+                                    "attempt": attempt,
+                                    "retry_limit": retry_limit,
+                                    "registry_endpoint": registry_endpoint,
+                                    "platform": platform,
+                                })),
+                            )
+                            .await;
+
+                        match refresher.refresh().await {
+                            Ok(()) => {
+                                refresh_succeeded = true;
+                                metrics
+                                    .record(
+                                        "auth_refresh_succeeded",
+                                        Some(json!({
+                                            "attempt": attempt,
+                                            "retry_limit": retry_limit,
+                                            "registry_endpoint": registry_endpoint,
+                                            "platform": platform,
+                                        })),
+                                    )
+                                    .await;
+                                insert_log(
+                                    logger,
+                                    server_id,
+                                    "Registry credentials refreshed; retrying push",
+                                )
+                                .await;
+                                tracing::info!(
+                                    target: "registry.push",
+                                    %registry_endpoint,
+                                    %server_id,
+                                    scopes = ?scopes,
+                                    attempt,
+                                    retry_limit,
+                                    platform = %platform,
+                                    "registry auth refresh succeeded; retrying push",
+                                );
+                                metrics
+                                    .record(
+                                        "push_retry",
+                                        Some(json!({
+                                            "attempt": attempt,
+                                            "retry_limit": retry_limit,
+                                            "registry_endpoint": registry_endpoint,
+                                            "reason": "auth_refresh",
+                                            "error": error_message,
+                                            "platform": platform,
+                                        })),
+                                    )
+                                    .await;
+                                let backoff = Duration::from_millis(100 * attempt as u64);
+                                sleep(backoff).await;
+                                continue;
+                            }
+                            Err(refresh_err) => {
+                                metrics
+                                    .record(
+                                        "auth_refresh_failed",
+                                        Some(json!({
+                                            "attempt": attempt,
+                                            "retry_limit": retry_limit,
+                                            "registry_endpoint": registry_endpoint,
+                                            "error": refresh_err,
+                                            "platform": platform,
+                                        })),
+                                    )
+                                    .await;
+                                insert_log(
+                                    logger,
+                                    server_id,
+                                    "Registry auth refresh failed; aborting push",
+                                )
+                                .await;
+                                tracing::error!(
+                                    target: "registry.push",
+                                    %registry_endpoint,
+                                    %server_id,
+                                    scopes = ?scopes,
+                                    attempt,
+                                    retry_limit,
+                                    platform = %platform,
+                                    error = %refresh_err,
+                                    "registry auth refresh failed",
+                                );
+                                let err = RegistryPushError::AuthExpired(format!(
+                                    "{error_message}; auth refresh failed: {refresh_err}"
+                                ));
+                                let (error_kind, auth_expired) = classify_registry_push_error(&err);
+                                let error_message = err.to_string();
+                                record_push_failure(
+                                    metrics,
+                                    registry_endpoint,
+                                    attempt,
+                                    retry_limit,
+                                    error_kind,
+                                    &error_message,
+                                    auth_expired,
+                                    platform,
+                                )
+                                .await;
+                                tracing::error!(
+                                    target: "registry.push",
+                                    %registry_endpoint,
+                                    %server_id,
+                                    scopes = ?scopes,
+                                    attempt,
+                                    retry_limit,
+                                    platform = %platform,
+                                    error = %error_message,
+                                    "registry push failed",
+                                );
+                                return Err(err);
+                            }
+                        }
+                    } else {
+                        let err = RegistryPushError::AuthExpired(error_message);
+                        let (error_kind, auth_expired) = classify_registry_push_error(&err);
+                        let error_message = err.to_string();
+                        record_push_failure(
+                            metrics,
+                            registry_endpoint,
+                            attempt,
+                            retry_limit,
+                            error_kind,
+                            &error_message,
+                            auth_expired,
+                            platform,
+                        )
+                        .await;
+                        tracing::error!(
+                            target: "registry.push",
+                            %registry_endpoint,
+                            %server_id,
+                            scopes = ?scopes,
+                            attempt,
+                            retry_limit,
+                            platform = %platform,
+                            error = %error_message,
+                            "registry push failed",
+                        );
+                        return Err(err);
+                    }
+                } else {
+                    if attempt < retry_limit && retryable {
+                        metrics
+                            .record(
+                                "push_retry",
+                                Some(json!({
+                                    "attempt": attempt,
+                                    "retry_limit": retry_limit,
+                                    "registry_endpoint": registry_endpoint,
+                                    "reason": "retryable_error",
+                                    "error": error_message,
+                                    "platform": platform,
+                                })),
+                            )
+                            .await;
+                        let backoff = Duration::from_millis(100 * attempt as u64);
+                        sleep(backoff).await;
+                        continue;
+                    }
+
+                    return Err(err);
+                }
             }
+        }
+    }
+}
+
+impl PushStreamOutcome {
+    fn into_with_digest(self, digest: Option<String>) -> PushStreamResult {
+        PushStreamResult {
+            outcome: self,
+            digest,
         }
     }
 }
 
 pub struct RegistryPushResult {
     pub image: String,
+    pub remote_tag: String,
+    pub digest: Option<String>,
+    pub platform: String,
     pub auth_refresh_attempted: bool,
     pub auth_refresh_succeeded: bool,
 }
@@ -697,11 +1059,14 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
     logger: &L,
     docker: &Docker,
     server_id: i32,
-    image_tag: &str,
+    local_image: &str,
     registry: &str,
+    remote_image_name: &str,
+    remote_tag: &str,
+    platform: &str,
     credential_refresher: Option<CredentialRefreshFn>,
 ) -> Result<RegistryPushResult, RegistryPushError> {
-    let reference = build_registry_reference(registry, image_tag);
+    let reference = build_registry_reference(registry, remote_image_name, remote_tag);
     let scopes = registry_scopes(&reference.repository);
     insert_log(
         logger,
@@ -727,6 +1092,7 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
             Some(json!({
                 "registry_endpoint": &reference.repository,
                 "tag": &reference.tag,
+                "platform": platform,
             })),
         )
         .await;
@@ -735,7 +1101,7 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
         .repo(&reference.repository)
         .tag(&reference.tag)
         .build();
-    if let Err(err) = docker.tag_image(image_tag, Some(tag_opts)).await {
+    if let Err(err) = docker.tag_image(local_image, Some(tag_opts)).await {
         let error_message = err.to_string();
         record_push_failure(
             &usage_metrics,
@@ -745,6 +1111,7 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
             "tag",
             &error_message,
             false,
+            platform,
         )
         .await;
         tracing::error!(
@@ -771,6 +1138,7 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
             Some(json!({
                 "registry_endpoint": &reference.repository,
                 "tag": &reference.tag,
+                "platform": platform,
             })),
         )
         .await;
@@ -791,7 +1159,7 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
     let mut refresh_context = credential_refresher
         .map(|refresh_fn| SharedDockerRefresher::new(Arc::clone(&shared_docker), refresh_fn));
 
-    let outcome = push_stream_with_retry(
+    let push_result = push_stream_with_retry(
         logger,
         &usage_metrics,
         server_id,
@@ -811,26 +1179,34 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
             }
         },
         retry_limit,
+        platform,
         refresh_context
             .as_mut()
             .map(|context| context as &mut dyn RegistryAuthRefresher),
     )
     .await?;
-
+    let outcome = push_result.outcome;
+    let digest = push_result.digest;
     insert_log(logger, server_id, "Image pushed to registry").await;
     tracing::info!(
         target: "registry.push",
         registry_endpoint = %reference.repository,
         %server_id,
         scopes = ?scopes,
-        "registry push completed"
+        platform = %platform,
+        digest = ?digest,
+        "registry push completed",
     );
 
     Ok(RegistryPushResult {
         image: reference.display_name(),
+        remote_tag: reference.tag,
+        digest,
+        platform: platform.to_string(),
         auth_refresh_attempted: outcome.auth_refresh_attempted,
         auth_refresh_succeeded: outcome.auth_refresh_succeeded,
     })
+
 }
 
 async fn insert_log<L: BuildLogSink + ?Sized>(logger: &L, server_id: i32, text: &str) {
@@ -913,7 +1289,13 @@ pub async fn build_from_git(
     }
 
     insert_log(pool, server_id, "Building image").await;
-    let tag = format!("mcp-custom-{server_id}");
+    let base_name = format!("mcp-custom-{server_id}");
+    let manifest_tag = "latest";
+    let platform_targets = desired_platform_targets();
+    let registry_env = std::env::var("REGISTRY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let mut registry_image = None;
     let mut auth_refresh_attempted = false;
     let mut auth_refresh_succeeded = false;
@@ -948,33 +1330,135 @@ pub async fn build_from_git(
         }
     };
 
-    let options = BuildImageOptions::<String> {
-        dockerfile: "Dockerfile".into(),
-        t: tag.clone(),
-        pull: true,
-        nocache: true,
-        rm: true,
-        forcerm: true,
-        ..Default::default()
-    };
+    let mut platform_pushes: Vec<(PlatformTarget, RegistryPushResult)> = Vec::new();
+    let mut local_alias_created = false;
 
-    let mut build_stream = docker.build_image(options, None, Some(body_full(tar_data)));
-    while let Some(item) = build_stream.next().await {
-        match item {
-            Ok(output) => {
-                if let Some(msg) = output.stream {
-                    insert_log(pool, server_id, msg.trim()).await;
+    for target in &platform_targets {
+        let local_tag = format!("{base_name}-{}", target.slug);
+        let build_options = BuildImageOptions::<String> {
+            dockerfile: "Dockerfile".into(),
+            t: local_tag.clone(),
+            pull: true,
+            nocache: true,
+            rm: true,
+            forcerm: true,
+            platform: target.spec.clone(),
+            ..Default::default()
+        };
+
+        let mut build_stream =
+            docker.build_image(build_options, None, Some(body_full(tar_data.clone())));
+        while let Some(item) = build_stream.next().await {
+            match item {
+                Ok(output) => {
+                    if let Some(msg) = output.stream {
+                        insert_log(pool, server_id, msg.trim()).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(?e, platform = %target.spec, "docker build error");
+                    insert_log(pool, server_id, "Image build failed").await;
+                    set_status_or_log(pool, server_id, "error").await?;
+                    return Ok(None);
                 }
             }
-            Err(e) => {
-                tracing::error!(?e, "docker build error");
-                insert_log(pool, server_id, "Image build failed").await;
+        }
+
+        if !local_alias_created {
+            let alias_opts = TagImageOptionsBuilder::new()
+                .repo(&base_name)
+                .tag("latest")
+                .build();
+            if let Err(err) = docker.tag_image(&local_tag, Some(alias_opts)).await {
+                tracing::error!(?err, %server_id, platform = %target.spec, "failed to tag local image alias");
+                insert_log(pool, server_id, "Failed to tag local image").await;
                 set_status_or_log(pool, server_id, "error").await?;
                 return Ok(None);
+            }
+            local_alias_created = true;
+        }
+
+        if let Some(registry) = registry_env.as_ref() {
+            let remote_tag = if platform_targets.len() > 1 {
+                format!("{manifest_tag}-{}", target.slug)
+            } else {
+                manifest_tag.to_string()
+            };
+            match push_image_to_registry(
+                pool,
+                pool,
+                &docker,
+                server_id,
+                &local_tag,
+                registry,
+                &base_name,
+                &remote_tag,
+                &target.spec,
+                None,
+            )
+            .await
+            {
+                Ok(result) => {
+                    auth_refresh_attempted |= result.auth_refresh_attempted;
+                    auth_refresh_succeeded |= result.auth_refresh_succeeded;
+                    platform_pushes.push((target.clone(), result));
+                }
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        registry = %registry,
+                        platform = %target.spec,
+                        %server_id,
+                        "registry push failed"
+                    );
+                    insert_log(pool, server_id, &format!("Registry push failed: {err}")).await;
+                    set_status_or_log(pool, server_id, "error").await?;
+                    return Ok(None);
+                }
             }
         }
     }
 
+    if let Some(registry) = registry_env.as_ref() {
+        if platform_pushes.len() > 1 {
+            let mut manifest_inputs = Vec::new();
+            for (target, result) in &platform_pushes {
+                if let Some(digest) = result.digest.clone() {
+                    manifest_inputs.push((target.clone(), digest));
+                } else {
+                    tracing::error!(platform = %target.spec, %server_id, "missing digest for manifest publish");
+                    insert_log(pool, server_id, "Missing digest for manifest publish").await;
+                    set_status_or_log(pool, server_id, "error").await?;
+                    return Ok(None);
+                }
+            }
+            let manifest_metrics = UsageMetricRecorder { pool, server_id };
+            if let Err(err) = publish_manifest_list(
+                pool,
+                &manifest_metrics,
+                server_id,
+                registry,
+                &base_name,
+                manifest_tag,
+                &manifest_inputs,
+            )
+            .await
+            {
+                tracing::error!(?err, registry = %registry, %server_id, "manifest publish failed");
+                insert_log(pool, server_id, &format!("Manifest publish failed: {err}")).await;
+                set_status_or_log(pool, server_id, "error").await?;
+                return Ok(None);
+            }
+            registry_image = Some(format!(
+                "{}/{}:{}",
+                registry.trim_end_matches('/'),
+                base_name,
+                manifest_tag
+            ));
+        } else if let Some((_, result)) = platform_pushes.first() {
+            registry_image = Some(result.image.clone());
+        }
+    }
     // Parse Dockerfile for EXPOSE instructions
     let dockerfile = tmp.path().join("Dockerfile");
     if let Ok(content) = tokio::fs::read_to_string(&dockerfile).await {
@@ -985,28 +1469,9 @@ pub async fn build_from_git(
 
     insert_log(pool, server_id, "Image built").await;
 
-    if let Ok(registry) = std::env::var("REGISTRY") {
-        let registry = registry.trim();
-        if !registry.is_empty() {
-            match push_image_to_registry(pool, pool, &docker, server_id, &tag, registry, None).await
-            {
-                Ok(push_result) => {
-                    registry_image = Some(push_result.image);
-                    auth_refresh_attempted = push_result.auth_refresh_attempted;
-                    auth_refresh_succeeded = push_result.auth_refresh_succeeded;
-                }
-                Err(err) => {
-                    tracing::error!(?err, %registry, %server_id, "registry push failed");
-                    insert_log(pool, server_id, &format!("Registry push failed: {err}")).await;
-                    set_status_or_log(pool, server_id, "error").await?;
-                    return Ok(None);
-                }
-            }
-        }
-    }
     insert_log(pool, server_id, "Cleaning up").await;
     Ok(Some(BuildArtifacts {
-        local_image: tag,
+        local_image: base_name,
         registry_image,
         auth_refresh_attempted,
         auth_refresh_succeeded,
@@ -1016,9 +1481,12 @@ pub async fn build_from_git(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD as Base64Standard;
+    use base64::Engine;
     use bollard::models::PushImageInfo;
     use futures_util::stream;
-    use tempfile::tempdir;
+    use httpmock::prelude::*;
+    use tempfile::{tempdir, NamedTempFile};
     use tokio::sync::Mutex;
 
     #[derive(Default)]
@@ -1134,7 +1602,7 @@ mod tests {
 
     #[test]
     fn registry_reference_formats_path() {
-        let reference = build_registry_reference("example.com/org/", "app");
+        let reference = build_registry_reference("example.com/org/", "app", "latest");
         assert_eq!(reference.repository, "example.com/org/app");
         assert_eq!(reference.tag, "latest");
         assert_eq!(reference.display_name(), "example.com/org/app:latest");
@@ -1271,13 +1739,14 @@ mod tests {
                 }
             },
             3,
+            "linux/amd64",
             None,
         )
         .await
         .expect("retry should eventually succeed");
 
-        assert!(!outcome.auth_refresh_attempted);
-        assert!(!outcome.auth_refresh_succeeded);
+        assert!(!outcome.outcome.auth_refresh_attempted);
+        assert!(!outcome.outcome.auth_refresh_succeeded);
 
         assert_eq!(counter.load(Ordering::SeqCst), 2);
         let events = metrics.events().await;
@@ -1318,6 +1787,7 @@ mod tests {
                 })])
             },
             2,
+            "linux/amd64",
             None,
         )
         .await
@@ -1361,6 +1831,7 @@ mod tests {
                 stream::iter(vec![Ok(info)])
             },
             2,
+            "linux/amd64",
             None,
         )
         .await
@@ -1414,13 +1885,14 @@ mod tests {
                 }
             },
             3,
+            "linux/amd64",
             Some(&mut refresher as &mut dyn RegistryAuthRefresher),
         )
         .await
         .expect("refresh should allow push to succeed");
 
-        assert!(outcome.auth_refresh_attempted);
-        assert!(outcome.auth_refresh_succeeded);
+        assert!(outcome.outcome.auth_refresh_attempted);
+        assert!(outcome.outcome.auth_refresh_succeeded);
 
         assert_eq!(counter.load(Ordering::SeqCst), 2);
         assert_eq!(refresher.attempts(), 1);
@@ -1487,6 +1959,7 @@ mod tests {
                 stream::iter(vec![Ok(info)])
             },
             2,
+            "linux/amd64",
             Some(&mut refresher as &mut dyn RegistryAuthRefresher),
         )
         .await
@@ -1537,6 +2010,7 @@ mod tests {
             "tag",
             "simulated failure",
             false,
+            "linux/amd64",
         )
         .await;
 
@@ -1569,8 +2043,80 @@ mod tests {
             failure_entry.get("auth_expired").and_then(Value::as_bool),
             Some(false)
         );
+        assert_eq!(
+            failure_entry.get("platform").and_then(Value::as_str),
+            Some("linux/amd64")
+        );
     }
 
+
+
+    #[tokio::test]
+    async fn publish_manifest_list_pushes_payload() {
+        let server = MockServer::start_async().await;
+        let registry = format!("http://{}/demo", server.address());
+        let auth_value = Base64Standard.encode("user:pass");
+        let config = NamedTempFile::new().expect("temp docker config");
+        std::fs::write(
+            config.path(),
+            format!(
+                r#"{{"auths": {{"http://{}": {{"auth": "{}"}}}}}}"#,
+                server.address(),
+                auth_value
+            ),
+        )
+        .expect("write docker config");
+        std::env::set_var("REGISTRY_AUTH_DOCKERCONFIG", config.path());
+
+        let manifest_path = "/v2/demo/example/manifests/latest";
+        let mock = server
+            .mock_async(|when, then| {
+                when.method("PUT")
+                    .path(manifest_path)
+                    .header("authorization", format!("Basic {}", auth_value))
+                    .header(
+                        "content-type",
+                        "application/vnd.docker.distribution.manifest.list.v2+json",
+                    );
+                then.status(201)
+                    .header("Docker-Content-Digest", "sha256:manifest123");
+            })
+            .await;
+
+        let logger = RecordingLog::default();
+        let metrics = RecordingMetrics::default();
+        let target = PlatformTarget::parse("linux/amd64").expect("valid platform");
+
+        let digest = publish_manifest_list(
+            &logger,
+            &metrics,
+            5,
+            &registry,
+            "example",
+            "latest",
+            &[(target.clone(), "sha256:deadbeef".to_string())],
+        )
+        .await
+        .expect("manifest publish succeeds");
+
+        assert_eq!(digest, "sha256:manifest123");
+        mock.assert_async().await;
+
+        let events = metrics.events().await;
+        let manifest_event = events
+            .iter()
+            .find(|(event, _)| event == "manifest_published")
+            .expect("manifest event emitted");
+        let details = manifest_event.1.as_ref().expect("manifest details");
+        assert_eq!(
+            details
+                .get("architectures")
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.first())
+                .and_then(Value::as_str),
+            Some("linux/amd64")
+        );
+    }
     #[tokio::test]
     async fn record_push_failure_respects_auth_flag() {
         let cases = vec![(true, "auth_expired"), (false, "remote")];
@@ -1586,6 +2132,7 @@ mod tests {
                 error_kind,
                 "failure",
                 auth_expired,
+                "linux/amd64",
             )
             .await;
 
@@ -1607,6 +2154,10 @@ mod tests {
             assert_eq!(
                 failure_entry.get("error_kind").and_then(Value::as_str),
                 Some(error_kind)
+            );
+            assert_eq!(
+                failure_entry.get("platform").and_then(Value::as_str),
+                Some("linux/amd64")
             );
         }
     }
@@ -1661,6 +2212,7 @@ mod tests {
                 error_kind,
                 &error_message,
                 auth_flag,
+                "linux/amd64",
             )
             .await;
 
@@ -1700,6 +2252,10 @@ mod tests {
                     .map(|value| value.to_owned()),
                 Some(error_message.clone()),
             );
+            assert_eq!(
+                failure_entry.get("platform").and_then(Value::as_str),
+                Some("linux/amd64")
+            );
         }
     }
 
@@ -1715,6 +2271,7 @@ mod tests {
             "remote",
             "simulated error",
             false,
+            "linux/amd64",
         )
         .await;
 
@@ -1756,6 +2313,7 @@ mod tests {
                 stream::iter(vec![Ok(info)])
             },
             2,
+            "linux/amd64",
             None,
         )
         .await
@@ -1846,6 +2404,7 @@ mod tests {
                 })])
             },
             1,
+            "linux/amd64",
             None,
         )
         .await
