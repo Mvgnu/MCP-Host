@@ -23,6 +23,7 @@ The build service tags and pushes images using the Docker remote API via Bollard
 * Authentication failures generate `registry authentication expired` errors and surface to the server status feed so operators can refresh credentials.
 * Transient transport errors (I/O, hyper, HTTP client, or timeouts) retry up to `REGISTRY_PUSH_RETRIES` attempts (default `3`) with a short backoff. Override the limit via an environment variable when tuning resilience.
 * Usage metrics capture each stage: `tag_started`/`tag_succeeded` for Docker tagging and `push_failed` entries with `attempt=0` for pre-stream failures, giving observability platforms enough context to differentiate tagging issues from push retries.
+* Telemetry payloads now include `attempt`, `retry_limit`, `registry_endpoint`, `error_kind`, and `auth_expired` keys so downstream dashboards can surface retry pressure and credential expiry without additional joins.
 
 #### Runbook
 

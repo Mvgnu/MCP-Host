@@ -656,3 +656,7 @@ This document tracks development progress and high level notes from the planning
 - Audited usage-metrics consumers and updated the server dashboard to render tagging and push telemetry with friendly labels.
 - Added `MetricsEventList` to expose new registry metadata alongside charted cadence trends.
 - Extended backend registry tests with table-driven coverage for `record_push_failure` and error classification to guard retry/auth flags.
+## 2025-10-27
+- Verified downstream telemetry consumers: server metrics API/UI accept `tag_*` and enriched `push_*` payloads; updated MetricsEventList to surface registry endpoint, retry, and auth context for failure/retry events.
+- Documented payload contract (`attempt`, `retry_limit`, `registry_endpoint`, `error_kind`, `auth_expired`) in README so dashboards ingesting raw JSON stay aligned.
+- Added negative-path regression tests covering every `RegistryPushError` variant, zero-retry handling, and malformed remote detail responses to ensure `record_push_failure` metrics remain stable.
