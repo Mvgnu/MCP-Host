@@ -1,0 +1,13 @@
+# Rust
+/target
+
+# Node
+node_modules/
+next-env.d.ts
+.DS_Store
+
+# general
+.env
+/backend/target
+proxy_conf/
+storage/

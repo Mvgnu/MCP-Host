@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    env:
+      JWT_SECRET: testsecret
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-rust@v1
+        with:
+          rust-version: stable
+      - name: Install tools
+        run: cargo install cargo-audit --locked
+      - name: Build & Test
+        run: |
+          cargo fmt --check --manifest-path backend/Cargo.toml
+          cargo clippy --manifest-path backend/Cargo.toml -- -D warnings
+          cargo build --manifest-path backend/Cargo.toml
+          cargo test --manifest-path backend/Cargo.toml
+          cargo audit
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      - name: Install
+        run: npm install --prefix frontend --legacy-peer-deps
+      - name: Lint & Test
+        run: |
+          npm run lint --prefix frontend
+          npm test --prefix frontend
+          npx playwright install --with-deps
+          npm run test:e2e --prefix frontend
+          npm run build --prefix frontend

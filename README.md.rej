@@ -1,0 +1,190 @@
+@@ -59,51 +59,60 @@
+ 
+ The usage_metrics table can function as an event log for each server (one row per operation or request) or store aggregated stats (e.g. daily usage counts), depending on how we implement metrics collection. For simplicity, we’ll log each significant event for now. This data will enable both historical analysis (e.g. usage over time) and real-time monitoring of activity.
+ 
+ We will use a database migration tool or ORM to create these tables. For example, if using Diesel (a type-safe Rust ORM), a migration file would contain SQL as above and can be run with diesel migration run  to set up the schema. If using an async SQL library like SQLx or Prisma, similar table definitions would be applied in the setup phase.
+ 
+ Backend Setup (Rust, Axum Framework)
+ 
+ Project Initialization: Start a new Rust project (binary crate) for the backend. In Cargo.toml, add dependencies for our web server, database, and auth needs. For example:
+ 
+ [dependencies]
+ axum = "0.6"              # Web framework for routing and handlers
+ tokio = { version = "1.28", features = ["full"] }  # Async runtime
+ serde = { version = "1.0", features = ["derive"] } # For JSON serialization
+ serde_json = "1.0"
+ dotenvy = "0.15"          # To load env vars (like DATABASE_URL)
+ sqlx = { version = "0.6", features = ["postgres", "runtime-tokio-native-tls"] } 
+ # or alternatively: diesel = { version = "2.1.0", features = ["postgres"] }
+ 
+ jsonwebtoken = "8.2"      # For JWT creation/verification
+ argon2 = "0.4"            # For secure password hashing (Argon2id)
+ uuid = "1.3"              # To generate unique IDs (optional, e.g. for session tokens)
+ tracing = "0.1"           # For logging
+ 
+ Why Axum? Axum (from the Tokio project) provides a fast, modular HTTP server with strong async support and type-safe routing . It integrates nicely with Tower middleware and Rust’s ecosystem. We choose Axum for clarity and performance, but Actix-Web could also be used with similar principles. We’ll use PostgreSQL via an async driver (SQLx) or Diesel with a connection pool for database operations.
+ 
+-Configuration: Load configuration from environment variables or a .env file (using dotenvy). Critical settings include the DATABASE_URL (Postgres connection string), a JWT signing secret key, and possibly a Docker host or other runtime configs. We’ll also enable logging with tracing for debugging.
++Configuration: Load configuration from environment variables or a `.env` file using `dotenvy`. **Both** `DATABASE_URL` and `JWT_SECRET` must be defined before starting the server. The JWT secret is used for signing authentication tokens and the process will exit if it is missing. Other runtime configs (like Docker host) can also be provided. We’ll enable structured logging with `tracing` for debugging.
++The optional `CONTAINER_RUNTIME` variable selects the backend used to run MCP
++servers. `docker` is the default, but you can set it to `kubernetes` to launch
++pods in the current cluster (using your kubeconfig). When enabled, the backend
++creates a pod per server and streams logs via the Kubernetes API. If
++initialization fails the server logs a warning and falls back to Docker.
++When using the Kubernetes runtime you may set `K8S_NAMESPACE` to control which
++namespace pods are created in. It defaults to `default`.
++Set `K8S_SERVICE_ACCOUNT` to specify the service account used by the pods,
++also defaulting to `default`.
+ 
+ Database Connection Pool: Initialize a connection pool to Postgres at startup. For SQLx, for example:
+ 
+ use sqlx::postgres::PgPoolOptions;
+ 
+ #[tokio::main]
+ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+     dotenvy::dotenv().ok();  // load .env if present
+     let database_url = std::env::var("DATABASE_URL")?;
+     // Create a connection pool (with 5 connections here)
+     let db_pool = PgPoolOptions::new()
+         .max_connections(5)
+         .connect(&database_url).await?;
+     // ... set up Axum router next
+ }
+ 
+ This pool (db_pool) will be added to Axum’s application state so handlers can access the DB. In Axum, we can use an extractor for state or a global using Extension. For example:
+ 
+ use axum::{Router, Extension};
+ 
+ let app = Router::new()
+     .route("/", axum::routing::get(root_handler))
+     // ... (other routes)
+     .layer(Extension(db_pool));  // make pool available to all handlers
+ 
+@@ -647,80 +656,127 @@
+   <p className="text-sm text-gray-600">Use this URL and API key in your AI assistant configuration to connect.</p>
+ </div>
+ 
+ (If we didn’t implement subdomains, this could be a placeholder or something like http://host:port we computed. But ideally, we mimic the AnyContext style with subdomain.)
+ 
+ Usage Metrics UI: For historical metrics, we could show a chart. Using a library like Chart.js or Recharts can make attractive visuals. For instance, to integrate Chart.js we’d install react-chartjs-2 and chart.js and create a line chart of daily usage counts  . If we have data like an array of dates and counts, it’s straightforward to pass it to a <Line> component from react-chartjs-2.
+ 
+ For real-time metrics, we can use the SSE endpoint we made. In React, the simplest is to use the browser’s EventSource API:
+ 
+ // In server detail component
+ useEffect(() => {
+   const evtSource = new EventSource(`${apiUrl}/api/servers/${id}/metrics/stream`, { withCredentials: true });
+   evtSource.onmessage = (event) => {
+     if (event.data) {
+       const obj = JSON.parse(event.data);
+       setLiveMetrics(obj); // update some state with the new data
+     }
+   };
+   evtSource.onerror = (err) => {
+     console.error("SSE error:", err);
+     evtSource.close();
+   };
+   return () => evtSource.close();
+ }, [id]);
+ 
++The server list itself also stays current by listening to `/api/servers/stream`,
++which emits JSON `{id, status}` whenever a deployment changes state.
++
+ Now liveMetrics state will update whenever the server pushes an event (for example, number of requests per minute as we coded earlier). We can display that in the UI (e.g. “Current QPS: X” or updating a chart dynamically). This gives the user immediate feedback on usage without refreshing .
+ 
+ Responsive Design: Throughout the frontend, use Tailwind’s responsive utilities to ensure the site works on mobile and desktop. For example, on the dashboard table, we might hide less important columns on small screens or use a card layout instead of a wide table on a narrow viewport. Tailwind makes it easy: e.g., <td className="hidden sm:table-cell"> could hide a cell on mobile, showing it from sm breakpoint up. We also used classes like min-h-screen flex items-center justify-center for the login container – these ensure the page is centered vertically and horizontally, and will naturally adapt to various screen sizes. The design principle is mobile-first: start with a single-column or stacked layout, then add md: prefixes to create side-by-side components on larger screens  .
+ 
+ For instance, we might design the dashboard as a two-column layout on desktop: a sidebar with navigation and a main content area. Using Tailwind, we could do:
+ 
+ <div className="md:flex">
+   <aside className="md:w-1/4 p-4 bg-gray-800 text-white"> ...sidebar links... </aside>
+   <main className="md:w-3/4 p-6"> ...main dashboard content... </main>
+ </div>
+ 
+ On mobile, without the md: prefixes, the aside and main will stack (full width each) . On medium screens and up, aside takes 25% width and main 75%, side by side.
+ 
+ We can also employ ready-made UI components or examples – e.g., Tailwind UI or Flowbite components – for a polished look, but manual composition with Tailwind utilities as above works fine.
+ 
+ Best Practices and Considerations
+ 
+ Security: We’ve applied several security best practices:
+ 	•	Password hashing with Argon2id (memory-hard, recommended algorithm) .
+ 	•	JWT in HttpOnly cookies to prevent XSS stealing, combined with Secure and SameSite=Strict to prevent CSRF and ensure tokens only go over HTTPS .
+ 	•	Validations and error handling to avoid undefined behavior (checking input lengths, handling DB errors).
+ 	•	Access control at every API (auth middleware and owner checks) – never assume the client will hide unauthorized options; always enforce on server.
+ 	•	SQL Injection is mitigated by using parameterized queries ($1, $2 placeholders with sqlx) or Diesel’s safe query builder, so user input isn’t directly interpolated into SQL.
+ 	•	CORS: If our frontend is served on a different domain than the Rust API, configure the Axum server’s CORS to allow that origin and credentials. The tower_http::cors::CorsLayer can be used to allow methods and headers and set allow_credentials(true) so that cookies work cross-site.
+ 	•	API Key for MCP servers: Each deployed server has an api_key and the server’s container should require this for any client communication (like AnyContext uses an x-api-key header ). This prevents others from connecting to your MCP server URL if they somehow guess it. The platform should generate secure random API keys (the UUID approach is okay, though a longer random string or using a crypto random generator is even better).
+ 	•	Resource Limits: As mentioned, set limits on container resources to prevent abuse. Also consider implementing quotas (e.g., a user can only create N servers, or sessions, or certain rate limits) to protect against misuse.
+ 	•	Logging and Monitoring: Use tracing to log important events (user logins, errors, container starts/stops) with appropriate levels. In production, aggregate logs and use monitoring for the infrastructure (Prometheus/Grafana for resource use, etc.). We can expose a health check endpoint (like GET /api/health) that just returns 200 OK – useful for load balancers or uptime monitors.
+ 
+ Scalability: Our design is mostly stateless in the web tier (thanks to JWT and database storage). The Rust server can be replicated behind a load balancer – all instances connect to the same Postgres and same Docker daemon or cluster. Postgres itself can be scaled (read replicas, etc.) if needed, but given typical usage (mostly config data and logs), a single instance or managed DB should handle quite a lot. If one host can’t handle all MCP containers, that’s where an orchestrator (Kubernetes) would schedule containers on multiple nodes. The platform could then become more complex (the control plane might need to decide which node to launch a container on). However, initially you might simply increase the server’s VM size.
+ 
+ To scale WebSockets or SSE (for real-time metrics), consider using a message broker or a pub-sub (like Redis pub/sub or an event bus) if you have multiple web server instances, so that all instances can broadcast events to users regardless of which instance is handling the container. Another approach is to push metrics to a central time-series DB and have the frontend poll that – simpler but less instantaneous.
+ 
+ Maintainability: We modularized code by splitting responsibilities:
+ 	•	Route handlers for each resource (users, servers, sessions, metrics) can live in separate modules in Rust.
+ 	•	A separate module or service object for interacting with Docker (to keep that logic isolated).
+ 	•	On the frontend, use Next.js pages for routing but factor out components for reuse (e.g., a ServerList component, a ServerForm, a MetricChart component, etc.). This keeps the code DRY and easier to test or update.
+ 	•	Writing unit tests for Rust handlers (using something like axum::body::Body to simulate requests) can ensure our auth logic and DB interactions work as expected. Integration testing with a temporary database and maybe a dummy Docker client (for not actually spawning containers in tests) would be valuable.
+ 
+ Modern UI/UX: Finally, ensure the UI is clean and intuitive. Using Tailwind, we can quickly implement modern design trends:
+ 	•	Dark mode support: as seen in the Tailwind classes above, e.g., dark:bg-gray-800 – Tailwind can automatically support a dark theme if we add media or class strategy in config. This could be a nice touch.
+ 	•	Interactive feedback: Show loading spinners when actions are in progress, confirm modal on deletions, toast notifications on success/failure. The Next.js app could use a library like react-hot-toast for notifications.
+ 	•	Responsive nav: Perhaps a hamburger menu on mobile to show the sidebar links.
+ 	•	Consistent styling: define a few reusable style classes or use Tailwind’s theming to keep colors consistent (e.g., define primary color, etc.).
+ 	•	Accessibility: Use proper HTML elements (forms, labels, buttons) and Tailwind’s accessibility utilities if needed (like sr-only for screen reader text).
+ 
+ By following this guide, you can assemble a full-stack system that mimics AnyContext: a Rust backend managing user accounts and containerized context servers, and a Next.js frontend for a seamless user experience. The result is a scalable “Context-as-a-Service” platform – enabling users to spin up connectors that bridge AI and external data with ease and security.
++Automated redeploys: each server includes a `webhook_secret`. Configure your CI to POST to `/api/servers/<id>/webhook` with an `X-Webhook-Secret` header so MCP Host rebuilds automatically.
++GitHub integration: set a push webhook to `/api/servers/<id>/github` using the same header for HMAC verification.
++Custom domains: map your own domain to a server via `/api/servers/<id>/domains` and access it through that URL.
++Reverse proxy controller: a separate `proxy_controller` process watches config files, obtains TLS certificates, and reloads Nginx when domains change.
++Automatic TLS: MCP Host uses an embedded ACME client to obtain Let's Encrypt certificates for custom domains. Set `CERTBOT_EMAIL` for registration.
++Secrets management: store encrypted secrets via `/api/servers/<id>/secrets` which get injected at runtime. If `VAULT_ADDR` and `VAULT_TOKEN` are set, values are stored in HashiCorp Vault instead of the database.
++Source builds: provide a `repo_url` and MCP Host clones your code, parses the Dockerfile for `EXPOSE` instructions, and builds the image automatically.
++Language builders: if no Dockerfile is present, MCP Host detects Node, Python, or Rust projects and generates one for you.
++Registry push: set the `REGISTRY` environment variable to automatically push built images after successful builds.
++File storage: upload and download persistent blobs via `/api/servers/<id>/files`.
++Mounted storage: uploaded files are mounted into running containers at `/data`.
++File management UI: manage uploads from the Files page for each server.
++Bring your own MCP: choose the Custom option to run your own Docker image or build from a Git repository.
++Marketplace MCPs: list official connectors via `/api/marketplace` and select them during server creation for one-click deployment.
++Managed vector databases: create Chroma instances via `/api/vector-dbs` for persistent embeddings.
++Data ingestion pipelines: schedule jobs that fetch data from URLs and ingest it into your vector DBs.
++GPU servers: toggle the GPU option on server creation to run containers with Nvidia GPUs when available.
++CPU and memory limits: specify `cpu_limit` (cores) and `memory_limit` (MB) in the server config to constrain resource usage.
++Crash restarts: containers are automatically restarted if they exit unexpectedly.
++MCP workflows: chain multiple servers together and invoke them sequentially via `/api/workflows`.
++Persistent job queue ensures container tasks survive server restarts.
++Invocation tracing: all `/invoke` requests are stored with inputs and outputs for later debugging via `/api/servers/<id>/invocations`.
++Automated evaluation: create tests via `/api/servers/<id>/eval/tests` and run them with `/api/servers/<id>/eval/run`; results are listed from `/api/servers/<id>/eval/results`.
++Evaluation scoreboard: `/api/evaluations` lists recent results across all your servers. `/api/evaluations/summary` ranks servers by average score.
++Role-based access control: users have roles like `admin` or `user` with quotas limiting how many servers they may create.
++Organizations: create teams with `/api/orgs` and invite members.
++Invoke endpoint: send JSON to `/api/servers/<id>/invoke` to proxy the request to your MCP and return its response.
++Manifest handshake: MCP Host fetches `/.well-known/mcp.json` from running containers and stores the manifest for later retrieval.
++Capabilities sync: any `capabilities` listed in the manifest are stored and exposed via `/api/servers/<id>/capabilities` so agents can auto-configure.
++Client config endpoint: call `/api/servers/<id>/client-config` to retrieve an invoke URL, API key, and the stored manifest for plug-and-play clients.
++Use the helper script at `scripts/get_config.py` to fetch this configuration and save it locally for your agents.
++Run `scripts/gen_python_sdk.py` with the same server ID to generate a Python client stub based on the manifest.
++Run `scripts/gen_ts_sdk.py` with the same ID to generate a TypeScript client.
++Run `scripts/mcp_cli.py` to fetch configs or generate SDKs from one convenient CLI.
++Use `mcp-cli create my-agent --mcp-id=<SERVER_ID>` to scaffold a simple Python FastAPI agent preconfigured to call your MCP server.
++Use `mcp-cli dev <SERVER_ID>` to run a local proxy forwarding requests to your MCP while coding locally.
++You can install this helper locally with `pip install .` from the `cli` directory
++or fetch the published package via `pip install mcp-host-cli`, which provides an
++`mcp-cli` command in your environment.
++
++Continuous integration: a GitHub Actions workflow builds the backend, runs
++tests, and runs the frontend test suite on every push.
++
+ 
+ References:
+ 	•	AnyContext architecture and MCP concept  
+ 	•	Axum and Diesel for high-performance Rust APIs  
+ 	•	Password hashing best practices (Argon2id) 
+ 	•	JWT storage security (HttpOnly cookies vs localStorage)  
+ 	•	Docker container management with Bollard (Rust)  
+ 	•	Server-Sent Events for real-time updates  
+ 	•	Tailwind CSS responsive design patterns  
++- `/api/me` returns user email, role, and server_quota for the new Profile page.

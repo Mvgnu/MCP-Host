@@ -1,0 +1,94 @@
+mod auth;
+mod docker;
+mod extractor;
+mod runtime;
+mod servers;
+use crate::routes::api_routes;
+mod build;
+mod capabilities;
+mod config;
+mod domains;
+mod error;
+mod file_store;
+mod job_queue;
+mod proxy;
+mod routes;
+mod secrets;
+mod services;
+mod vault;
+mod marketplace;
+mod vector_dbs;
+mod organizations;
+mod ingestion;
+mod invocations;
+mod evaluation;
+mod workflows;
+
+use axum::{routing::get, Extension, Router};
+use axum_prometheus::PrometheusMetricLayer;
+use job_queue::{start_worker, Job};
+use runtime::{ContainerRuntime, DockerRuntime, KubernetesRuntime};
+use sqlx::postgres::PgPoolOptions;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tracing_subscriber::{fmt, EnvFilter};
+
+async fn root() -> &'static str {
+    "MCP Host API"
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .json()
+        .init();
+
+    dotenvy::dotenv().ok();
+    // Fail fast if the JWT secret is missing
+    let _ = config::JWT_SECRET.as_str();
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:password@localhost/mcp".into());
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await?;
+
+    // Run migrations if available
+    if sqlx::migrate!().run(&pool).await.is_err() {
+        eprintln!("Database migrations failed");
+    }
+
+    let runtime: Arc<dyn ContainerRuntime> = match config::CONTAINER_RUNTIME.as_str() {
+        "kubernetes" => match KubernetesRuntime::new().await {
+            Ok(rt) => Arc::new(rt),
+            Err(e) => {
+                tracing::warn!(%e, "failed to init Kubernetes runtime; using docker");
+                Arc::new(DockerRuntime)
+            }
+        },
+        _ => Arc::new(DockerRuntime),
+    };
+    let job_tx = start_worker(pool.clone(), runtime.clone());
+    ingestion::start_ingestion_worker(pool.clone());
+    let (prometheus_layer, metrics_handle) = PrometheusMetricLayer::pair();
+    let app = Router::new()
+        .route("/", get(root))
+        .route(
+            "/metrics",
+            get(move || async move { metrics_handle.render() }),
+        )
+        .merge(api_routes())
+        .layer(prometheus_layer)
+        .layer(Extension(pool.clone()))
+        .layer(Extension(job_tx.clone()))
+        .layer(Extension(runtime.clone()));
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    println!("Listening on {}", addr);
+    axum::Server::bind(&addr)
+        .serve(app.into_make_service())
+        .await?;
+
+    Ok(())
+}
