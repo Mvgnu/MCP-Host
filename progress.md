@@ -645,3 +645,7 @@ This document tracks development progress and high level notes from the planning
 - Added user profile page showing email, role, and server quota
 - `/api/me` now returns server_quota
 - Navigation links to Profile page when logged in
+## 2025-10-25
+- Replaced Docker CLI tagging/pushing with Bollard APIs that stream registry progress into build logs.
+- Registry failures now bubble structured errors so build status flips to error with actionable messaging.
+- Introduced a logging sink trait and registry push tests to cover success and failure flows.
