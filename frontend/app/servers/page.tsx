@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import Spinner from '../../components/Spinner';
 import Alert from '../../components/Alert';
 import MetricsChart from '../../components/MetricsChart';
+import MetricsEventList from '../../components/MetricsEventList';
 import ServerCard from '../../components/ServerCard';
 import { useServerStore, Server } from '../../lib/store';
 
@@ -165,8 +166,25 @@ export default function Servers() {
         </pre>
       )}
       {metrics && (
-        <div className="mt-2 bg-gray-900 p-2 rounded">
-          <MetricsChart events={metrics.events.slice().reverse()} />
+        <div className="mt-2 grid gap-4 rounded bg-gray-900 p-3 lg:grid-cols-2">
+          <section>
+            <h2 className="text-lg font-semibold text-white">Registry push cadence</h2>
+            <p className="text-xs text-slate-400">
+              Toggle event families to focus on tagging vs push activity. Chart renders oldest to newest for trend clarity.
+            </p>
+            <div className="mt-2">
+              <MetricsChart events={metrics.events.slice().reverse()} />
+            </div>
+          </section>
+          <section>
+            <h2 className="text-lg font-semibold text-white">Latest telemetry</h2>
+            <p className="text-xs text-slate-400">
+              New metrics include tagging lifecycle (`tag_*`) and enriched push outcomes (`push_*`).
+            </p>
+            <div className="mt-2">
+              <MetricsEventList events={metrics.events} />
+            </div>
+          </section>
         </div>
       )}
     </div>

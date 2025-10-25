@@ -21,3 +21,9 @@
   Log:
     - 2025-10-26 09:05:00 UTC: Audited registry push metrics for gaps around Docker tag failures and cross-runtime status propagation.
     - 2025-10-26 10:00:00 UTC: Added tag_started/tag_succeeded metrics, unified push_failed emission, updated docs, and extended tests.
+- ID: BE-BUILD-004
+  Status: IN_PROGRESS
+  Task: Harden registry telemetry consumers and guard regression paths for push failure metadata.
+  Hypothesis: Aligning API/UI consumption of new tag_* and push_* metrics plus defensive tests will keep dashboards accurate during refactors.
+  Log:
+    - 2025-10-26 11:30:00 UTC: Surfaced tagging/push telemetry in server dashboard, added metric timeline, and expanded backend negative-path tests for retry/auth metadata.

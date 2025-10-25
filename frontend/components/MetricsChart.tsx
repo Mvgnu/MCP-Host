@@ -28,11 +28,21 @@ interface MetricEvent {
   details?: any;
 }
 
+const FRIENDLY_LABELS: Record<string, string> = {
+  tag_started: 'Tagging started',
+  tag_succeeded: 'Tagging completed',
+  push_started: 'Push started',
+  push_retry: 'Push retry scheduled',
+  push_succeeded: 'Push completed',
+  push_failed: 'Push failed',
+};
+
 export default function MetricsChart({ events }: { events: MetricEvent[] }) {
-  const eventTypes = useMemo(
-    () => Array.from(new Set(events.map((e) => e.event_type))),
-    [events]
-  );
+  const eventTypes = useMemo(() => {
+    const types = Array.from(new Set(events.map((e) => e.event_type)));
+    types.sort();
+    return types;
+  }, [events]);
   const [selected, setSelected] = useState<string[]>(eventTypes);
 
   // update selected types when events change
@@ -61,8 +71,9 @@ export default function MetricsChart({ events }: { events: MetricEvent[] }) {
           });
         cumulative.reverse();
         const color = colors[idx % colors.length];
+        const label = FRIENDLY_LABELS[type] ?? type;
         return {
-          label: type,
+          label,
           data: cumulative,
           borderColor: color,
           backgroundColor: `${color}33`,
@@ -110,7 +121,12 @@ export default function MetricsChart({ events }: { events: MetricEvent[] }) {
                 )
               }
             />
-            <span>{t}</span>
+            <span>
+              {FRIENDLY_LABELS[t] ?? t}
+              {FRIENDLY_LABELS[t] ? (
+                <span className="ml-1 text-xs text-slate-400">({t})</span>
+              ) : null}
+            </span>
           </label>
         ))}
       </div>

@@ -100,6 +100,15 @@ fn should_refresh_auth(detail_code: Option<i64>, message: Option<&str>) -> bool 
             .unwrap_or(false)
 }
 
+fn classify_registry_push_error(err: &RegistryPushError) -> (&'static str, bool) {
+    match err {
+        RegistryPushError::AuthExpired(_) => ("auth_expired", true),
+        RegistryPushError::Remote(_) => ("remote", false),
+        RegistryPushError::Tag(_) => ("tag", false),
+        RegistryPushError::Push(_) => ("push", false),
+    }
+}
+
 fn extract_digest(line: &str) -> Option<String> {
     line.split("digest:")
         .nth(1)
@@ -431,12 +440,7 @@ where
                 continue;
             }
             Err(err) => {
-                let (error_kind, auth_expired) = match &err {
-                    RegistryPushError::AuthExpired(_) => ("auth_expired", true),
-                    RegistryPushError::Remote(_) => ("remote", false),
-                    RegistryPushError::Tag(_) => ("tag", false),
-                    RegistryPushError::Push(_) => ("push", false),
-                };
+                let (error_kind, auth_expired) = classify_registry_push_error(&err);
                 let error_message = err.to_string();
                 record_push_failure(
                     metrics,
@@ -1098,6 +1102,155 @@ mod tests {
                 .get("error_kind")
                 .and_then(Value::as_str),
             Some("tag")
+        );
+        assert_eq!(
+            failure_entry
+                .get("retry_limit")
+                .and_then(Value::as_u64),
+            Some(5)
+        );
+        assert_eq!(
+            failure_entry
+                .get("auth_expired")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn record_push_failure_respects_auth_flag() {
+        let cases = vec![(true, "auth_expired"), (false, "remote")];
+
+        for (auth_expired, error_kind) in cases {
+            let metrics = RecordingMetrics::default();
+
+            record_push_failure(
+                &metrics,
+                "registry.test/example",
+                2,
+                4,
+                error_kind,
+                "failure",
+                auth_expired,
+            )
+            .await;
+
+            let events = metrics.events().await;
+            let failure_entry = events
+                .iter()
+                .find(|(event, _)| event == "push_failed")
+                .and_then(|(_, details)| details.as_ref())
+                .expect("push_failed metric recorded");
+
+            assert_eq!(
+                failure_entry
+                    .get("auth_expired")
+                    .and_then(Value::as_bool),
+                Some(auth_expired)
+            );
+            assert_eq!(
+                failure_entry
+                    .get("retry_limit")
+                    .and_then(Value::as_u64),
+                Some(4)
+            );
+            assert_eq!(
+                failure_entry
+                    .get("error_kind")
+                    .and_then(Value::as_str),
+                Some(error_kind)
+            );
+        }
+    }
+
+    #[test]
+    fn classify_registry_push_error_covers_variants() {
+        use bollard::errors::Error as BollardError;
+
+        let cases = vec![
+            (
+                RegistryPushError::AuthExpired("expired".to_string()),
+                ("auth_expired", true),
+            ),
+            (
+                RegistryPushError::Remote("denied".to_string()),
+                ("remote", false),
+            ),
+            (
+                RegistryPushError::Tag(BollardError::DockerResponseServerError {
+                    status_code: 500,
+                    message: "tag failed".to_string(),
+                }),
+                ("tag", false),
+            ),
+            (
+                RegistryPushError::Push(BollardError::DockerResponseServerError {
+                    status_code: 502,
+                    message: "push failed".to_string(),
+                }),
+                ("push", false),
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(classify_registry_push_error(&error), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn push_errors_record_retry_metadata() {
+        use bollard::errors::Error as BollardError;
+
+        let logger = RecordingLog::default();
+        let metrics = RecordingMetrics::default();
+        let scopes = vec!["scope".to_string()];
+
+        let err = push_stream_with_retry(
+            &logger,
+            &metrics,
+            8,
+            "registry.test/example",
+            &scopes,
+            || {
+                stream::iter(vec![Err(BollardError::DockerResponseServerError {
+                    status_code: 500,
+                    message: "boom".to_string(),
+                })])
+            },
+            1,
+        )
+        .await
+        .expect_err("push error should bubble");
+
+        assert!(matches!(err, RegistryPushError::Push(_)));
+        let events = metrics.events().await;
+        let failure_details = events
+            .iter()
+            .find(|(event, _)| event == "push_failed")
+            .and_then(|(_, details)| details.as_ref())
+            .expect("push_failed details present");
+
+        assert_eq!(
+            failure_details.get("attempt").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            failure_details
+                .get("retry_limit")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            failure_details
+                .get("error_kind")
+                .and_then(Value::as_str),
+            Some("push")
+        );
+        assert_eq!(
+            failure_details
+                .get("auth_expired")
+                .and_then(Value::as_bool),
+            Some(false)
         );
     }
 }
