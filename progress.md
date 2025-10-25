@@ -650,3 +650,4 @@ This document tracks development progress and high level notes from the planning
 - Registry failures now bubble structured errors so build status flips to error with actionable messaging.
 - Introduced a logging sink trait and registry push tests to cover success and failure flows.
 - Hardened registry push telemetry with scope-aware tracing, digest logging, and retry logic plus auth-expiration handling tests.
+- Added tagging-stage metrics (`tag_started`, `tag_succeeded`) and ensured `push_failed` events are emitted for pre-push failures so dashboards can distinguish tagging faults from registry stream errors.
