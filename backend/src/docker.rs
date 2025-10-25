@@ -95,10 +95,21 @@ pub fn spawn_server_task(
             .and_then(|v| v.as_str())
         {
             set_status_with_context(&pool, server_id, "cloning", "preparing git build").await;
-            if let Some(tag) = build::build_from_git(&pool, server_id, repo, branch).await {
-                image = tag;
-            } else {
-                return;
+            match build::build_from_git(&pool, server_id, repo, branch).await {
+                Ok(Some(tag)) => {
+                    image = tag;
+                }
+                Ok(None) => {
+                    return;
+                }
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        %server_id,
+                        "build failed to update status after git build"
+                    );
+                    return;
+                }
             }
         }
 

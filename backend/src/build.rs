@@ -1,4 +1,4 @@
-use crate::servers::set_status;
+use crate::servers::{add_metric, set_status, SetStatusError};
 use async_trait::async_trait;
 use bollard::body_full;
 use bollard::image::BuildImageOptions;
@@ -8,6 +8,8 @@ use bollard::Docker;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use regex::Regex;
+use serde_json::json;
+use serde_json::Value;
 use sqlx::PgPool;
 use std::fmt;
 use std::path::Path;
@@ -167,6 +169,39 @@ impl BuildLogSink for PgPool {
     }
 }
 
+#[async_trait]
+trait MetricRecorder: Send + Sync {
+    async fn record(&self, event_type: &str, details: Option<Value>);
+}
+
+struct UsageMetricRecorder<'a> {
+    pool: &'a PgPool,
+    server_id: i32,
+}
+
+#[async_trait]
+impl<'a> MetricRecorder for UsageMetricRecorder<'a> {
+    async fn record(&self, event_type: &str, details: Option<Value>) {
+        let owned_details = details;
+        if let Err(err) = add_metric(
+            self.pool,
+            self.server_id,
+            event_type,
+            owned_details.as_ref(),
+        )
+        .await
+        {
+            tracing::warn!(
+                target: "registry.push.metrics",
+                event_type = %event_type,
+                server_id = self.server_id,
+                ?err,
+                "failed to persist registry metric"
+            );
+        }
+    }
+}
+
 async fn stream_push_progress<L, S>(
     logger: &L,
     server_id: i32,
@@ -270,8 +305,9 @@ where
     Ok(())
 }
 
-async fn push_stream_with_retry<L, F, S>(
+async fn push_stream_with_retry<L, M, F, S>(
     logger: &L,
+    metrics: &M,
     server_id: i32,
     registry_endpoint: &str,
     scopes: &[String],
@@ -280,12 +316,25 @@ async fn push_stream_with_retry<L, F, S>(
 ) -> Result<(), RegistryPushError>
 where
     L: BuildLogSink + ?Sized,
+    M: MetricRecorder + ?Sized,
     F: FnMut() -> S,
     S: futures_util::Stream<Item = Result<PushImageInfo, bollard::errors::Error>> + Unpin,
 {
     let mut attempt = 0;
     loop {
         attempt += 1;
+        if attempt == 1 {
+            metrics
+                .record(
+                    "push_started",
+                    Some(json!({
+                        "attempt": attempt,
+                        "retry_limit": retry_limit,
+                        "registry_endpoint": registry_endpoint,
+                    })),
+                )
+                .await;
+        }
         tracing::info!(
             target: "registry.push",
             %registry_endpoint,
@@ -316,6 +365,16 @@ where
                         "registry push succeeded after retry"
                     );
                 }
+                metrics
+                    .record(
+                        "push_succeeded",
+                        Some(json!({
+                            "attempt": attempt,
+                            "retry_limit": retry_limit,
+                            "registry_endpoint": registry_endpoint,
+                        })),
+                    )
+                    .await;
                 return Ok(());
             }
             Err(RegistryPushError::Push(err))
@@ -331,11 +390,41 @@ where
                     error = %err,
                     "retryable registry push error"
                 );
+                metrics
+                    .record(
+                        "push_retry",
+                        Some(json!({
+                            "attempt": attempt,
+                            "retry_limit": retry_limit,
+                            "registry_endpoint": registry_endpoint,
+                            "error": err.to_string(),
+                        })),
+                    )
+                    .await;
                 let backoff = Duration::from_millis(100 * attempt as u64);
                 sleep(backoff).await;
                 continue;
             }
             Err(err) => {
+                let (error_kind, auth_expired) = match &err {
+                    RegistryPushError::AuthExpired(_) => ("auth_expired", true),
+                    RegistryPushError::Remote(_) => ("remote", false),
+                    RegistryPushError::Tag(_) => ("tag", false),
+                    RegistryPushError::Push(_) => ("push", false),
+                };
+                metrics
+                    .record(
+                        "push_failed",
+                        Some(json!({
+                            "attempt": attempt,
+                            "retry_limit": retry_limit,
+                            "registry_endpoint": registry_endpoint,
+                            "error": err.to_string(),
+                            "error_kind": error_kind,
+                            "auth_expired": auth_expired,
+                        })),
+                    )
+                    .await;
                 tracing::error!(
                     target: "registry.push",
                     %registry_endpoint,
@@ -353,6 +442,7 @@ where
 }
 
 async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
+    pool: &PgPool,
     logger: &L,
     docker: &Docker,
     server_id: i32,
@@ -396,8 +486,10 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
     );
 
     let retry_limit = registry_push_retry_limit();
+    let usage_metrics = UsageMetricRecorder { pool, server_id };
     push_stream_with_retry(
         logger,
+        &usage_metrics,
         server_id,
         &reference.repository,
         &scopes,
@@ -425,14 +517,22 @@ async fn insert_log<L: BuildLogSink + ?Sized>(logger: &L, server_id: i32, text: 
     logger.log(server_id, text).await;
 }
 
-async fn set_status_or_log(pool: &PgPool, server_id: i32, status: &str) {
-    if let Err(err) = set_status(pool, server_id, status).await {
-        tracing::error!(
-            ?err,
-            %server_id,
-            status = %status,
-            "failed to update server status after build operation"
-        );
+async fn set_status_or_log(
+    pool: &PgPool,
+    server_id: i32,
+    status: &str,
+) -> Result<(), SetStatusError> {
+    match set_status(pool, server_id, status).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                %server_id,
+                status = %status,
+                "failed to update server status after build operation"
+            );
+            Err(err)
+        }
     }
 }
 
@@ -443,15 +543,15 @@ pub async fn build_from_git(
     server_id: i32,
     repo_url: &str,
     branch: Option<&str>,
-) -> Option<String> {
+) -> Result<Option<String>, SetStatusError> {
     insert_log(pool, server_id, "Cloning repository").await;
     let tmp = match tempdir() {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(?e, "tempdir failed");
-            set_status_or_log(pool, server_id, "error").await;
+            set_status_or_log(pool, server_id, "error").await?;
             insert_log(pool, server_id, "Failed to create build dir").await;
-            return None;
+            return Ok(None);
         }
     };
 
@@ -470,8 +570,8 @@ pub async fn build_from_git(
     {
         tracing::error!(?e, "git clone failed");
         insert_log(pool, server_id, "Git clone failed").await;
-        set_status_or_log(pool, server_id, "error").await;
-        return None;
+        set_status_or_log(pool, server_id, "error").await?;
+        return Ok(None);
     }
 
     // Generate a Dockerfile when none exists using a simple language-specific template
@@ -492,8 +592,8 @@ pub async fn build_from_git(
         Err(e) => {
             tracing::error!(?e, "Failed to connect to Docker");
             insert_log(pool, server_id, "Docker connection failed").await;
-            set_status_or_log(pool, server_id, "error").await;
-            return None;
+            set_status_or_log(pool, server_id, "error").await?;
+            return Ok(None);
         }
     };
 
@@ -513,8 +613,8 @@ pub async fn build_from_git(
         Err(e) => {
             tracing::error!(?e, "Failed to create tar");
             insert_log(pool, server_id, "Failed to create build context").await;
-            set_status_or_log(pool, server_id, "error").await;
-            return None;
+            set_status_or_log(pool, server_id, "error").await?;
+            return Ok(None);
         }
     };
 
@@ -539,8 +639,8 @@ pub async fn build_from_git(
             Err(e) => {
                 tracing::error!(?e, "docker build error");
                 insert_log(pool, server_id, "Image build failed").await;
-                set_status_or_log(pool, server_id, "error").await;
-                return None;
+                set_status_or_log(pool, server_id, "error").await?;
+                return Ok(None);
             }
         }
     }
@@ -558,17 +658,18 @@ pub async fn build_from_git(
     if let Ok(registry) = std::env::var("REGISTRY") {
         let registry = registry.trim();
         if !registry.is_empty() {
-            if let Err(err) = push_image_to_registry(pool, &docker, server_id, &tag, registry).await
+            if let Err(err) =
+                push_image_to_registry(pool, pool, &docker, server_id, &tag, registry).await
             {
                 tracing::error!(?err, %registry, %server_id, "registry push failed");
                 insert_log(pool, server_id, &format!("Registry push failed: {err}")).await;
-                set_status_or_log(pool, server_id, "error").await;
-                return None;
+                set_status_or_log(pool, server_id, "error").await?;
+                return Ok(None);
             }
         }
     }
     insert_log(pool, server_id, "Cleaning up").await;
-    Some(tag)
+    Ok(Some(tag))
 }
 
 #[cfg(test)]
@@ -590,10 +691,31 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingMetrics {
+        entries: Mutex<Vec<(String, Option<Value>)>>,
+    }
+
+    impl RecordingMetrics {
+        async fn events(&self) -> Vec<(String, Option<Value>)> {
+            self.entries.lock().await.clone()
+        }
+    }
+
     #[async_trait]
     impl BuildLogSink for RecordingLog {
         async fn log(&self, _server_id: i32, text: &str) {
             self.entries.lock().await.push(text.to_string());
+        }
+    }
+
+    #[async_trait]
+    impl MetricRecorder for RecordingMetrics {
+        async fn record(&self, event_type: &str, details: Option<Value>) {
+            self.entries
+                .lock()
+                .await
+                .push((event_type.to_string(), details));
         }
     }
 
@@ -743,12 +865,14 @@ mod tests {
         use std::sync::Arc;
 
         let logger = RecordingLog::default();
+        let metrics = RecordingMetrics::default();
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
         let scopes = vec!["scope".to_string()];
 
         push_stream_with_retry(
             &logger,
+            &metrics,
             99,
             "registry.test/example",
             &scopes,
@@ -771,14 +895,34 @@ mod tests {
         .expect("retry should eventually succeed");
 
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+        let events = metrics.events().await;
+        assert!(events.iter().any(|(event, _)| event == "push_started"));
+        let retry_events: Vec<_> = events
+            .iter()
+            .filter(|(event, _)| event == "push_retry")
+            .collect();
+        assert_eq!(retry_events.len(), 1);
+        assert!(events.iter().any(|(event, _)| event == "push_succeeded"));
+        let success_details = events
+            .iter()
+            .find(|(event, _)| event == "push_succeeded")
+            .and_then(|(_, details)| details.as_ref());
+        assert_eq!(
+            success_details
+                .and_then(|value| value.get("attempt"))
+                .and_then(Value::as_u64),
+            Some(2)
+        );
     }
 
     #[tokio::test]
     async fn non_retryable_push_errors_bubble() {
         let logger = RecordingLog::default();
+        let metrics = RecordingMetrics::default();
         let scopes = vec!["scope".to_string()];
         let err = push_stream_with_retry(
             &logger,
+            &metrics,
             100,
             "registry.test/example",
             &scopes,
@@ -794,5 +938,57 @@ mod tests {
         .expect_err("remote error should bubble");
 
         assert!(matches!(err, RegistryPushError::Remote(_)));
+        let events = metrics.events().await;
+        assert!(events.iter().any(|(event, _)| event == "push_started"));
+        let failure_details = events
+            .iter()
+            .find(|(event, _)| event == "push_failed")
+            .and_then(|(_, details)| details.as_ref())
+            .expect("push_failed event should include details");
+        assert_eq!(
+            failure_details.get("error_kind").and_then(Value::as_str),
+            Some("remote")
+        );
+        assert_eq!(
+            failure_details.get("auth_expired").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_expired_records_failed_metric() {
+        let logger = RecordingLog::default();
+        let metrics = RecordingMetrics::default();
+        let scopes = vec!["scope".to_string()];
+        let err = push_stream_with_retry(
+            &logger,
+            &metrics,
+            7,
+            "registry.test/example",
+            &scopes,
+            || {
+                let mut info = PushImageInfo::default();
+                info.error_detail = Some(bollard::models::ErrorDetail {
+                    code: Some(401),
+                    message: Some("authentication required".to_string()),
+                });
+                stream::iter(vec![Ok(info)])
+            },
+            2,
+        )
+        .await
+        .expect_err("auth expired should bubble");
+
+        assert!(matches!(err, RegistryPushError::AuthExpired(_)));
+        let events = metrics.events().await;
+        let failed_details = events
+            .iter()
+            .find(|(event, _)| event == "push_failed")
+            .and_then(|(_, details)| details.as_ref())
+            .expect("push_failed details present");
+        assert_eq!(
+            failed_details.get("auth_expired").and_then(Value::as_bool),
+            Some(true)
+        );
     }
 }
