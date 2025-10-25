@@ -660,3 +660,8 @@ This document tracks development progress and high level notes from the planning
 - Verified downstream telemetry consumers: server metrics API/UI accept `tag_*` and enriched `push_*` payloads; updated MetricsEventList to surface registry endpoint, retry, and auth context for failure/retry events.
 - Documented payload contract (`attempt`, `retry_limit`, `registry_endpoint`, `error_kind`, `auth_expired`) in README so dashboards ingesting raw JSON stay aligned.
 - Added negative-path regression tests covering every `RegistryPushError` variant, zero-retry handling, and malformed remote detail responses to ensure `record_push_failure` metrics remain stable.
+
+## 2025-10-28
+- Audited non-UI telemetry consumers (usage_metrics table, REST endpoint, SSE stream) to confirm support for `tag_*` and enriched `push_*` payloads.
+- Added regression test ensuring the metrics broadcast delivers full registry telemetry details to downstream listeners.
+- Updated README with a telemetry consumer matrix and marked BE-BUILD-004 complete in the tracker.
