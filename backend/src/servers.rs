@@ -62,7 +62,7 @@ pub struct LogEntry {
     pub log_text: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct Metric {
     pub id: i32,
     pub timestamp: chrono::DateTime<chrono::Utc>,
@@ -149,6 +149,104 @@ pub async fn set_status(pool: &PgPool, server_id: i32, status: &str) -> Result<(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn metrics_channel_preserves_enriched_registry_details() {
+        /* audit:
+           purpose: Validate metrics broadcast retains enriched registry telemetry payloads
+           tracker: BE-BUILD-004
+           relates_to: progress.md
+        */
+        let server_id = 4242;
+
+        METRIC_CHANNELS.remove(&server_id);
+        let mut receiver = subscribe_metrics(server_id);
+        let sender = {
+            let entry = METRIC_CHANNELS
+                .get(&server_id)
+                .expect("metric channel should be registered");
+            entry.value().clone()
+        };
+
+        let expected_details = json!({
+            "attempt": 2,
+            "retry_limit": 5,
+            "registry_endpoint": "registry.test/project",
+            "error_kind": "push",
+            "auth_expired": false,
+        });
+
+        let metric = Metric {
+            id: 99,
+            timestamp: chrono::Utc::now(),
+            event_type: "push_failed".to_string(),
+            details: Some(expected_details.clone()),
+        };
+
+        sender
+            .send(metric.clone())
+            .expect("metrics broadcast should accept payloads");
+
+        let received = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("metrics broadcast timed out")
+            .expect("metrics broadcast closed unexpectedly");
+
+        assert_eq!(received.event_type, "push_failed");
+        let details = received
+            .details
+            .as_ref()
+            .expect("details should be preserved");
+        assert_eq!(
+            details.get("attempt").and_then(Value::as_i64),
+            Some(2)
+        );
+        assert_eq!(
+            details
+                .get("retry_limit")
+                .and_then(Value::as_i64),
+            Some(5)
+        );
+        assert_eq!(
+            details
+                .get("registry_endpoint")
+                .and_then(Value::as_str),
+            Some("registry.test/project")
+        );
+        assert_eq!(
+            details.get("error_kind").and_then(Value::as_str),
+            Some("push")
+        );
+        assert_eq!(
+            details.get("auth_expired").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let serialized = serde_json::to_string(&received)
+            .expect("metric serialization should succeed");
+        let round_trip: Value = serde_json::from_str(&serialized)
+            .expect("serialized metric should decode");
+        assert_eq!(round_trip["event_type"].as_str(), Some("push_failed"));
+        assert_eq!(round_trip["details"]["attempt"].as_i64(), Some(2));
+        assert_eq!(round_trip["details"]["retry_limit"].as_i64(), Some(5));
+        assert_eq!(
+            round_trip["details"]["registry_endpoint"].as_str(),
+            Some("registry.test/project")
+        );
+        assert_eq!(
+            round_trip["details"]["auth_expired"].as_bool(),
+            Some(false)
+        );
+
+        METRIC_CHANNELS.remove(&server_id);
+    }
 }
 
 pub async fn list_servers(

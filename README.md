@@ -32,3 +32,15 @@ The build service tags and pushes images using the Docker remote API via Bollard
 3. **Handle auth expiry** – when the error includes `authentication required`, refresh the registry credentials and redeploy. The build will emit an explicit `registry authentication expired` message.
 4. **Transient faults** – for recurring network hiccups, increase `REGISTRY_PUSH_RETRIES` temporarily and monitor retry success events (`registry push succeeded after retry`).
 5. **Status recovery** – failed pushes mark the server `error`; once the issue is resolved trigger a redeploy to rebuild and push a fresh image.
+
+### Telemetry consumer audit
+
+The enriched registry telemetry is ingested by several non-UI paths:
+
+| Consumer | Location | Handling | Notes |
+| --- | --- | --- | --- |
+| Usage metrics table | `backend/migrations/0001_create_tables.sql` | `details` column is `JSONB`, so new `tag_*` and `push_*` fields are stored without schema changes. | Verified that registry-specific keys persist end-to-end. |
+| Metrics REST API | `backend/src/servers.rs#get_metrics` | Returns the raw `details` payload for each event. | No filtering or shape assumptions beyond JSON. |
+| Metrics SSE stream | `backend/src/servers.rs#stream_metrics` | Serializes each `Metric` with the full `details` object. | New regression test guards enriched registry payload delivery. |
+
+No separate analytics jobs or alert rules exist yet; future consumers should rely on the documented payload contract above.
