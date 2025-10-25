@@ -55,8 +55,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // Run migrations if available
-    if sqlx::migrate!().run(&pool).await.is_err() {
-        eprintln!("Database migrations failed");
+    if let Err(error) = sqlx::migrate!().run(&pool).await {
+        if *config::ALLOW_MIGRATION_FAILURE {
+            tracing::warn!(
+                ?error,
+                "Database migrations failed but continuing due to ALLOW_MIGRATION_FAILURE"
+            );
+        } else {
+            return Err(Box::new(error) as Box<dyn std::error::Error>);
+        }
     }
 
     let runtime: Arc<dyn ContainerRuntime> = match config::CONTAINER_RUNTIME.as_str() {
@@ -84,8 +91,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(job_tx.clone()))
         .layer(Extension(runtime.clone()));
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    println!("Listening on {}", addr);
+    let addr: SocketAddr = format!("{}:{}", config::BIND_ADDRESS.as_str(), *config::BIND_PORT)
+        .parse()
+        .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+    tracing::info!(%addr, "Listening for incoming connections");
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .await?;
