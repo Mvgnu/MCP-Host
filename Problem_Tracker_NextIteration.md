@@ -60,3 +60,10 @@
     - 2025-10-31 09:20:00 UTC: Added platform parsing/config plumbing, refactored build pipeline to iterate targets, and enriched push metrics with `platform` context.
     - 2025-10-31 10:05:00 UTC: Implemented manifest publishing helper with auth handling, HTTP contract tests, and README/runbook updates covering QEMU/Buildx requirements.
     - 2025-10-31 10:40:00 UTC: Landed integration test for manifest telemetry and recorded tracker closure.
+- ID: BE-BUILD-008
+  Status: DONE
+  Task: Implement proactive registry credential lifecycle management.
+  Hypothesis: Introducing health monitoring, rotation hooks, and alerting metadata for registry credentials will reduce outage risk beyond reactive refresh retries.
+  Log:
+    - 2025-11-01 09:00:00 UTC: Audited backend registry auth refresh implementation to determine extension points for proactive lifecycle telemetry and rotation.
+    - 2025-11-01 12:30:00 UTC: Added credential health probes, proactive rotation hooks, telemetry, runtime propagation, documentation updates, and regression tests covering rotation paths.
