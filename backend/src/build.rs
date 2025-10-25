@@ -1,4 +1,5 @@
 use crate::servers::{add_metric, set_status, SetStatusError};
+use crate::telemetry::MetricError;
 use async_trait::async_trait;
 use bollard::body_full;
 use bollard::image::BuildImageOptions;
@@ -235,13 +236,26 @@ impl<'a> MetricRecorder for UsageMetricRecorder<'a> {
         )
         .await
         {
-            tracing::warn!(
-                target: "registry.push.metrics",
-                event_type = %event_type,
-                server_id = self.server_id,
-                ?err,
-                "failed to persist registry metric"
-            );
+            match err {
+                MetricError::Database(db_err) => {
+                    tracing::warn!(
+                        target: "registry.push.metrics",
+                        event_type = %event_type,
+                        server_id = self.server_id,
+                        error = %db_err,
+                        "failed to persist registry metric"
+                    );
+                }
+                MetricError::Validation(validation) => {
+                    tracing::error!(
+                        target: "registry.push.metrics",
+                        event_type = %event_type,
+                        server_id = self.server_id,
+                        error = %validation,
+                        "registry metric validation failed"
+                    );
+                }
+            }
         }
     }
 }
@@ -374,6 +388,12 @@ where
     Ok(())
 }
 
+#[derive(Debug)]
+struct PushStreamOutcome {
+    auth_refresh_attempted: bool,
+    auth_refresh_succeeded: bool,
+}
+
 async fn push_stream_with_retry<L, M, F, S>(
     logger: &L,
     metrics: &M,
@@ -383,13 +403,15 @@ async fn push_stream_with_retry<L, M, F, S>(
     mut make_stream: F,
     retry_limit: usize,
     mut auth_refresher: Option<&mut dyn RegistryAuthRefresher>,
-) -> Result<(), RegistryPushError>
+) -> Result<PushStreamOutcome, RegistryPushError>
 where
     L: BuildLogSink + ?Sized,
     M: MetricRecorder + ?Sized,
     F: FnMut() -> S,
     S: futures_util::Stream<Item = Result<PushImageInfo, bollard::errors::Error>> + Unpin,
 {
+    let mut refresh_attempted = false;
+    let mut refresh_succeeded = false;
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -445,7 +467,10 @@ where
                         })),
                     )
                     .await;
-                return Ok(());
+                return Ok(PushStreamOutcome {
+                    auth_refresh_attempted: refresh_attempted,
+                    auth_refresh_succeeded: refresh_succeeded,
+                });
             }
             Err(RegistryPushError::Push(err))
                 if attempt < retry_limit && is_retryable_push_error(&err) =>
@@ -477,6 +502,7 @@ where
             }
             Err(RegistryPushError::AuthExpired(message)) => {
                 if let Some(ref mut refresher) = auth_refresher {
+                    refresh_attempted = true;
                     metrics
                         .record(
                             "auth_refresh_started",
@@ -506,6 +532,7 @@ where
 
                     match refresher.refresh().await {
                         Ok(()) => {
+                            refresh_succeeded = true;
                             metrics
                                 .record(
                                     "auth_refresh_succeeded",
@@ -659,6 +686,12 @@ where
     }
 }
 
+pub struct RegistryPushResult {
+    pub image: String,
+    pub auth_refresh_attempted: bool,
+    pub auth_refresh_succeeded: bool,
+}
+
 async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
     pool: &PgPool,
     logger: &L,
@@ -667,7 +700,7 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
     image_tag: &str,
     registry: &str,
     credential_refresher: Option<CredentialRefreshFn>,
-) -> Result<(), RegistryPushError> {
+) -> Result<RegistryPushResult, RegistryPushError> {
     let reference = build_registry_reference(registry, image_tag);
     let scopes = registry_scopes(&reference.repository);
     insert_log(
@@ -758,7 +791,7 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
     let mut refresh_context = credential_refresher
         .map(|refresh_fn| SharedDockerRefresher::new(Arc::clone(&shared_docker), refresh_fn));
 
-    push_stream_with_retry(
+    let outcome = push_stream_with_retry(
         logger,
         &usage_metrics,
         server_id,
@@ -793,7 +826,11 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
         "registry push completed"
     );
 
-    Ok(())
+    Ok(RegistryPushResult {
+        image: reference.display_name(),
+        auth_refresh_attempted: outcome.auth_refresh_attempted,
+        auth_refresh_succeeded: outcome.auth_refresh_succeeded,
+    })
 }
 
 async fn insert_log<L: BuildLogSink + ?Sized>(logger: &L, server_id: i32, text: &str) {
@@ -819,14 +856,21 @@ async fn set_status_or_log(
     }
 }
 
+pub struct BuildArtifacts {
+    pub local_image: String,
+    pub registry_image: Option<String>,
+    pub auth_refresh_attempted: bool,
+    pub auth_refresh_succeeded: bool,
+}
+
 /// Clone a git repository and build a Docker image.
-/// Returns the built image tag on success.
+/// Returns the build artifacts on success.
 pub async fn build_from_git(
     pool: &PgPool,
     server_id: i32,
     repo_url: &str,
     branch: Option<&str>,
-) -> Result<Option<String>, SetStatusError> {
+) -> Result<Option<BuildArtifacts>, SetStatusError> {
     insert_log(pool, server_id, "Cloning repository").await;
     let tmp = match tempdir() {
         Ok(t) => t,
@@ -870,6 +914,9 @@ pub async fn build_from_git(
 
     insert_log(pool, server_id, "Building image").await;
     let tag = format!("mcp-custom-{server_id}");
+    let mut registry_image = None;
+    let mut auth_refresh_attempted = false;
+    let mut auth_refresh_succeeded = false;
     let docker = match Docker::connect_with_local_defaults() {
         Ok(d) => d,
         Err(e) => {
@@ -941,18 +988,29 @@ pub async fn build_from_git(
     if let Ok(registry) = std::env::var("REGISTRY") {
         let registry = registry.trim();
         if !registry.is_empty() {
-            if let Err(err) =
-                push_image_to_registry(pool, pool, &docker, server_id, &tag, registry, None).await
+            match push_image_to_registry(pool, pool, &docker, server_id, &tag, registry, None).await
             {
-                tracing::error!(?err, %registry, %server_id, "registry push failed");
-                insert_log(pool, server_id, &format!("Registry push failed: {err}")).await;
-                set_status_or_log(pool, server_id, "error").await?;
-                return Ok(None);
+                Ok(push_result) => {
+                    registry_image = Some(push_result.image);
+                    auth_refresh_attempted = push_result.auth_refresh_attempted;
+                    auth_refresh_succeeded = push_result.auth_refresh_succeeded;
+                }
+                Err(err) => {
+                    tracing::error!(?err, %registry, %server_id, "registry push failed");
+                    insert_log(pool, server_id, &format!("Registry push failed: {err}")).await;
+                    set_status_or_log(pool, server_id, "error").await?;
+                    return Ok(None);
+                }
             }
         }
     }
     insert_log(pool, server_id, "Cleaning up").await;
-    Ok(Some(tag))
+    Ok(Some(BuildArtifacts {
+        local_image: tag,
+        registry_image,
+        auth_refresh_attempted,
+        auth_refresh_succeeded,
+    }))
 }
 
 #[cfg(test)]
@@ -1193,7 +1251,7 @@ mod tests {
         let counter_clone = counter.clone();
         let scopes = vec!["scope".to_string()];
 
-        push_stream_with_retry(
+        let outcome = push_stream_with_retry(
             &logger,
             &metrics,
             99,
@@ -1217,6 +1275,9 @@ mod tests {
         )
         .await
         .expect("retry should eventually succeed");
+
+        assert!(!outcome.auth_refresh_attempted);
+        assert!(!outcome.auth_refresh_succeeded);
 
         assert_eq!(counter.load(Ordering::SeqCst), 2);
         let events = metrics.events().await;
@@ -1330,7 +1391,7 @@ mod tests {
         let counter_clone = counter.clone();
         let mut refresher = TestRefresher::succeed();
 
-        push_stream_with_retry(
+        let outcome = push_stream_with_retry(
             &logger,
             &metrics,
             21,
@@ -1357,6 +1418,9 @@ mod tests {
         )
         .await
         .expect("refresh should allow push to succeed");
+
+        assert!(outcome.auth_refresh_attempted);
+        assert!(outcome.auth_refresh_succeeded);
 
         assert_eq!(counter.load(Ordering::SeqCst), 2);
         assert_eq!(refresher.attempts(), 1);

@@ -352,6 +352,15 @@ This document tracks development progress and high level notes from the planning
 - Explore GPU inference support and dynamic scaling options.
 
 ## 2025-08-06
+- Refactored the build pipeline so Docker and Kubernetes runtimes invoke the same `build_from_git` helper and share the retry/auth-refresh logic.
+- Kubernetes runtime now requires registry pushes for git builds and automatically patches a configured image pull secret when credentials refresh.
+- Added `backend/src/telemetry.rs` module plus integration tests guarding REST and SSE schema contracts for registry metrics.
+- Documented new configuration (`K8S_REGISTRY_SECRET_NAME`, `REGISTRY_AUTH_DOCKERCONFIG`) and the telemetry guardrails in the README.
+
+### Next Steps
+- Extend multi-architecture publishing to leverage the shared helper and emit per-architecture telemetry.
+
+## 2025-08-06
 - Added GPU support: servers can request Nvidia GPUs via a new `use_gpu` flag.
 - Updated Docker launcher to pass `device_requests` when GPUs are enabled.
 - Frontend form includes a GPU checkbox and the servers list shows a GPU badge.

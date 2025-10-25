@@ -16,6 +16,22 @@ pub static K8S_NAMESPACE: Lazy<String> =
 pub static K8S_SERVICE_ACCOUNT: Lazy<String> =
     Lazy::new(|| std::env::var("K8S_SERVICE_ACCOUNT").unwrap_or_else(|_| "default".to_string()));
 
+/// Optional image pull secret used by the Kubernetes runtime when refreshing registry credentials.
+pub static K8S_REGISTRY_SECRET_NAME: Lazy<Option<String>> = Lazy::new(|| {
+    std::env::var("K8S_REGISTRY_SECRET_NAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+});
+
+/// Path to a dockerconfigjson file containing registry credentials.
+pub static REGISTRY_AUTH_DOCKERCONFIG: Lazy<Option<String>> = Lazy::new(|| {
+    std::env::var("REGISTRY_AUTH_DOCKERCONFIG")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+});
+
 /// Address the HTTP server should bind to. Defaults to `0.0.0.0`.
 pub static BIND_ADDRESS: Lazy<String> =
     Lazy::new(|| std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0".to_string()));
