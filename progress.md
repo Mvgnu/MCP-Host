@@ -665,3 +665,7 @@ This document tracks development progress and high level notes from the planning
 - Audited non-UI telemetry consumers (usage_metrics table, REST endpoint, SSE stream) to confirm support for `tag_*` and enriched `push_*` payloads.
 - Added regression test ensuring the metrics broadcast delivers full registry telemetry details to downstream listeners.
 - Updated README with a telemetry consumer matrix and marked BE-BUILD-004 complete in the tracker.
+## 2025-10-29
+- Added automated registry credential refresh workflow with shared Docker client guard and retry-loop integration.
+- Recorded new telemetry events (`auth_refresh_started`, `auth_refresh_succeeded`, `auth_refresh_failed`) and annotated `push_retry` with `reason="auth_refresh"` for refreshed attempts.
+- Extended backend tests to cover refresh success/failure flows and updated README/runbook plus tracker entry BE-BUILD-005.
