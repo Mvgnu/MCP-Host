@@ -29,3 +29,11 @@
     - 2025-10-26 11:30:00 UTC: Surfaced tagging/push telemetry in server dashboard, added metric timeline, and expanded backend negative-path tests for retry/auth metadata.
     - 2025-10-27 08:45:00 UTC: Audited repo consumers (UI, metrics API) for tag/push schema alignment, documented payload contract, and added regression tests for all RegistryPushError variants including zero-retry and malformed remote detail cases.
     - 2025-10-28 09:20:00 UTC: Completed non-UI consumer audit (DB, REST, SSE), added broadcast regression test for enriched payloads, and documented coverage in README to close BE-BUILD-004.
+- ID: BE-BUILD-005
+  Status: DONE
+  Task: Automate registry auth refresh handling and surface dedicated telemetry for refresh outcomes.
+  Hypothesis: Retrying pushes after credential expiry without manual intervention will reduce operator toil while the new metrics expose refresh health to observability tools.
+  Log:
+    - 2025-10-29 09:05:00 UTC: Audited build.rs retry loop to map insertion points for credential refresh hooks and metric emission.
+    - 2025-10-29 10:10:00 UTC: Implemented shared Docker client guard, auth-refresh callbacks, and extended push_retry telemetry with auth-refresh context plus README/runbook updates.
+    - 2025-10-29 11:00:00 UTC: Added unit tests covering refresh success/failure flows and recorded new metrics contracts before closing the task.

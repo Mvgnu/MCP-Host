@@ -20,7 +20,7 @@ The build service tags and pushes images using the Docker remote API via Bollard
 
 * Registry endpoints are emitted via `tracing` with target `registry.push`, including the derived scopes (`repository:<image>:push/pull`) and server ID.
 * Progress logs include digest discovery lines such as `Manifest published with digest sha256:<hash>` that propagate to the UI.
-* Authentication failures generate `registry authentication expired` errors and surface to the server status feed so operators can refresh credentials.
+* Authentication failures attempt an automated credential refresh (when a refresher is configured), emitting `auth_refresh_started`, `auth_refresh_succeeded`, or `auth_refresh_failed` metrics and annotating the follow-up `push_retry` event with `reason="auth_refresh"` and the triggering error.
 * Transient transport errors (I/O, hyper, HTTP client, or timeouts) retry up to `REGISTRY_PUSH_RETRIES` attempts (default `3`) with a short backoff. Override the limit via an environment variable when tuning resilience.
 * Usage metrics capture each stage: `tag_started`/`tag_succeeded` for Docker tagging and `push_failed` entries with `attempt=0` for pre-stream failures, giving observability platforms enough context to differentiate tagging issues from push retries.
 * Telemetry payloads now include `attempt`, `retry_limit`, `registry_endpoint`, `error_kind`, and `auth_expired` keys so downstream dashboards can surface retry pressure and credential expiry without additional joins.
@@ -29,7 +29,7 @@ The build service tags and pushes images using the Docker remote API via Bollard
 
 1. **Verify telemetry** – search your log aggregator for `target="registry.push" registry push failed` events to identify the failing repository and scope.
 2. **Check digest messages** – if `Manifest published` entries are missing, confirm the registry user has push permissions for the derived scopes.
-3. **Handle auth expiry** – when the error includes `authentication required`, refresh the registry credentials and redeploy. The build will emit an explicit `registry authentication expired` message.
+3. **Handle auth expiry** – when logs show `authentication required`, confirm the automated refresh succeeded (look for `auth_refresh_succeeded`). If it failed, rotate credentials and trigger a redeploy; the build log and metrics (`auth_refresh_failed`) include the refresh error for triage.
 4. **Transient faults** – for recurring network hiccups, increase `REGISTRY_PUSH_RETRIES` temporarily and monitor retry success events (`registry push succeeded after retry`).
 5. **Status recovery** – failed pushes mark the server `error`; once the issue is resolved trigger a redeploy to rebuild and push a fresh image.
 

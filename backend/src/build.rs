@@ -12,7 +12,10 @@ use serde_json::json;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::fmt;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use tar::Builder as TarBuilder;
 use tempfile::tempdir;
 use tokio::fs;
@@ -183,6 +186,38 @@ trait MetricRecorder: Send + Sync {
     async fn record(&self, event_type: &str, details: Option<Value>);
 }
 
+type CredentialRefreshFuture = Pin<Box<dyn Future<Output = Result<Docker, String>> + Send>>;
+type CredentialRefreshFn = Box<dyn FnMut() -> CredentialRefreshFuture + Send>;
+
+#[async_trait]
+trait RegistryAuthRefresher: Send {
+    async fn refresh(&mut self) -> Result<(), String>;
+}
+
+struct SharedDockerRefresher {
+    shared: Arc<Mutex<Docker>>,
+    refresh_fn: CredentialRefreshFn,
+}
+
+impl SharedDockerRefresher {
+    fn new(shared: Arc<Mutex<Docker>>, refresh_fn: CredentialRefreshFn) -> Self {
+        Self { shared, refresh_fn }
+    }
+}
+
+#[async_trait]
+impl RegistryAuthRefresher for SharedDockerRefresher {
+    async fn refresh(&mut self) -> Result<(), String> {
+        let new_docker = (self.refresh_fn)().await?;
+        let mut guard = self
+            .shared
+            .lock()
+            .expect("docker client mutex poisoned during auth refresh");
+        *guard = new_docker;
+        Ok(())
+    }
+}
+
 struct UsageMetricRecorder<'a> {
     pool: &'a PgPool,
     server_id: i32,
@@ -347,6 +382,7 @@ async fn push_stream_with_retry<L, M, F, S>(
     scopes: &[String],
     mut make_stream: F,
     retry_limit: usize,
+    mut auth_refresher: Option<&mut dyn RegistryAuthRefresher>,
 ) -> Result<(), RegistryPushError>
 where
     L: BuildLogSink + ?Sized,
@@ -439,6 +475,161 @@ where
                 sleep(backoff).await;
                 continue;
             }
+            Err(RegistryPushError::AuthExpired(message)) => {
+                if let Some(ref mut refresher) = auth_refresher {
+                    metrics
+                        .record(
+                            "auth_refresh_started",
+                            Some(json!({
+                                "attempt": attempt,
+                                "retry_limit": retry_limit,
+                                "registry_endpoint": registry_endpoint,
+                            })),
+                        )
+                        .await;
+                    insert_log(
+                        logger,
+                        server_id,
+                        "Refreshing registry credentials after authentication expiry",
+                    )
+                    .await;
+                    tracing::warn!(
+                        target: "registry.push",
+                        %registry_endpoint,
+                        %server_id,
+                        scopes = ?scopes,
+                        attempt,
+                        retry_limit,
+                        error = %message,
+                        "registry authentication expired; attempting credential refresh",
+                    );
+
+                    match refresher.refresh().await {
+                        Ok(()) => {
+                            metrics
+                                .record(
+                                    "auth_refresh_succeeded",
+                                    Some(json!({
+                                        "attempt": attempt,
+                                        "retry_limit": retry_limit,
+                                        "registry_endpoint": registry_endpoint,
+                                    })),
+                                )
+                                .await;
+                            insert_log(
+                                logger,
+                                server_id,
+                                "Registry credentials refreshed; retrying push",
+                            )
+                            .await;
+                            tracing::info!(
+                                target: "registry.push",
+                                %registry_endpoint,
+                                %server_id,
+                                scopes = ?scopes,
+                                attempt,
+                                retry_limit,
+                                "registry auth refresh succeeded; retrying push",
+                            );
+                            metrics
+                                .record(
+                                    "push_retry",
+                                    Some(json!({
+                                        "attempt": attempt,
+                                        "retry_limit": retry_limit,
+                                        "registry_endpoint": registry_endpoint,
+                                        "reason": "auth_refresh",
+                                        "error": message,
+                                    })),
+                                )
+                                .await;
+                            let backoff = Duration::from_millis(100 * attempt as u64);
+                            sleep(backoff).await;
+                            continue;
+                        }
+                        Err(refresh_err) => {
+                            metrics
+                                .record(
+                                    "auth_refresh_failed",
+                                    Some(json!({
+                                        "attempt": attempt,
+                                        "retry_limit": retry_limit,
+                                        "registry_endpoint": registry_endpoint,
+                                        "error": refresh_err,
+                                    })),
+                                )
+                                .await;
+                            insert_log(
+                                logger,
+                                server_id,
+                                "Registry auth refresh failed; aborting push",
+                            )
+                            .await;
+                            tracing::error!(
+                                target: "registry.push",
+                                %registry_endpoint,
+                                %server_id,
+                                scopes = ?scopes,
+                                attempt,
+                                retry_limit,
+                                error = %refresh_err,
+                                "registry auth refresh failed",
+                            );
+                            let err = RegistryPushError::AuthExpired(format!(
+                                "{message}; auth refresh failed: {refresh_err}"
+                            ));
+                            let (error_kind, auth_expired) = classify_registry_push_error(&err);
+                            let error_message = err.to_string();
+                            record_push_failure(
+                                metrics,
+                                registry_endpoint,
+                                attempt,
+                                retry_limit,
+                                error_kind,
+                                &error_message,
+                                auth_expired,
+                            )
+                            .await;
+                            tracing::error!(
+                                target: "registry.push",
+                                %registry_endpoint,
+                                %server_id,
+                                scopes = ?scopes,
+                                attempt,
+                                retry_limit,
+                                error = %error_message,
+                                "registry push failed",
+                            );
+                            return Err(err);
+                        }
+                    }
+                } else {
+                    let err = RegistryPushError::AuthExpired(message);
+                    let (error_kind, auth_expired) = classify_registry_push_error(&err);
+                    let error_message = err.to_string();
+                    record_push_failure(
+                        metrics,
+                        registry_endpoint,
+                        attempt,
+                        retry_limit,
+                        error_kind,
+                        &error_message,
+                        auth_expired,
+                    )
+                    .await;
+                    tracing::error!(
+                        target: "registry.push",
+                        %registry_endpoint,
+                        %server_id,
+                        scopes = ?scopes,
+                        attempt,
+                        retry_limit,
+                        error = %error_message,
+                        "registry push failed",
+                    );
+                    return Err(err);
+                }
+            }
             Err(err) => {
                 let (error_kind, auth_expired) = classify_registry_push_error(&err);
                 let error_message = err.to_string();
@@ -475,6 +666,7 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
     server_id: i32,
     image_tag: &str,
     registry: &str,
+    credential_refresher: Option<CredentialRefreshFn>,
 ) -> Result<(), RegistryPushError> {
     let reference = build_registry_reference(registry, image_tag);
     let scopes = registry_scopes(&reference.repository);
@@ -560,17 +752,35 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
         "starting registry push"
     );
 
+    let shared_docker = Arc::new(Mutex::new(docker.clone()));
+    let repository_for_stream = reference.repository.clone();
+    let tag_for_stream = reference.tag.clone();
+    let mut refresh_context = credential_refresher
+        .map(|refresh_fn| SharedDockerRefresher::new(Arc::clone(&shared_docker), refresh_fn));
+
     push_stream_with_retry(
         logger,
         &usage_metrics,
         server_id,
         &reference.repository,
         &scopes,
-        || {
-            let push_opts = PushImageOptionsBuilder::new().tag(&reference.tag).build();
-            docker.push_image(&reference.repository, Some(push_opts), None)
+        {
+            let shared = Arc::clone(&shared_docker);
+            move || {
+                let client = {
+                    let guard = shared
+                        .lock()
+                        .expect("docker client mutex poisoned during push stream creation");
+                    guard.clone()
+                };
+                let push_opts = PushImageOptionsBuilder::new().tag(&tag_for_stream).build();
+                client.push_image(&repository_for_stream, Some(push_opts), None)
+            }
         },
         retry_limit,
+        refresh_context
+            .as_mut()
+            .map(|context| context as &mut dyn RegistryAuthRefresher),
     )
     .await?;
 
@@ -732,7 +942,7 @@ pub async fn build_from_git(
         let registry = registry.trim();
         if !registry.is_empty() {
             if let Err(err) =
-                push_image_to_registry(pool, pool, &docker, server_id, &tag, registry).await
+                push_image_to_registry(pool, pool, &docker, server_id, &tag, registry, None).await
             {
                 tracing::error!(?err, %registry, %server_id, "registry push failed");
                 insert_log(pool, server_id, &format!("Registry push failed: {err}")).await;
@@ -772,6 +982,46 @@ mod tests {
     impl RecordingMetrics {
         async fn events(&self) -> Vec<(String, Option<Value>)> {
             self.entries.lock().await.clone()
+        }
+    }
+
+    struct TestRefresher {
+        succeed: bool,
+        attempts: usize,
+        failure_message: String,
+    }
+
+    impl TestRefresher {
+        fn succeed() -> Self {
+            Self {
+                succeed: true,
+                attempts: 0,
+                failure_message: String::new(),
+            }
+        }
+
+        fn fail(message: &str) -> Self {
+            Self {
+                succeed: false,
+                attempts: 0,
+                failure_message: message.to_string(),
+            }
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts
+        }
+    }
+
+    #[async_trait]
+    impl RegistryAuthRefresher for TestRefresher {
+        async fn refresh(&mut self) -> Result<(), String> {
+            self.attempts += 1;
+            if self.succeed {
+                Ok(())
+            } else {
+                Err(self.failure_message.clone())
+            }
         }
     }
 
@@ -963,6 +1213,7 @@ mod tests {
                 }
             },
             3,
+            None,
         )
         .await
         .expect("retry should eventually succeed");
@@ -1006,6 +1257,7 @@ mod tests {
                 })])
             },
             2,
+            None,
         )
         .await
         .expect_err("remote error should bubble");
@@ -1048,6 +1300,7 @@ mod tests {
                 stream::iter(vec![Ok(info)])
             },
             2,
+            None,
         )
         .await
         .expect_err("auth expired should bubble");
@@ -1062,6 +1315,149 @@ mod tests {
         assert_eq!(
             failed_details.get("auth_expired").and_then(Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_expired_refresh_retries_and_succeeds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let logger = RecordingLog::default();
+        let metrics = RecordingMetrics::default();
+        let scopes = vec!["scope".to_string()];
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+        let mut refresher = TestRefresher::succeed();
+
+        push_stream_with_retry(
+            &logger,
+            &metrics,
+            21,
+            "registry.test/example",
+            &scopes,
+            move || {
+                let attempt = counter_clone.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    let mut info = PushImageInfo::default();
+                    info.error_detail = Some(bollard::models::ErrorDetail {
+                        code: Some(401),
+                        message: Some("authentication required".to_string()),
+                    });
+                    stream::iter(vec![Ok(info)])
+                } else {
+                    stream::iter(vec![Ok(PushImageInfo {
+                        status: Some("Done".to_string()),
+                        ..Default::default()
+                    })])
+                }
+            },
+            3,
+            Some(&mut refresher as &mut dyn RegistryAuthRefresher),
+        )
+        .await
+        .expect("refresh should allow push to succeed");
+
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert_eq!(refresher.attempts(), 1);
+
+        let events = metrics.events().await;
+        let started = events
+            .iter()
+            .find(|(event, _)| event == "auth_refresh_started")
+            .and_then(|(_, details)| details.as_ref())
+            .expect("auth_refresh_started recorded");
+        assert_eq!(started.get("attempt").and_then(Value::as_u64), Some(1));
+        let succeeded = events
+            .iter()
+            .find(|(event, _)| event == "auth_refresh_succeeded")
+            .and_then(|(_, details)| details.as_ref())
+            .expect("auth_refresh_succeeded recorded");
+        assert_eq!(succeeded.get("attempt").and_then(Value::as_u64), Some(1));
+        let retry_details = events
+            .iter()
+            .find(|(event, _)| event == "push_retry")
+            .and_then(|(_, details)| details.as_ref())
+            .expect("push_retry recorded");
+        assert_eq!(
+            retry_details.get("reason").and_then(Value::as_str),
+            Some("auth_refresh")
+        );
+        assert_eq!(
+            retry_details.get("attempt").and_then(Value::as_u64),
+            Some(1)
+        );
+        let success_details = events
+            .iter()
+            .find(|(event, _)| event == "push_succeeded")
+            .and_then(|(_, details)| details.as_ref())
+            .expect("push_succeeded recorded");
+        assert_eq!(
+            success_details
+                .get("attempt")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+            Some(2),
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_refresh_failure_records_metrics() {
+        let logger = RecordingLog::default();
+        let metrics = RecordingMetrics::default();
+        let scopes = vec!["scope".to_string()];
+        let mut refresher = TestRefresher::fail("token refresh failure");
+
+        let err = push_stream_with_retry(
+            &logger,
+            &metrics,
+            22,
+            "registry.test/example",
+            &scopes,
+            || {
+                let mut info = PushImageInfo::default();
+                info.error_detail = Some(bollard::models::ErrorDetail {
+                    code: Some(401),
+                    message: Some("authentication required".to_string()),
+                });
+                stream::iter(vec![Ok(info)])
+            },
+            2,
+            Some(&mut refresher as &mut dyn RegistryAuthRefresher),
+        )
+        .await
+        .expect_err("refresh failure should bubble");
+
+        assert!(
+            matches!(err, RegistryPushError::AuthExpired(message) if message.contains("token refresh failure"))
+        );
+        assert_eq!(refresher.attempts(), 1);
+
+        let events = metrics.events().await;
+        assert!(events
+            .iter()
+            .any(|(event, _)| event == "auth_refresh_started"));
+        let failed_details = events
+            .iter()
+            .find(|(event, _)| event == "auth_refresh_failed")
+            .and_then(|(_, details)| details.as_ref())
+            .expect("auth_refresh_failed recorded");
+        assert_eq!(
+            failed_details.get("error").and_then(Value::as_str),
+            Some("token refresh failure")
+        );
+        let failure_entry = events
+            .iter()
+            .find(|(event, _)| event == "push_failed")
+            .and_then(|(_, details)| details.as_ref())
+            .expect("push_failed recorded");
+        assert_eq!(
+            failure_entry.get("auth_expired").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            failure_entry.get("attempt").and_then(Value::as_u64),
+            Some(1)
         );
     }
 
@@ -1098,21 +1494,15 @@ mod tests {
             Some(0)
         );
         assert_eq!(
-            failure_entry
-                .get("error_kind")
-                .and_then(Value::as_str),
+            failure_entry.get("error_kind").and_then(Value::as_str),
             Some("tag")
         );
         assert_eq!(
-            failure_entry
-                .get("retry_limit")
-                .and_then(Value::as_u64),
+            failure_entry.get("retry_limit").and_then(Value::as_u64),
             Some(5)
         );
         assert_eq!(
-            failure_entry
-                .get("auth_expired")
-                .and_then(Value::as_bool),
+            failure_entry.get("auth_expired").and_then(Value::as_bool),
             Some(false)
         );
     }
@@ -1143,21 +1533,15 @@ mod tests {
                 .expect("push_failed metric recorded");
 
             assert_eq!(
-                failure_entry
-                    .get("auth_expired")
-                    .and_then(Value::as_bool),
+                failure_entry.get("auth_expired").and_then(Value::as_bool),
                 Some(auth_expired)
             );
             assert_eq!(
-                failure_entry
-                    .get("retry_limit")
-                    .and_then(Value::as_u64),
+                failure_entry.get("retry_limit").and_then(Value::as_u64),
                 Some(4)
             );
             assert_eq!(
-                failure_entry
-                    .get("error_kind")
-                    .and_then(Value::as_str),
+                failure_entry.get("error_kind").and_then(Value::as_str),
                 Some(error_kind)
             );
         }
@@ -1238,15 +1622,11 @@ mod tests {
                 Some(5),
             );
             assert_eq!(
-                failure_entry
-                    .get("error_kind")
-                    .and_then(Value::as_str),
+                failure_entry.get("error_kind").and_then(Value::as_str),
                 Some(expected_kind),
             );
             assert_eq!(
-                failure_entry
-                    .get("auth_expired")
-                    .and_then(Value::as_bool),
+                failure_entry.get("auth_expired").and_then(Value::as_bool),
                 Some(expected_auth),
             );
             assert_eq!(
@@ -1282,15 +1662,11 @@ mod tests {
             .expect("push_failed metric recorded");
 
         assert_eq!(
-            failure_entry
-                .get("retry_limit")
-                .and_then(Value::as_u64),
+            failure_entry.get("retry_limit").and_then(Value::as_u64),
             Some(0),
         );
         assert_eq!(
-            failure_entry
-                .get("attempt")
-                .and_then(Value::as_u64),
+            failure_entry.get("attempt").and_then(Value::as_u64),
             Some(1),
         );
     }
@@ -1316,6 +1692,7 @@ mod tests {
                 stream::iter(vec![Ok(info)])
             },
             2,
+            None,
         )
         .await
         .expect_err("error details without message should bubble");
@@ -1333,27 +1710,19 @@ mod tests {
             .expect("push_failed metric recorded");
 
         assert_eq!(
-            failure_entry
-                .get("error_kind")
-                .and_then(Value::as_str),
+            failure_entry.get("error_kind").and_then(Value::as_str),
             Some("remote"),
         );
         assert_eq!(
-            failure_entry
-                .get("auth_expired")
-                .and_then(Value::as_bool),
+            failure_entry.get("auth_expired").and_then(Value::as_bool),
             Some(false),
         );
         assert_eq!(
-            failure_entry
-                .get("attempt")
-                .and_then(Value::as_u64),
+            failure_entry.get("attempt").and_then(Value::as_u64),
             Some(1),
         );
         assert_eq!(
-            failure_entry
-                .get("retry_limit")
-                .and_then(Value::as_u64),
+            failure_entry.get("retry_limit").and_then(Value::as_u64),
             Some(2),
         );
     }
@@ -1413,6 +1782,7 @@ mod tests {
                 })])
             },
             1,
+            None,
         )
         .await
         .expect_err("push error should bubble");
@@ -1430,21 +1800,15 @@ mod tests {
             Some(1)
         );
         assert_eq!(
-            failure_details
-                .get("retry_limit")
-                .and_then(Value::as_u64),
+            failure_details.get("retry_limit").and_then(Value::as_u64),
             Some(1)
         );
         assert_eq!(
-            failure_details
-                .get("error_kind")
-                .and_then(Value::as_str),
+            failure_details.get("error_kind").and_then(Value::as_str),
             Some("push")
         );
         assert_eq!(
-            failure_details
-                .get("auth_expired")
-                .and_then(Value::as_bool),
+            failure_details.get("auth_expired").and_then(Value::as_bool),
             Some(false)
         );
     }
