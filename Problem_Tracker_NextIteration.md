@@ -52,3 +52,11 @@
   Log:
     - 2025-10-30 09:45:00 UTC: Introduced telemetry module with schema validation and wired it into `add_metric` for defensive checks.
     - 2025-10-30 11:45:00 UTC: Landed integration tests for REST and SSE payloads plus README updates documenting the guardrails.
+- ID: BE-BUILD-007
+  Status: DONE
+  Task: Deliver multi-architecture image publishing with manifest telemetry.
+  Hypothesis: Building per-architecture images, emitting platform-aware metrics, and publishing manifest lists will unlock heterogeneous deployments while keeping observability intact.
+  Log:
+    - 2025-10-31 09:20:00 UTC: Added platform parsing/config plumbing, refactored build pipeline to iterate targets, and enriched push metrics with `platform` context.
+    - 2025-10-31 10:05:00 UTC: Implemented manifest publishing helper with auth handling, HTTP contract tests, and README/runbook updates covering QEMU/Buildx requirements.
+    - 2025-10-31 10:40:00 UTC: Landed integration test for manifest telemetry and recorded tracker closure.

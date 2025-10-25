@@ -32,6 +32,29 @@ pub static REGISTRY_AUTH_DOCKERCONFIG: Lazy<Option<String>> = Lazy::new(|| {
         .filter(|value| !value.is_empty())
 });
 
+/// Architectures that should be targeted when building/publishing images. Provide a
+/// comma-separated list such as `linux/amd64,linux/arm64` via `REGISTRY_ARCH_TARGETS`.
+/// Defaults to just `linux/amd64` so existing single-arch builds continue to function.
+pub static REGISTRY_ARCH_TARGETS: Lazy<Vec<String>> = Lazy::new(|| {
+    std::env::var("REGISTRY_ARCH_TARGETS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|raw| {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|targets| !targets.is_empty())
+        .unwrap_or_else(|| vec!["linux/amd64".to_string()])
+});
+
 /// Address the HTTP server should bind to. Defaults to `0.0.0.0`.
 pub static BIND_ADDRESS: Lazy<String> =
     Lazy::new(|| std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0".to_string()));
