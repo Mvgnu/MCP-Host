@@ -115,12 +115,21 @@ impl ContainerRuntime for KubernetesRuntime {
                 if let Err(err) = crate::servers::set_status(&pool, server_id, "cloning").await {
                     tracing::error!(?err, %server_id, "failed to set status to cloning");
                 }
-                if let Some(tag) =
-                    crate::build::build_from_git(&pool, server_id, repo, branch).await
-                {
-                    image = tag;
-                } else {
-                    return;
+                match crate::build::build_from_git(&pool, server_id, repo, branch).await {
+                    Ok(Some(tag)) => {
+                        image = tag;
+                    }
+                    Ok(None) => {
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            ?err,
+                            %server_id,
+                            "build failed to update status after git build"
+                        );
+                        return;
+                    }
                 }
             }
 
