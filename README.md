@@ -22,6 +22,7 @@ The build service tags and pushes images using the Docker remote API via Bollard
 * Progress logs include digest discovery lines such as `Manifest published with digest sha256:<hash>` that propagate to the UI.
 * Authentication failures generate `registry authentication expired` errors and surface to the server status feed so operators can refresh credentials.
 * Transient transport errors (I/O, hyper, HTTP client, or timeouts) retry up to `REGISTRY_PUSH_RETRIES` attempts (default `3`) with a short backoff. Override the limit via an environment variable when tuning resilience.
+* Usage metrics capture each stage: `tag_started`/`tag_succeeded` for Docker tagging and `push_failed` entries with `attempt=0` for pre-stream failures, giving observability platforms enough context to differentiate tagging issues from push retries.
 
 #### Runbook
 

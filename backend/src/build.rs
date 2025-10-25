@@ -202,6 +202,31 @@ impl<'a> MetricRecorder for UsageMetricRecorder<'a> {
     }
 }
 
+async fn record_push_failure<M: MetricRecorder + ?Sized>(
+    metrics: &M,
+    registry_endpoint: &str,
+    attempt: usize,
+    retry_limit: usize,
+    error_kind: &str,
+    error_message: &str,
+    auth_expired: bool,
+) {
+    // telemetry: registry_push_failure
+    metrics
+        .record(
+            "push_failed",
+            Some(json!({
+                "attempt": attempt,
+                "retry_limit": retry_limit,
+                "registry_endpoint": registry_endpoint,
+                "error": error_message,
+                "error_kind": error_kind,
+                "auth_expired": auth_expired,
+            })),
+        )
+        .await;
+}
+
 async fn stream_push_progress<L, S>(
     logger: &L,
     server_id: i32,
@@ -412,19 +437,17 @@ where
                     RegistryPushError::Tag(_) => ("tag", false),
                     RegistryPushError::Push(_) => ("push", false),
                 };
-                metrics
-                    .record(
-                        "push_failed",
-                        Some(json!({
-                            "attempt": attempt,
-                            "retry_limit": retry_limit,
-                            "registry_endpoint": registry_endpoint,
-                            "error": err.to_string(),
-                            "error_kind": error_kind,
-                            "auth_expired": auth_expired,
-                        })),
-                    )
-                    .await;
+                let error_message = err.to_string();
+                record_push_failure(
+                    metrics,
+                    registry_endpoint,
+                    attempt,
+                    retry_limit,
+                    error_kind,
+                    &error_message,
+                    auth_expired,
+                )
+                .await;
                 tracing::error!(
                     target: "registry.push",
                     %registry_endpoint,
@@ -432,8 +455,8 @@ where
                     scopes = ?scopes,
                     attempt,
                     retry_limit,
-                    error = %err,
-                    "registry push failed"
+                    error = %error_message,
+                    "registry push failed",
                 );
                 return Err(err);
             }
@@ -466,14 +489,62 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
         "tagging image for registry push"
     );
 
+    let retry_limit = registry_push_retry_limit();
+    let usage_metrics = UsageMetricRecorder { pool, server_id };
+
+    usage_metrics
+        .record(
+            "tag_started",
+            Some(json!({
+                "registry_endpoint": &reference.repository,
+                "tag": &reference.tag,
+            })),
+        )
+        .await;
+
     let tag_opts = TagImageOptionsBuilder::new()
         .repo(&reference.repository)
         .tag(&reference.tag)
         .build();
-    docker
-        .tag_image(image_tag, Some(tag_opts))
-        .await
-        .map_err(RegistryPushError::Tag)?;
+    if let Err(err) = docker.tag_image(image_tag, Some(tag_opts)).await {
+        let error_message = err.to_string();
+        record_push_failure(
+            &usage_metrics,
+            &reference.repository,
+            0,
+            retry_limit,
+            "tag",
+            &error_message,
+            false,
+        )
+        .await;
+        tracing::error!(
+            target: "registry.push",
+            registry_endpoint = %reference.repository,
+            %server_id,
+            scopes = ?scopes,
+            tag = %reference.tag,
+            error = %error_message,
+            "failed to tag image for registry push",
+        );
+        insert_log(
+            logger,
+            server_id,
+            &format!("Failed to tag image for registry push: {error_message}"),
+        )
+        .await;
+        return Err(RegistryPushError::Tag(err));
+    }
+
+    usage_metrics
+        .record(
+            "tag_succeeded",
+            Some(json!({
+                "registry_endpoint": &reference.repository,
+                "tag": &reference.tag,
+            })),
+        )
+        .await;
 
     insert_log(logger, server_id, "Pushing image to registry").await;
     tracing::info!(
@@ -485,8 +556,6 @@ async fn push_image_to_registry<L: BuildLogSink + ?Sized>(
         "starting registry push"
     );
 
-    let retry_limit = registry_push_retry_limit();
-    let usage_metrics = UsageMetricRecorder { pool, server_id };
     push_stream_with_retry(
         logger,
         &usage_metrics,
@@ -989,6 +1058,46 @@ mod tests {
         assert_eq!(
             failed_details.get("auth_expired").and_then(Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn record_push_failure_helper_serializes_context() {
+        let metrics = RecordingMetrics::default();
+
+        record_push_failure(
+            &metrics,
+            "registry.test/example",
+            0,
+            5,
+            "tag",
+            "simulated failure",
+            false,
+        )
+        .await;
+
+        let events = metrics.events().await;
+        let failure_entry = events
+            .iter()
+            .find(|(event, _)| event == "push_failed")
+            .and_then(|(_, details)| details.as_ref())
+            .expect("push_failed metric recorded");
+
+        assert_eq!(
+            failure_entry
+                .get("registry_endpoint")
+                .and_then(Value::as_str),
+            Some("registry.test/example")
+        );
+        assert_eq!(
+            failure_entry.get("attempt").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            failure_entry
+                .get("error_kind")
+                .and_then(Value::as_str),
+            Some("tag")
         );
     }
 }
