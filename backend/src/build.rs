@@ -1163,6 +1163,201 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn record_push_failure_captures_all_error_variants() {
+        use bollard::errors::Error as BollardError;
+
+        let cases: Vec<(RegistryPushError, usize, &'static str, bool)> = vec![
+            (
+                RegistryPushError::Remote("denied".to_string()),
+                1,
+                "remote",
+                false,
+            ),
+            (
+                RegistryPushError::AuthExpired("expired".to_string()),
+                2,
+                "auth_expired",
+                true,
+            ),
+            (
+                RegistryPushError::Tag(BollardError::DockerResponseServerError {
+                    status_code: 500,
+                    message: "tag failure".to_string(),
+                }),
+                0,
+                "tag",
+                false,
+            ),
+            (
+                RegistryPushError::Push(BollardError::DockerResponseServerError {
+                    status_code: 502,
+                    message: "push failure".to_string(),
+                }),
+                3,
+                "push",
+                false,
+            ),
+        ];
+
+        for (error, attempt, expected_kind, expected_auth) in cases {
+            let metrics = RecordingMetrics::default();
+            let (error_kind, auth_flag) = classify_registry_push_error(&error);
+            let error_message = error.to_string();
+
+            record_push_failure(
+                &metrics,
+                "registry.test/example",
+                attempt,
+                5,
+                error_kind,
+                &error_message,
+                auth_flag,
+            )
+            .await;
+
+            let events = metrics.events().await;
+            let failure_entry = events
+                .iter()
+                .find(|(event, _)| event == "push_failed")
+                .and_then(|(_, details)| details.as_ref())
+                .expect("push_failed metric recorded");
+
+            assert_eq!(
+                failure_entry
+                    .get("attempt")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize),
+                Some(attempt),
+            );
+            assert_eq!(
+                failure_entry
+                    .get("retry_limit")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize),
+                Some(5),
+            );
+            assert_eq!(
+                failure_entry
+                    .get("error_kind")
+                    .and_then(Value::as_str),
+                Some(expected_kind),
+            );
+            assert_eq!(
+                failure_entry
+                    .get("auth_expired")
+                    .and_then(Value::as_bool),
+                Some(expected_auth),
+            );
+            assert_eq!(
+                failure_entry
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(|value| value.to_owned()),
+                Some(error_message.clone()),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn record_push_failure_handles_zero_retry_limit() {
+        let metrics = RecordingMetrics::default();
+
+        record_push_failure(
+            &metrics,
+            "registry.test/example",
+            1,
+            0,
+            "remote",
+            "simulated error",
+            false,
+        )
+        .await;
+
+        let events = metrics.events().await;
+        let failure_entry = events
+            .iter()
+            .find(|(event, _)| event == "push_failed")
+            .and_then(|(_, details)| details.as_ref())
+            .expect("push_failed metric recorded");
+
+        assert_eq!(
+            failure_entry
+                .get("retry_limit")
+                .and_then(Value::as_u64),
+            Some(0),
+        );
+        assert_eq!(
+            failure_entry
+                .get("attempt")
+                .and_then(Value::as_u64),
+            Some(1),
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_error_without_detail_message_records_failure() {
+        let logger = RecordingLog::default();
+        let metrics = RecordingMetrics::default();
+        let scopes = vec!["scope".to_string()];
+
+        let err = push_stream_with_retry(
+            &logger,
+            &metrics,
+            11,
+            "registry.test/example",
+            &scopes,
+            || {
+                let mut info = PushImageInfo::default();
+                info.error_detail = Some(bollard::models::ErrorDetail {
+                    code: Some(418),
+                    message: None,
+                });
+                stream::iter(vec![Ok(info)])
+            },
+            2,
+        )
+        .await
+        .expect_err("error details without message should bubble");
+
+        match err {
+            RegistryPushError::Remote(msg) => assert!(msg.contains("Unknown registry error")),
+            other => panic!("expected remote error detail, got {:?}", other),
+        }
+
+        let events = metrics.events().await;
+        let failure_entry = events
+            .iter()
+            .find(|(event, _)| event == "push_failed")
+            .and_then(|(_, details)| details.as_ref())
+            .expect("push_failed metric recorded");
+
+        assert_eq!(
+            failure_entry
+                .get("error_kind")
+                .and_then(Value::as_str),
+            Some("remote"),
+        );
+        assert_eq!(
+            failure_entry
+                .get("auth_expired")
+                .and_then(Value::as_bool),
+            Some(false),
+        );
+        assert_eq!(
+            failure_entry
+                .get("attempt")
+                .and_then(Value::as_u64),
+            Some(1),
+        );
+        assert_eq!(
+            failure_entry
+                .get("retry_limit")
+                .and_then(Value::as_u64),
+            Some(2),
+        );
+    }
+
     #[test]
     fn classify_registry_push_error_covers_variants() {
         use bollard::errors::Error as BollardError;

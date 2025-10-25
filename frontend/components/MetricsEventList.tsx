@@ -56,6 +56,7 @@ function formatDetails(event: MetricEvent): string[] {
     case 'push_retry':
       return [
         `Retry ${details.attempt ?? '?'} of ${details.retry_limit ?? '?'}`,
+        `Repository: ${details.registry_endpoint ?? 'unknown'}`,
         details.error ? `Reason: ${details.error}` : 'Reason: unknown',
       ];
     case 'push_succeeded':
@@ -65,6 +66,7 @@ function formatDetails(event: MetricEvent): string[] {
       ];
     case 'push_failed':
       return [
+        `Repository: ${details.registry_endpoint ?? 'unknown'}`,
         `Failure kind: ${details.error_kind ?? 'unknown'}`,
         details.error ? `Error: ${details.error}` : 'Error: unknown',
         `Attempt ${details.attempt ?? '?'} of ${details.retry_limit ?? '?'}`,

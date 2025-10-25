@@ -27,3 +27,4 @@
   Hypothesis: Aligning API/UI consumption of new tag_* and push_* metrics plus defensive tests will keep dashboards accurate during refactors.
   Log:
     - 2025-10-26 11:30:00 UTC: Surfaced tagging/push telemetry in server dashboard, added metric timeline, and expanded backend negative-path tests for retry/auth metadata.
+    - 2025-10-27 08:45:00 UTC: Audited repo consumers (UI, metrics API) for tag/push schema alignment, documented payload contract, and added regression tests for all RegistryPushError variants including zero-retry and malformed remote detail cases.
