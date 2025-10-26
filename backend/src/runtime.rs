@@ -146,6 +146,25 @@ impl ContainerRuntime for RuntimeOrchestrator {
                 }
             };
 
+            if decision.governance_required {
+                tracing::info!(
+                    %server_id,
+                    backend = %decision.backend.as_str(),
+                    "governance workflow required before launch",
+                );
+                if let Err(set_err) =
+                    crate::servers::set_status(&pool, server_id, "pending-governance").await
+                {
+                    tracing::error!(
+                        ?set_err,
+                        %server_id,
+                        "failed to set server status after governance gate",
+                    );
+                }
+                assignments.remove(&server_id);
+                return;
+            }
+
             if !decision.capabilities_satisfied {
                 tracing::error!(
                     %server_id,

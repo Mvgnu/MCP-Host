@@ -2,6 +2,7 @@ mod artifacts;
 mod auth;
 mod docker;
 mod extractor;
+mod governance;
 mod runtime;
 mod servers;
 mod telemetry;
@@ -12,6 +13,7 @@ mod config;
 mod domains;
 mod error;
 mod evaluation;
+mod evaluations;
 mod file_store;
 mod ingestion;
 mod invocations;
@@ -31,7 +33,7 @@ use axum::{routing::get, Extension, Router};
 use axum_prometheus::PrometheusMetricLayer;
 use job_queue::start_worker;
 use policy::{RuntimeBackend, RuntimePolicyEngine};
-use runtime::{ContainerRuntime, DockerRuntime, KubernetesRuntime};
+use runtime::{ContainerRuntime, DockerRuntime, KubernetesRuntime, RuntimeOrchestrator};
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -71,21 +73,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let configured_backend = config::CONTAINER_RUNTIME.as_str();
+    let governance_engine = Arc::new(governance::GovernanceEngine::new());
     let mut policy_engine = Arc::new(RuntimePolicyEngine::new(match configured_backend {
         "kubernetes" => RuntimeBackend::Kubernetes,
         _ => RuntimeBackend::Docker,
     }));
 
-    let runtime: Arc<dyn ContainerRuntime> = match configured_backend {
-        "kubernetes" => match KubernetesRuntime::new(policy_engine.clone()).await {
-            Ok(rt) => Arc::new(rt),
+    let runtime: Arc<dyn ContainerRuntime> = if configured_backend == "kubernetes" {
+        policy_engine
+            .register_executor(DockerRuntime::descriptor())
+            .await;
+        let docker_executor: Arc<dyn runtime::RuntimeExecutor> = Arc::new(DockerRuntime::new());
+
+        match KubernetesRuntime::new().await {
+            Ok(kube_runtime) => {
+                policy_engine
+                    .register_executor(KubernetesRuntime::descriptor())
+                    .await;
+                policy_engine
+                    .attach_governance(governance_engine.clone())
+                    .await;
+                let executors: Vec<Arc<dyn runtime::RuntimeExecutor>> =
+                    vec![docker_executor, Arc::new(kube_runtime)];
+                Arc::new(RuntimeOrchestrator::new(
+                    policy_engine.clone(),
+                    pool.clone(),
+                    executors,
+                ))
+            }
             Err(e) => {
                 tracing::warn!(%e, "failed to init Kubernetes runtime; using docker");
                 policy_engine = Arc::new(RuntimePolicyEngine::new(RuntimeBackend::Docker));
-                Arc::new(DockerRuntime::new(policy_engine.clone()))
+                policy_engine
+                    .register_executor(DockerRuntime::descriptor())
+                    .await;
+                policy_engine
+                    .attach_governance(governance_engine.clone())
+                    .await;
+                let executors: Vec<Arc<dyn runtime::RuntimeExecutor>> =
+                    vec![Arc::new(DockerRuntime::new())];
+                Arc::new(RuntimeOrchestrator::new(
+                    policy_engine.clone(),
+                    pool.clone(),
+                    executors,
+                ))
             }
-        },
-        _ => Arc::new(DockerRuntime::new(policy_engine.clone())),
+        }
+    } else {
+        policy_engine
+            .register_executor(DockerRuntime::descriptor())
+            .await;
+        policy_engine
+            .attach_governance(governance_engine.clone())
+            .await;
+        let executors: Vec<Arc<dyn runtime::RuntimeExecutor>> =
+            vec![Arc::new(DockerRuntime::new())];
+        Arc::new(RuntimeOrchestrator::new(
+            policy_engine.clone(),
+            pool.clone(),
+            executors,
+        ))
     };
     let job_tx = start_worker(pool.clone(), runtime.clone());
     ingestion::start_ingestion_worker(pool.clone());
@@ -101,7 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(pool.clone()))
         .layer(Extension(job_tx.clone()))
         .layer(Extension(runtime.clone()))
-        .layer(Extension(policy_engine.clone()));
+        .layer(Extension(policy_engine.clone()))
+        .layer(Extension(governance_engine.clone()));
 
     let addr: SocketAddr = format!("{}:{}", config::BIND_ADDRESS.as_str(), *config::BIND_PORT)
         .parse()
