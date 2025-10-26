@@ -1,3 +1,6 @@
+use crate::artifacts::{
+    record_build_artifacts, ArtifactPersistenceRequest, ArtifactPlatformRecord,
+};
 use crate::config::{REGISTRY_ARCH_TARGETS, REGISTRY_AUTH_DOCKERCONFIG};
 use crate::servers::{add_metric, set_status, SetStatusError};
 use crate::telemetry::MetricError;
@@ -2006,9 +2009,31 @@ async fn set_status_or_log(
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct BuildPlatformArtifact {
+    pub platform: String,
+    pub remote_image: String,
+    pub remote_tag: String,
+    pub digest: Option<String>,
+    pub auth_refresh_attempted: bool,
+    pub auth_refresh_succeeded: bool,
+    pub auth_rotation_attempted: bool,
+    pub auth_rotation_succeeded: bool,
+    pub credential_health_status: CredentialHealthStatus,
+}
+
 pub struct BuildArtifacts {
     pub local_image: String,
     pub registry_image: Option<String>,
+    pub manifest_tag: String,
+    pub manifest_digest: Option<String>,
+    pub registry: Option<String>,
+    pub platforms: Vec<BuildPlatformArtifact>,
+    pub source_repo: String,
+    pub source_branch: Option<String>,
+    pub source_revision: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
     pub auth_refresh_attempted: bool,
     pub auth_refresh_succeeded: bool,
     pub auth_rotation_attempted: bool,
@@ -2025,6 +2050,8 @@ pub async fn build_from_git(
     branch: Option<&str>,
 ) -> Result<Option<BuildArtifacts>, SetStatusError> {
     insert_log(pool, server_id, "Cloning repository").await;
+    let build_started_at = Utc::now();
+    let branch_value = branch.map(|s| s.to_string());
     let tmp = match tempdir() {
         Ok(t) => t,
         Err(e) => {
@@ -2036,23 +2063,34 @@ pub async fn build_from_git(
     };
 
     let repo = repo_url.to_string();
-    let br_opt = branch.map(|s| s.to_string());
+    let repo_for_clone = repo.clone();
+    let br_opt = branch_value.clone();
     let clone_path = tmp.path().to_path_buf();
-    if let Err(e) = tokio::task::spawn_blocking(move || {
-        let mut builder = git2::build::RepoBuilder::new();
-        if let Some(ref br) = br_opt {
-            builder.branch(br);
+    let clone_result =
+        tokio::task::spawn_blocking(move || -> Result<Option<String>, git2::Error> {
+            let mut builder = git2::build::RepoBuilder::new();
+            if let Some(ref br) = br_opt {
+                builder.branch(br);
+            }
+            let repository = builder.clone(&repo_for_clone, &clone_path)?;
+            let revision = repository
+                .head()
+                .ok()
+                .and_then(|reference| reference.target())
+                .map(|oid| oid.to_string());
+            Ok(revision)
+        })
+        .await
+        .unwrap_or_else(|e| Err(git2::Error::from_str(&e.to_string())));
+    let git_revision = match clone_result {
+        Ok(revision) => revision,
+        Err(e) => {
+            tracing::error!(?e, "git clone failed");
+            insert_log(pool, server_id, "Git clone failed").await;
+            set_status_or_log(pool, server_id, "error").await?;
+            return Ok(None);
         }
-        builder.clone(&repo, &clone_path).map(|_| ())
-    })
-    .await
-    .unwrap_or_else(|e| Err(git2::Error::from_str(&e.to_string())))
-    {
-        tracing::error!(?e, "git clone failed");
-        insert_log(pool, server_id, "Git clone failed").await;
-        set_status_or_log(pool, server_id, "error").await?;
-        return Ok(None);
-    }
+    };
 
     // Generate a Dockerfile when none exists using a simple language-specific template
     let dockerfile = tmp.path().join("Dockerfile");
@@ -2074,11 +2112,13 @@ pub async fn build_from_git(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     let mut registry_image = None;
+    let mut manifest_digest: Option<String> = None;
     let mut auth_refresh_attempted = false;
     let mut auth_refresh_succeeded = false;
     let mut auth_rotation_attempted = false;
     let mut auth_rotation_succeeded = false;
     let mut credential_health_status = CredentialHealthStatus::Unknown;
+    let mut platform_artifacts: Vec<BuildPlatformArtifact> = Vec::new();
     let docker = match Docker::connect_with_local_defaults() {
         Ok(d) => d,
         Err(e) => {
@@ -2270,11 +2310,25 @@ pub async fn build_from_git(
             auth_refresh_succeeded |= result.auth_refresh_succeeded;
             auth_rotation_attempted |= result.auth_rotation_attempted;
             auth_rotation_succeeded |= result.auth_rotation_succeeded;
-            credential_health_status =
-                credential_health_status.combine(result.credential_health_status);
+            let result_status = result.credential_health_status;
+            credential_health_status = credential_health_status.combine(result_status);
+            let remote_image = result.image.clone();
+            let remote_tag = result.remote_tag.clone();
+            let digest = result.digest.clone();
             if registry_image.is_none() {
-                registry_image = Some(result.image.clone());
+                registry_image = Some(remote_image.clone());
             }
+            platform_artifacts.push(BuildPlatformArtifact {
+                platform: record.target.spec.clone(),
+                remote_image: remote_image.clone(),
+                remote_tag: remote_tag.clone(),
+                digest: digest.clone(),
+                auth_refresh_attempted: result.auth_refresh_attempted,
+                auth_refresh_succeeded: result.auth_refresh_succeeded,
+                auth_rotation_attempted: result.auth_rotation_attempted,
+                auth_rotation_succeeded: result.auth_rotation_succeeded,
+                credential_health_status: result_status,
+            });
             platform_pushes.push((record.target, result));
         }
     }
@@ -2315,7 +2369,7 @@ pub async fn build_from_git(
             }
 
             let manifest_metrics = UsageMetricRecorder { pool, server_id };
-            if let Err(err) = publish_manifest_list(
+            match publish_manifest_list(
                 pool,
                 &manifest_metrics,
                 server_id,
@@ -2326,10 +2380,24 @@ pub async fn build_from_git(
             )
             .await
             {
-                tracing::error!(?err, registry = %registry, %server_id, "manifest publish failed");
-                insert_log(pool, server_id, &format!("Manifest publish failed: {err}")).await;
-                set_status_or_log(pool, server_id, "error").await?;
-                return Ok(None);
+                Ok(digest_value) => {
+                    if digest_value.is_empty() {
+                        manifest_digest = None;
+                    } else {
+                        manifest_digest = Some(digest_value.clone());
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        registry = %registry,
+                        %server_id,
+                        "manifest publish failed"
+                    );
+                    insert_log(pool, server_id, &format!("Manifest publish failed: {err}")).await;
+                    set_status_or_log(pool, server_id, "error").await?;
+                    return Ok(None);
+                }
             }
 
             let digest_set: HashSet<String> = manifest_inputs
@@ -2362,6 +2430,9 @@ pub async fn build_from_git(
             ));
         } else if let Some((_, result)) = platform_pushes.first() {
             registry_image = Some(result.image.clone());
+            if let Some(digest_value) = result.digest.clone() {
+                manifest_digest = Some(digest_value);
+            }
         }
     }
     // Parse Dockerfile for EXPOSE instructions
@@ -2374,16 +2445,75 @@ pub async fn build_from_git(
 
     insert_log(pool, server_id, "Image built").await;
 
-    insert_log(pool, server_id, "Cleaning up").await;
-    Ok(Some(BuildArtifacts {
-        local_image: base_name,
-        registry_image,
+    let build_completed_at = Utc::now();
+    let multi_arch = platform_artifacts.len() > 1;
+    let artifacts = BuildArtifacts {
+        local_image: base_name.clone(),
+        registry_image: registry_image.clone(),
+        manifest_tag: manifest_tag.to_string(),
+        manifest_digest: manifest_digest.clone(),
+        registry: registry_env.clone(),
+        platforms: platform_artifacts,
+        source_repo: repo,
+        source_branch: branch_value.clone(),
+        source_revision: git_revision.clone(),
+        started_at: build_started_at,
+        completed_at: build_completed_at,
         auth_refresh_attempted,
         auth_refresh_succeeded,
         auth_rotation_attempted,
         auth_rotation_succeeded,
         credential_health_status,
-    }))
+    };
+
+    let persistence_request = ArtifactPersistenceRequest {
+        server_id,
+        source_repo: Some(artifacts.source_repo.clone()),
+        source_branch: artifacts.source_branch.clone(),
+        source_revision: artifacts.source_revision.clone(),
+        registry: artifacts.registry.clone(),
+        local_image: artifacts.local_image.clone(),
+        registry_image: artifacts.registry_image.clone(),
+        manifest_tag: artifacts.manifest_tag.clone(),
+        manifest_digest: artifacts.manifest_digest.clone(),
+        started_at: artifacts.started_at,
+        completed_at: artifacts.completed_at,
+        status: "succeeded".to_string(),
+        multi_arch,
+        auth_refresh_attempted: artifacts.auth_refresh_attempted,
+        auth_refresh_succeeded: artifacts.auth_refresh_succeeded,
+        auth_rotation_attempted: artifacts.auth_rotation_attempted,
+        auth_rotation_succeeded: artifacts.auth_rotation_succeeded,
+        credential_health_status: artifacts.credential_health_status.as_str().to_string(),
+        platforms: artifacts
+            .platforms
+            .iter()
+            .map(|platform| ArtifactPlatformRecord {
+                platform: platform.platform.clone(),
+                remote_image: platform.remote_image.clone(),
+                remote_tag: platform.remote_tag.clone(),
+                digest: platform.digest.clone(),
+                auth_refresh_attempted: platform.auth_refresh_attempted,
+                auth_refresh_succeeded: platform.auth_refresh_succeeded,
+                auth_rotation_attempted: platform.auth_rotation_attempted,
+                auth_rotation_succeeded: platform.auth_rotation_succeeded,
+                credential_health_status: platform.credential_health_status.as_str().to_string(),
+            })
+            .collect(),
+    };
+
+    if let Err(err) = record_build_artifacts(pool, persistence_request).await {
+        tracing::error!(?err, %server_id, "failed to persist build artifacts");
+        insert_log(
+            pool,
+            server_id,
+            "Failed to persist build artifact metadata; consult server logs",
+        )
+        .await;
+    }
+
+    insert_log(pool, server_id, "Cleaning up").await;
+    Ok(Some(artifacts))
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+mod artifacts;
 mod auth;
 mod docker;
 mod extractor;
