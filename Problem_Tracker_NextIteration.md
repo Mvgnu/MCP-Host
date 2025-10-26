@@ -90,3 +90,39 @@
   Log:
     - 2025-11-03 09:00:00 UTC: Initiated API design; audited marketplace.rs static implementation and artifact persistence schema to scope query/aggregation requirements.
     - 2025-11-03 11:35:00 UTC: Replaced static marketplace entries with Postgres-backed query, added tier/health derivations, documented the API contract, and verified with cargo test.
+
+- ID: BE-RUNTIME-001
+  Status: DONE
+  Task: Introduce a policy-driven runtime core that evaluates placement rules before container launch.
+  Hypothesis: Centralizing runtime decisions with marketplace awareness and persistent audit logs enables promotion gates, backend selection, and lifecycle governance without duplicating logic across Docker/Kubernetes paths.
+  Log:
+    - 2025-11-05 08:35:00 UTC: Scoped runtime decision points in `runtime.rs` and designed `RuntimePolicyEngine` interfaces plus the `runtime_policy_decisions` schema.
+    - 2025-11-05 11:10:00 UTC: Refactored Docker/Kubernetes runtimes to delegate to the policy engine, persisted decisions, and updated documentation/extensions for downstream consumers.
+
+- ID: BE-RUNTIME-002
+  Status: PENDING
+  Task: Enforce runtime backend switching through policy decisions with pluggable executors (Docker, Kubernetes, VMs).
+  Hypothesis: Abstracting backend executors behind the policy engine will allow operators to target alternate environments and codify placement fallbacks without modifying launch code.
+  Log:
+    - 2025-11-05 11:15:00 UTC: Created task to track backend abstraction work after initial policy integration landed.
+
+- ID: BE-EVAL-002
+  Status: PENDING
+  Task: Bind evaluation runs to manifest digests and enforce policy gates before deployment.
+  Hypothesis: Guaranteeing evaluations certify a specific digest/tier will let the policy engine require passing checks before a placement proceeds, preventing drift between tests and deployed artifacts.
+  Log:
+    - 2025-11-05 11:16:00 UTC: Added backlog item to extend evaluation schema and integrate with policy decision flow.
+
+- ID: BE-LIFE-001
+  Status: PENDING
+  Task: Implement lifecycle governance (promotion checkpoints, credential rotations, rollbacks) driven by policy decisions.
+  Hypothesis: Using persisted policy outcomes and marketplace tiers to coordinate promotions and rotations will replace ad-hoc scripts with governed workflows.
+  Log:
+    - 2025-11-05 11:17:00 UTC: Logged follow-up to design operator flows once policy engine signals and audit trails are in place.
+
+- ID: BE-INTEL-001
+  Status: PENDING
+  Task: Layer anomaly scoring on the artifact ledger to influence policy thresholds.
+  Hypothesis: Highlighting build latency spikes, credential churn, or missing architectures via scoring will let policy dynamically adjust promotions and evaluation requirements.
+  Log:
+    - 2025-11-05 11:18:00 UTC: Added backlog entry to explore rule-based or learned scoring feeding into runtime policy decisions.

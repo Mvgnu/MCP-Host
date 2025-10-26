@@ -678,3 +678,8 @@ This document tracks development progress and high level notes from the planning
 - Added automated registry credential refresh workflow with shared Docker client guard and retry-loop integration.
 - Recorded new telemetry events (`auth_refresh_started`, `auth_refresh_succeeded`, `auth_refresh_failed`) and annotated `push_retry` with `reason="auth_refresh"` for refreshed attempts.
 - Extended backend tests to cover refresh success/failure flows and updated README/runbook plus tracker entry BE-BUILD-005.
+
+## 2025-11-05
+- Carved out `backend/src/policy.rs` with a policy engine that hydrates marketplace health data, selects runtime backends, and persists placement notes in the new `runtime_policy_decisions` table.
+- Refactored Docker and Kubernetes runtimes to delegate image selection and build triggers through the shared policy layer, warning when the configured backend diverges from policy guidance.
+- Exposed the policy engine via Axum extensions and documented the new workflow in README and design materials to set the stage for operator control surfaces.

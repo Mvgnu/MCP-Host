@@ -23,5 +23,6 @@ This document outlines the design direction for MCP Host. The goal is a modern, 
 2. **Marketplace** – list of prebuilt MCP images pulled from `/api/marketplace` using the `Card` component.
 3. **Vector DBs** – manage managed vector databases using `/api/vector-dbs` endpoints.
 4. **Dashboard** – servers list, capabilities, logs, metrics, and evaluation results.
+5. **Lifecycle & Policy Console** – surfaces runtime policy decisions, promotion gates, and evaluation requirements backed by the new `RuntimePolicyEngine`. Operators should be able to inspect recent `runtime_policy_decisions` records, trigger staged rollouts, and visualize tier/health rationale derived from the marketplace ledger.
 
 This vision will guide iterative enhancements to deliver a polished, professional frontend.

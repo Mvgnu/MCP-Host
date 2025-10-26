@@ -1,5 +1,6 @@
 use crate::build;
 use crate::capabilities;
+use crate::policy::{RuntimeBackend, RuntimePolicyEngine};
 use crate::proxy;
 use crate::servers::{add_metric, set_status};
 use bollard::container::{
@@ -11,6 +12,7 @@ use bollard::Docker;
 use reqwest;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
+use std::sync::Arc;
 use tokio::sync::mpsc::{self, Receiver};
 
 async fn insert_log(pool: &PgPool, server_id: i32, text: &str) {
@@ -36,6 +38,7 @@ async fn set_status_with_context(pool: &PgPool, server_id: i32, status: &str, co
 /// Spawn a background task to launch an MCP server container.
 /// Updates the `mcp_servers` table with running/error status.
 pub fn spawn_server_task(
+    policy: Arc<RuntimePolicyEngine>,
     server_id: i32,
     server_type: String,
     config: Option<Value>,
@@ -44,6 +47,31 @@ pub fn spawn_server_task(
     pool: PgPool,
 ) {
     tokio::spawn(async move {
+        let decision = match policy
+            .decide_and_record(&pool, server_id, &server_type, config.as_ref(), use_gpu)
+            .await
+        {
+            Ok(decision) => decision,
+            Err(err) => {
+                tracing::error!(
+                    ?err,
+                    %server_id,
+                    "failed to evaluate runtime policy for docker spawn",
+                );
+                set_status_with_context(&pool, server_id, "error", "runtime policy evaluation")
+                    .await;
+                return;
+            }
+        };
+
+        if !matches!(decision.backend, RuntimeBackend::Docker) {
+            tracing::warn!(
+                %server_id,
+                backend = %decision.backend.as_str(),
+                "runtime policy selected a backend different from docker runtime",
+            );
+        }
+
         let cfg_clone = config.clone();
         let branch = cfg_clone
             .as_ref()
@@ -73,27 +101,29 @@ pub fn spawn_server_task(
             )
             .await;
 
-        let mut image = match server_type.as_str() {
-            "PostgreSQL" => "ghcr.io/anycontext/postgres-mcp:latest".to_string(),
-            "Slack" => "ghcr.io/anycontext/slack-mcp:latest".to_string(),
-            "PDF Parser" => "ghcr.io/anycontext/pdf-mcp:latest".to_string(),
-            "Notion" => "ghcr.io/anycontext/notion-mcp:latest".to_string(),
-            "Router" => "ghcr.io/anycontext/router-mcp:latest".to_string(),
-            "Custom" => config
-                .as_ref()
-                .and_then(|v| v.get("image"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("ghcr.io/anycontext/default-mcp:latest")
-                .to_string(),
-            _ => "ghcr.io/anycontext/default-mcp:latest".to_string(),
-        };
+        let mut image = decision.image.clone();
 
         // Build from git repo if provided
-        if let Some(repo) = cfg_clone
-            .as_ref()
-            .and_then(|v| v.get("repo_url"))
-            .and_then(|v| v.as_str())
-        {
+        if decision.requires_build {
+            let repo = cfg_clone
+                .as_ref()
+                .and_then(|v| v.get("repo_url"))
+                .and_then(|v| v.as_str());
+            if repo.is_none() {
+                tracing::error!(
+                    %server_id,
+                    "policy requested git build but repo_url is missing",
+                );
+                set_status_with_context(
+                    &pool,
+                    server_id,
+                    "error",
+                    "runtime policy build precondition",
+                )
+                .await;
+                return;
+            }
+            let repo = repo.unwrap();
             set_status_with_context(&pool, server_id, "cloning", "preparing git build").await;
             match build::build_from_git(&pool, server_id, repo, branch).await {
                 Ok(Some(artifacts)) => {
@@ -288,6 +318,7 @@ pub fn spawn_server_task(
                     }
                     tracing::info!("server {server_id} started");
                     monitor_server_task(
+                        policy.clone(),
                         server_id,
                         server_type.clone(),
                         config.clone(),
@@ -541,6 +572,7 @@ pub fn stream_logs_task(server_id: i32, pool: PgPool) -> Option<Receiver<String>
 
 /// Monitor a running container and restart it if it exits unexpectedly.
 pub fn monitor_server_task(
+    policy: Arc<RuntimePolicyEngine>,
     server_id: i32,
     server_type: String,
     config: Option<Value>,
@@ -573,6 +605,7 @@ pub fn monitor_server_task(
                 set_status_with_context(&pool, server_id, "restarting", "container restart").await;
                 let _ = add_metric(&pool, server_id, "restart", None).await;
                 spawn_server_task(
+                    policy.clone(),
                     server_id,
                     server_type.clone(),
                     config.clone(),

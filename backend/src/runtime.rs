@@ -3,7 +3,10 @@ use base64::engine::general_purpose::STANDARD as Base64Engine;
 use base64::Engine;
 use chrono::Utc;
 use sqlx::PgPool;
+use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
+
+use crate::policy::{RuntimeBackend, RuntimePolicyEngine};
 
 #[async_trait]
 pub trait ContainerRuntime: Send + Sync {
@@ -26,7 +29,15 @@ pub trait ContainerRuntime: Send + Sync {
     fn stream_logs_task(&self, server_id: i32, pool: PgPool) -> Option<Receiver<String>>;
 }
 
-pub struct DockerRuntime;
+pub struct DockerRuntime {
+    policy: Arc<RuntimePolicyEngine>,
+}
+
+impl DockerRuntime {
+    pub fn new(policy: Arc<RuntimePolicyEngine>) -> Self {
+        Self { policy }
+    }
+}
 
 #[async_trait]
 impl ContainerRuntime for DockerRuntime {
@@ -39,7 +50,15 @@ impl ContainerRuntime for DockerRuntime {
         use_gpu: bool,
         pool: PgPool,
     ) {
-        crate::docker::spawn_server_task(server_id, server_type, config, api_key, use_gpu, pool);
+        crate::docker::spawn_server_task(
+            self.policy.clone(),
+            server_id,
+            server_type,
+            config,
+            api_key,
+            use_gpu,
+            pool,
+        );
     }
 
     fn stop_server_task(&self, server_id: i32, pool: PgPool) {
@@ -61,12 +80,13 @@ impl ContainerRuntime for DockerRuntime {
 
 pub struct KubernetesRuntime {
     client: kube::Client,
+    policy: Arc<RuntimePolicyEngine>,
 }
 
 impl KubernetesRuntime {
-    pub async fn new() -> Result<Self, kube::Error> {
+    pub async fn new(policy: Arc<RuntimePolicyEngine>) -> Result<Self, kube::Error> {
         let client = kube::Client::try_default().await?;
-        Ok(Self { client })
+        Ok(Self { client, policy })
     }
 }
 
@@ -90,31 +110,63 @@ impl ContainerRuntime for KubernetesRuntime {
 
         let client = self.client.clone();
         let namespace = crate::config::K8S_NAMESPACE.clone();
+        let policy = self.policy.clone();
         tokio::spawn(async move {
+            let decision = match policy
+                .decide_and_record(&pool, server_id, &server_type, config.as_ref(), use_gpu)
+                .await
+            {
+                Ok(decision) => decision,
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        %server_id,
+                        "failed to evaluate runtime policy for kubernetes spawn",
+                    );
+                    if let Err(set_err) =
+                        crate::servers::set_status(&pool, server_id, "error").await
+                    {
+                        tracing::error!(?set_err, %server_id, "failed to set status after policy failure");
+                    }
+                    return;
+                }
+            };
+
+            if !matches!(decision.backend, RuntimeBackend::Kubernetes) {
+                tracing::warn!(
+                    %server_id,
+                    backend = %decision.backend.as_str(),
+                    "runtime policy selected a backend different from kubernetes runtime",
+                );
+            }
+
             let cfg_clone = config.clone();
             let branch = cfg_clone
                 .as_ref()
                 .and_then(|v| v.get("branch"))
                 .and_then(|v| v.as_str());
 
-            let mut image = match server_type.as_str() {
-                "PostgreSQL" => "ghcr.io/anycontext/postgres-mcp:latest".to_string(),
-                "Slack" => "ghcr.io/anycontext/slack-mcp:latest".to_string(),
-                "Custom" => config
-                    .as_ref()
-                    .and_then(|v| v.get("image"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("ghcr.io/anycontext/default-mcp:latest")
-                    .to_string(),
-                _ => "ghcr.io/anycontext/default-mcp:latest".to_string(),
-            };
+            let mut image = decision.image.clone();
 
             // Build from git repo if provided
-            if let Some(repo) = cfg_clone
-                .as_ref()
-                .and_then(|v| v.get("repo_url"))
-                .and_then(|v| v.as_str())
-            {
+            if decision.requires_build {
+                let repo = cfg_clone
+                    .as_ref()
+                    .and_then(|v| v.get("repo_url"))
+                    .and_then(|v| v.as_str());
+                if repo.is_none() {
+                    tracing::error!(
+                        %server_id,
+                        "policy requested git build but repo_url is missing for kubernetes runtime",
+                    );
+                    if let Err(set_err) =
+                        crate::servers::set_status(&pool, server_id, "error").await
+                    {
+                        tracing::error!(?set_err, %server_id, "failed to set status after missing repo");
+                    }
+                    return;
+                }
+                let repo = repo.unwrap();
                 if let Err(err) = crate::servers::set_status(&pool, server_id, "cloning").await {
                     tracing::error!(?err, %server_id, "failed to set status to cloning");
                 }

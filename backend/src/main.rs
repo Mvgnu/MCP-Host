@@ -18,6 +18,7 @@ mod invocations;
 mod job_queue;
 mod marketplace;
 mod organizations;
+mod policy;
 mod proxy;
 mod routes;
 mod secrets;
@@ -28,7 +29,8 @@ mod workflows;
 
 use axum::{routing::get, Extension, Router};
 use axum_prometheus::PrometheusMetricLayer;
-use job_queue::{start_worker, Job};
+use job_queue::start_worker;
+use policy::{RuntimeBackend, RuntimePolicyEngine};
 use runtime::{ContainerRuntime, DockerRuntime, KubernetesRuntime};
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
@@ -68,15 +70,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let runtime: Arc<dyn ContainerRuntime> = match config::CONTAINER_RUNTIME.as_str() {
-        "kubernetes" => match KubernetesRuntime::new().await {
+    let configured_backend = config::CONTAINER_RUNTIME.as_str();
+    let mut policy_engine = Arc::new(RuntimePolicyEngine::new(match configured_backend {
+        "kubernetes" => RuntimeBackend::Kubernetes,
+        _ => RuntimeBackend::Docker,
+    }));
+
+    let runtime: Arc<dyn ContainerRuntime> = match configured_backend {
+        "kubernetes" => match KubernetesRuntime::new(policy_engine.clone()).await {
             Ok(rt) => Arc::new(rt),
             Err(e) => {
                 tracing::warn!(%e, "failed to init Kubernetes runtime; using docker");
-                Arc::new(DockerRuntime)
+                policy_engine = Arc::new(RuntimePolicyEngine::new(RuntimeBackend::Docker));
+                Arc::new(DockerRuntime::new(policy_engine.clone()))
             }
         },
-        _ => Arc::new(DockerRuntime),
+        _ => Arc::new(DockerRuntime::new(policy_engine.clone())),
     };
     let job_tx = start_worker(pool.clone(), runtime.clone());
     ingestion::start_ingestion_worker(pool.clone());
@@ -91,7 +100,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(prometheus_layer)
         .layer(Extension(pool.clone()))
         .layer(Extension(job_tx.clone()))
-        .layer(Extension(runtime.clone()));
+        .layer(Extension(runtime.clone()))
+        .layer(Extension(policy_engine.clone()));
 
     let addr: SocketAddr = format!("{}:{}", config::BIND_ADDRESS.as_str(), *config::BIND_PORT)
         .parse()
