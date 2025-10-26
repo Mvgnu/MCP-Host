@@ -16,6 +16,9 @@ The backend exposes several environment variables to control startup behavior:
 | `REGISTRY_AUTH_MAX_AGE_SECONDS` | Maximum age (in seconds) allowed for the `dockerconfigjson` before the health probe reports credentials as expired and recommends rotation. | `86400` |
 | `REGISTRY_AUTH_ROTATE_LEAD_SECONDS` | Lead time (in seconds) before the configured max age elapses to trigger proactive credential rotation attempts. | `3600` |
 | `REGISTRY_ARCH_TARGETS` | Comma-separated list of target platforms to build and publish (e.g., `linux/amd64,linux/arm64`). | `linux/amd64` |
+| `REGISTRY_BUILD_PARALLELISM` | Maximum number of per-architecture builds to execute concurrently. Defaults to the host CPU parallelism capped at the number of targets. | _auto_ |
+| `REGISTRY_BUILD_DISABLE_CACHE` | When set to a truthy value, disables Docker layer cache reuse during builds. | `false` |
+| `REGISTRY_BUILD_CACHE_FROM` | Comma-separated list of cache image references passed to Docker BuildKit via `cache-from` to seed layer reuse. | _unset_ |
 
 Set these variables in your deployment environment (or a local `.env` file) to adjust how the API service starts.
 
@@ -44,7 +47,9 @@ The build service tags and pushes images using the Docker remote API via Bollard
 
 The build service orchestrates per-architecture builds using Docker BuildKit and then publishes a manifest list that references each platform-specific image. Configure `REGISTRY_ARCH_TARGETS` to enumerate the platforms to build (for example, `linux/amd64,linux/arm64`). Ensure the host has the necessary emulation shims (e.g., QEMU binfmt) to build non-native architectures and that Docker Buildx is configured for the target platforms.
 
-Manifest publishing requires registry credentials in the configured `dockerconfigjson`. The helper automatically derives the appropriate authorization header and pushes the manifest via the registry HTTP API, emitting a `manifest_published` metric with the participating architectures and resulting digest.
+Build throughput now scales with platform count: `REGISTRY_BUILD_PARALLELISM` (defaulting to the available CPU concurrency) controls how many Docker builds execute at once, and `REGISTRY_BUILD_CACHE_FROM`/`REGISTRY_BUILD_DISABLE_CACHE` provide explicit cache reuse controls. Cached layers speed up iterative builds across architectures, while disabling the cache forces clean rebuilds when debugging.
+
+Manifest publishing requires registry credentials in the configured `dockerconfigjson`. The helper automatically derives the appropriate authorization header and pushes the manifest via the registry HTTP API, emitting a `manifest_published` metric with the participating architectures and resulting digest. After a successful publish, the service prunes manifests for architectures no longer produced, emitting `manifest_prune_started`/`manifest_prune_succeeded`/`manifest_prune_failed` metrics so operators can verify registry hygiene.
 
 ### Telemetry consumer audit
 
