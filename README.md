@@ -61,6 +61,26 @@ Build metadata is now persisted in Postgres so other subsystems (marketplace, ru
 
 Each referenced platform is normalized into `build_artifact_platforms` with the pushed image reference, digest, and per-platform credential/refresh booleans. These rows power queries for architecture coverage, digest-to-run lookups, and future marketplace automation that needs to correlate registry entries back to build outcomes. The persistence layer lives in `backend/src/artifacts.rs` and is guarded by a machine-readable comment so downstream tooling can discover the schema contract automatically.
 
+### Marketplace catalog API
+
+Operators can now query `/api/marketplace` to browse the persisted artifact ledger. The backend hydrates responses directly from `build_artifact_runs`/`build_artifact_platforms`, joining server metadata so every entry advertises:
+
+* Build provenance (source repo/branch/revision), manifest tag/digest, and the registry image reference that was published.
+* Architecture coverage plus per-platform credential health so policy engines can gate promotions on multi-arch readiness.
+* Derived health tiers (e.g., `gold:Router`, `watchlist:Slack`) computed from build status and credential posture, enabling tier-based filters in the UI or CLI.
+
+Supported query parameters:
+
+| Parameter | Description |
+| --- | --- |
+| `server_type` | Filter by server type (e.g., `Router`, `PostgreSQL`). |
+| `status` | Filter by build run status (`succeeded`, `failed`, etc.). |
+| `tier` | Filter by derived tier string. Tiers are case-insensitive. |
+| `q` | Performs a fuzzy `ILIKE` search across server name, manifest tag/digest, and image references. |
+| `limit` | Caps the number of returned rows (defaults to `50`, maximum `200`). |
+
+The response schema is described in `backend/src/marketplace.rs` (guarded by a `key: marketplace-catalog` comment for downstream automation). Each artifact also includes a `health` block listing any issues so lifecycle tooling can stage promotions or credential rotations with awareness of current risk.
+
 ### Telemetry consumer audit
 
 The enriched registry telemetry is ingested by several non-UI paths:

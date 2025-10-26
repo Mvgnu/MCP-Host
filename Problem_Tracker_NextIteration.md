@@ -82,3 +82,11 @@
   Log:
     - 2025-10-26 08:45:00 UTC: Added schema migration for build_artifact_runs/platforms and persistence helper module.
     - 2025-10-26 09:15:00 UTC: Wired build_from_git to capture git revision, manifest digests, and credential outcomes before writing run/platform rows; updated README with persistence contract.
+
+- ID: BE-MKT-001
+  Status: DONE
+  Task: Convert persisted artifact runs into a live marketplace catalog API.
+  Hypothesis: Querying build_artifact_runs/platforms with server metadata and health heuristics will let operators browse real inventory instead of static seed data while preserving tier filters.
+  Log:
+    - 2025-11-03 09:00:00 UTC: Initiated API design; audited marketplace.rs static implementation and artifact persistence schema to scope query/aggregation requirements.
+    - 2025-11-03 11:35:00 UTC: Replaced static marketplace entries with Postgres-backed query, added tier/health derivations, documented the API contract, and verified with cargo test.
