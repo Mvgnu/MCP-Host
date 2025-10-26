@@ -11,19 +11,22 @@ use bollard::query_parameters::{PushImageOptionsBuilder, TagImageOptionsBuilder}
 use bollard::Docker;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use futures_util::StreamExt;
+use futures_util::{stream, StreamExt, TryStreamExt};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::StatusCode;
 use serde_json::json;
 use serde_json::Value;
 use sqlx::PgPool;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs as stdfs;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use tar::Builder as TarBuilder;
 use tempfile::tempdir;
 use thiserror::Error;
@@ -88,6 +91,92 @@ enum ManifestPublishError {
     Http(String),
     #[error("registry rejected manifest publish: {0}")]
     Remote(String),
+}
+
+#[derive(Clone)]
+struct BuildCacheConfig {
+    disable_cache: bool,
+    cache_from: Vec<String>,
+}
+
+impl BuildCacheConfig {
+    // key: build-cache-config -> REGISTRY_BUILD_DISABLE_CACHE,REGISTRY_BUILD_CACHE_FROM
+    fn from_env() -> Self {
+        let disable_cache = std::env::var("REGISTRY_BUILD_DISABLE_CACHE")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        let cache_from = std::env::var("REGISTRY_BUILD_CACHE_FROM")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter_map(|entry| {
+                        let trimmed = entry.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(Vec::new);
+        Self {
+            disable_cache,
+            cache_from,
+        }
+    }
+
+    fn nocache(&self) -> bool {
+        self.disable_cache
+    }
+
+    fn cache_sources(&self) -> Option<Vec<String>> {
+        if self.cache_from.is_empty() {
+            None
+        } else {
+            Some(self.cache_from.clone())
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExistingManifestEntry {
+    digest: String,
+    platform_spec: Option<String>,
+}
+
+impl ExistingManifestEntry {
+    fn slug(&self) -> Option<String> {
+        self.platform_spec.as_ref().map(|spec| {
+            spec.chars()
+                .map(|c| match c {
+                    '/' | ':' | '\\' => '_',
+                    other => other,
+                })
+                .collect::<String>()
+        })
+    }
+}
+
+struct PlatformBuildRecord {
+    target: PlatformTarget,
+    local_tag: String,
+    push_result: Option<RegistryPushResult>,
+}
+
+struct PlatformBuildFailure {
+    message: String,
+}
+
+impl PlatformBuildFailure {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +255,23 @@ fn desired_platform_targets() -> Vec<PlatformTarget> {
             }
         })
         .collect()
+}
+
+fn registry_build_parallelism() -> Option<usize> {
+    std::env::var("REGISTRY_BUILD_PARALLELISM")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn compute_build_parallelism(target_count: usize) -> usize {
+    // key: build-parallelism-control -> REGISTRY_BUILD_PARALLELISM
+    let desired = target_count.max(1);
+    let fallback = thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(desired);
+    let limit = registry_build_parallelism().unwrap_or(fallback).max(1);
+    limit.min(desired)
 }
 
 fn load_registry_auth_header(registry_host: &str) -> Option<String> {
@@ -379,6 +485,266 @@ async fn publish_manifest_list<L: BuildLogSink + ?Sized, M: MetricRecorder + ?Si
         .await;
 
     Ok(digest)
+}
+
+async fn fetch_existing_manifest_entries(
+    registry: &str,
+    image_tag: &str,
+    manifest_tag: &str,
+) -> Result<Vec<ExistingManifestEntry>, ManifestPublishError> {
+    let location = registry_location(registry, image_tag)?;
+    let auth = load_registry_auth_header(&location.auth_host)
+        .ok_or_else(|| ManifestPublishError::MissingCredentials(location.host.clone()))?;
+
+    let mut manifest_url = location.base.clone();
+    manifest_url.set_path(&format!(
+        "/v2/{}/manifests/{}",
+        location.repository, manifest_tag
+    ));
+
+    let response = MANIFEST_HTTP_CLIENT
+        .get(manifest_url.clone())
+        .header(AUTHORIZATION, auth)
+        .header(
+            ACCEPT,
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+        )
+        .send()
+        .await
+        .map_err(|err| ManifestPublishError::Http(err.to_string()))?;
+
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        return Ok(Vec::new());
+    }
+
+    let body = response
+        .text()
+        .await
+        .map_err(|err| ManifestPublishError::Http(err.to_string()))?;
+
+    if !status.is_success() {
+        tracing::warn!(
+            target: "registry.push",
+            repository = %location.repository,
+            %manifest_tag,
+            status = %status,
+            body = %body,
+            "existing manifest fetch failed",
+        );
+        return Err(ManifestPublishError::Remote(format!("{status}: {body}")));
+    }
+
+    let json: Value =
+        serde_json::from_str(&body).map_err(|err| ManifestPublishError::Http(err.to_string()))?;
+    let manifests = json
+        .get("manifests")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut entries = Vec::new();
+    for manifest in manifests {
+        let digest = manifest
+            .get("digest")
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if let Some(digest) = digest {
+            let platform_spec = manifest
+                .get("platform")
+                .and_then(|value| value.as_object())
+                .and_then(|platform| {
+                    let os = platform
+                        .get("os")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let arch = platform
+                        .get("architecture")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    match (os, arch) {
+                        (Some(os), Some(arch)) => {
+                            let variant = platform
+                                .get("variant")
+                                .and_then(|value| value.as_str())
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty());
+                            if let Some(variant) = variant {
+                                Some(format!("{os}/{arch}/{variant}"))
+                            } else {
+                                Some(format!("{os}/{arch}"))
+                            }
+                        }
+                        _ => None,
+                    }
+                });
+            entries.push(ExistingManifestEntry {
+                digest,
+                platform_spec,
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+async fn prune_stale_manifest_entries<L: BuildLogSink + ?Sized, M: MetricRecorder + ?Sized>(
+    logger: &L,
+    metrics: &M,
+    server_id: i32,
+    registry: &str,
+    image_tag: &str,
+    manifest_tag: &str,
+    previous_entries: &[ExistingManifestEntry],
+    new_digests: &HashSet<String>,
+) -> Result<(), ManifestPublishError> {
+    if previous_entries.is_empty() {
+        return Ok(());
+    }
+
+    let location = registry_location(registry, image_tag)?;
+    let auth = load_registry_auth_header(&location.auth_host)
+        .ok_or_else(|| ManifestPublishError::MissingCredentials(location.host.clone()))?;
+
+    let mut deleted_any = false;
+    for entry in previous_entries {
+        if new_digests.contains(&entry.digest) {
+            continue;
+        }
+
+        let slug = entry.slug();
+        let mut delete_url = location.base.clone();
+        delete_url.set_path(&format!(
+            "/v2/{}/manifests/{}",
+            location.repository, entry.digest
+        ));
+
+        metrics
+            .record(
+                "manifest_prune_started",
+                Some(json!({
+                    "registry_endpoint": format!(
+                        "{}/{}",
+                        registry.trim_end_matches('/'),
+                        image_tag
+                    ),
+                    "manifest_tag": manifest_tag,
+                    "digest": entry.digest,
+                    "platform": entry.platform_spec,
+                })),
+            )
+            .await;
+
+        let response = MANIFEST_HTTP_CLIENT
+            .delete(delete_url.clone())
+            .header(AUTHORIZATION, auth.clone())
+            .send()
+            .await
+            .map_err(|err| ManifestPublishError::Http(err.to_string()))?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unavailable>".to_string());
+
+        if status.is_success() || status == StatusCode::NOT_FOUND {
+            deleted_any = true;
+            metrics
+                .record(
+                    "manifest_prune_succeeded",
+                    Some(json!({
+                        "registry_endpoint": format!(
+                            "{}/{}",
+                            registry.trim_end_matches('/'),
+                            image_tag
+                        ),
+                        "manifest_tag": manifest_tag,
+                        "digest": entry.digest,
+                        "platform": entry.platform_spec,
+                        "status": status.as_u16(),
+                    })),
+                )
+                .await;
+            if let Some(slug) = slug {
+                insert_log(
+                    logger,
+                    server_id,
+                    &format!(
+                        "Pruned stale manifest digest {} for platform {}",
+                        entry.digest, slug
+                    ),
+                )
+                .await;
+            } else {
+                insert_log(
+                    logger,
+                    server_id,
+                    &format!("Pruned stale manifest digest {}", entry.digest),
+                )
+                .await;
+            }
+            tracing::info!(
+                target: "registry.push",
+                repository = %location.repository,
+                digest = %entry.digest,
+                platform = ?entry.platform_spec,
+                status = %status,
+                "pruned stale manifest entry",
+            );
+        } else {
+            metrics
+                .record(
+                    "manifest_prune_failed",
+                    Some(json!({
+                        "registry_endpoint": format!(
+                            "{}/{}",
+                            registry.trim_end_matches('/'),
+                            image_tag
+                        ),
+                        "manifest_tag": manifest_tag,
+                        "digest": entry.digest,
+                        "platform": entry.platform_spec,
+                        "status": status.as_u16(),
+                        "body": body,
+                    })),
+                )
+                .await;
+            insert_log(
+                logger,
+                server_id,
+                &format!(
+                    "Failed to prune stale manifest digest {}: {status} {body}",
+                    entry.digest
+                ),
+            )
+            .await;
+            tracing::error!(
+                target: "registry.push",
+                repository = %location.repository,
+                digest = %entry.digest,
+                platform = ?entry.platform_spec,
+                status = %status,
+                body = %body,
+                "manifest prune failed",
+            );
+            return Err(ManifestPublishError::Remote(format!("{status}: {body}")));
+        }
+    }
+
+    if deleted_any {
+        insert_log(
+            logger,
+            server_id,
+            "Completed manifest prune for removed architectures",
+        )
+        .await;
+    }
+
+    Ok(())
 }
 
 const DEFAULT_REGISTRY_PUSH_RETRIES: usize = 3;
@@ -1744,112 +2110,210 @@ pub async fn build_from_git(
         }
     };
 
-    let mut platform_pushes: Vec<(PlatformTarget, RegistryPushResult)> = Vec::new();
-    let mut local_alias_created = false;
+    let cache_config = BuildCacheConfig::from_env();
+    let tar_data = Arc::new(tar_data);
+    let target_order: HashMap<String, usize> = platform_targets
+        .iter()
+        .enumerate()
+        .map(|(idx, target)| (target.spec.clone(), idx))
+        .collect();
+    let target_count = platform_targets.len();
+    let parallelism = compute_build_parallelism(target_count);
+    let multi_arch = target_count > 1;
 
-    for target in &platform_targets {
-        let local_tag = format!("{base_name}-{}", target.slug);
-        let build_options = BuildImageOptions::<String> {
-            dockerfile: "Dockerfile".into(),
-            t: local_tag.clone(),
-            pull: true,
-            nocache: true,
-            rm: true,
-            forcerm: true,
-            platform: target.spec.clone(),
-            ..Default::default()
-        };
+    let build_records: Vec<PlatformBuildRecord> = match stream::iter(
+        platform_targets.iter().cloned().map(|target| {
+            let docker = docker.clone();
+            let tar_data = Arc::clone(&tar_data);
+            let cache_config = cache_config.clone();
+            let registry_env = registry_env.clone();
+            let base_name = base_name.clone();
+            let manifest_tag = manifest_tag.to_string();
+            let pool_ref = pool;
+            async move {
+                let local_tag = format!("{base_name}-{}", target.slug);
+                let mut build_options = BuildImageOptions::<String> {
+                    dockerfile: "Dockerfile".into(),
+                    t: local_tag.clone(),
+                    pull: true,
+                    nocache: cache_config.nocache(),
+                    rm: true,
+                    forcerm: true,
+                    platform: target.spec.clone(),
+                    ..Default::default()
+                };
+                if let Some(cache_from) = cache_config.cache_sources() {
+                    build_options.cachefrom = cache_from;
+                }
 
-        let mut build_stream =
-            docker.build_image(build_options, None, Some(body_full(tar_data.clone())));
-        while let Some(item) = build_stream.next().await {
-            match item {
-                Ok(output) => {
-                    if let Some(msg) = output.stream {
-                        insert_log(pool, server_id, msg.trim()).await;
+                let mut build_stream = docker.build_image(
+                    build_options,
+                    None,
+                    Some(body_full(tar_data.as_ref().clone())),
+                );
+                while let Some(item) = build_stream.next().await {
+                    match item {
+                        Ok(output) => {
+                            if let Some(msg) = output.stream {
+                                insert_log(pool_ref, server_id, msg.trim()).await;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!(?err, platform = %target.spec, "docker build error");
+                            let message = format!("Image build failed for {}: {err}", target.spec);
+                            insert_log(pool_ref, server_id, &message).await;
+                            return Err(PlatformBuildFailure::new(message));
+                        }
                     }
                 }
-                Err(e) => {
-                    tracing::error!(?e, platform = %target.spec, "docker build error");
-                    insert_log(pool, server_id, "Image build failed").await;
-                    set_status_or_log(pool, server_id, "error").await?;
-                    return Ok(None);
-                }
-            }
-        }
 
-        if !local_alias_created {
-            let alias_opts = TagImageOptionsBuilder::new()
-                .repo(&base_name)
-                .tag("latest")
-                .build();
-            if let Err(err) = docker.tag_image(&local_tag, Some(alias_opts)).await {
-                tracing::error!(?err, %server_id, platform = %target.spec, "failed to tag local image alias");
-                insert_log(pool, server_id, "Failed to tag local image").await;
-                set_status_or_log(pool, server_id, "error").await?;
-                return Ok(None);
-            }
-            local_alias_created = true;
-        }
+                let push_result = if let Some(registry) = registry_env.as_ref() {
+                    let remote_tag = if multi_arch {
+                        format!("{manifest_tag}-{}", target.slug)
+                    } else {
+                        manifest_tag.clone()
+                    };
+                    match push_image_to_registry(
+                        pool_ref,
+                        pool_ref,
+                        &docker,
+                        server_id,
+                        &local_tag,
+                        registry,
+                        &base_name,
+                        &remote_tag,
+                        &target.spec,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(result) => Some(result),
+                        Err(err) => {
+                            tracing::error!(
+                                ?err,
+                                registry = %registry,
+                                platform = %target.spec,
+                                %server_id,
+                                "registry push failed"
+                            );
+                            let message =
+                                format!("Registry push failed for {}: {err}", target.spec);
+                            insert_log(pool_ref, server_id, &message).await;
+                            return Err(PlatformBuildFailure::new(message));
+                        }
+                    }
+                } else {
+                    None
+                };
 
-        if let Some(registry) = registry_env.as_ref() {
-            let remote_tag = if platform_targets.len() > 1 {
-                format!("{manifest_tag}-{}", target.slug)
-            } else {
-                manifest_tag.to_string()
-            };
-            match push_image_to_registry(
-                pool,
-                pool,
-                &docker,
-                server_id,
-                &local_tag,
-                registry,
-                &base_name,
-                &remote_tag,
-                &target.spec,
-                None,
-            )
+                Ok(PlatformBuildRecord {
+                    target,
+                    local_tag,
+                    push_result,
+                })
+            }
+        }),
+    )
+    .buffer_unordered(parallelism)
+    .try_collect()
+    .await
+    {
+        Ok(records) => records,
+        Err(err) => {
+            tracing::error!(error = %err.message, %server_id, "multi-arch build orchestration failed");
+            set_status_or_log(pool, server_id, "error").await?;
+            return Ok(None);
+        }
+    };
+
+    let mut build_records = build_records;
+    build_records.sort_by_key(|record| {
+        target_order
+            .get(&record.target.spec)
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+
+    if let Some(alias_source) = platform_targets
+        .first()
+        .and_then(|expected| {
+            build_records
+                .iter()
+                .find(|record| record.target.spec == expected.spec)
+        })
+        .or_else(|| build_records.first())
+    {
+        let alias_opts = TagImageOptionsBuilder::new()
+            .repo(&base_name)
+            .tag("latest")
+            .build();
+        if let Err(err) = docker
+            .tag_image(&alias_source.local_tag, Some(alias_opts))
             .await
-            {
-                Ok(result) => {
-                    auth_refresh_attempted |= result.auth_refresh_attempted;
-                    auth_refresh_succeeded |= result.auth_refresh_succeeded;
-                    auth_rotation_attempted |= result.auth_rotation_attempted;
-                    auth_rotation_succeeded |= result.auth_rotation_succeeded;
-                    credential_health_status =
-                        credential_health_status.combine(result.credential_health_status);
-                    platform_pushes.push((target.clone(), result));
-                }
-                Err(err) => {
-                    tracing::error!(
-                        ?err,
-                        registry = %registry,
-                        platform = %target.spec,
-                        %server_id,
-                        "registry push failed"
-                    );
-                    insert_log(pool, server_id, &format!("Registry push failed: {err}")).await;
-                    set_status_or_log(pool, server_id, "error").await?;
-                    return Ok(None);
-                }
+        {
+            tracing::error!(
+                ?err,
+                %server_id,
+                platform = %alias_source.target.spec,
+                "failed to tag local image alias"
+            );
+            insert_log(pool, server_id, "Failed to tag local image").await;
+            set_status_or_log(pool, server_id, "error").await?;
+            return Ok(None);
+        }
+    }
+
+    let mut platform_pushes: Vec<(PlatformTarget, RegistryPushResult)> = Vec::new();
+    for record in build_records.into_iter() {
+        if let Some(result) = record.push_result {
+            auth_refresh_attempted |= result.auth_refresh_attempted;
+            auth_refresh_succeeded |= result.auth_refresh_succeeded;
+            auth_rotation_attempted |= result.auth_rotation_attempted;
+            auth_rotation_succeeded |= result.auth_rotation_succeeded;
+            credential_health_status =
+                credential_health_status.combine(result.credential_health_status);
+            if registry_image.is_none() {
+                registry_image = Some(result.image.clone());
             }
+            platform_pushes.push((record.target, result));
         }
     }
 
     if let Some(registry) = registry_env.as_ref() {
         if platform_pushes.len() > 1 {
+            let previous_entries =
+                match fetch_existing_manifest_entries(registry, &base_name, manifest_tag).await {
+                    Ok(entries) => entries,
+                    Err(err) => {
+                        tracing::error!(
+                            ?err,
+                            registry = %registry,
+                            %server_id,
+                            "manifest inspection failed"
+                        );
+                        insert_log(pool, server_id, &format!("Manifest inspect failed: {err}"))
+                            .await;
+                        set_status_or_log(pool, server_id, "error").await?;
+                        return Ok(None);
+                    }
+                };
+
             let mut manifest_inputs = Vec::new();
             for (target, result) in &platform_pushes {
                 if let Some(digest) = result.digest.clone() {
                     manifest_inputs.push((target.clone(), digest));
                 } else {
-                    tracing::error!(platform = %target.spec, %server_id, "missing digest for manifest publish");
+                    tracing::error!(
+                        platform = %target.spec,
+                        %server_id,
+                        "missing digest for manifest publish"
+                    );
                     insert_log(pool, server_id, "Missing digest for manifest publish").await;
                     set_status_or_log(pool, server_id, "error").await?;
                     return Ok(None);
                 }
             }
+
             let manifest_metrics = UsageMetricRecorder { pool, server_id };
             if let Err(err) = publish_manifest_list(
                 pool,
@@ -1867,6 +2331,29 @@ pub async fn build_from_git(
                 set_status_or_log(pool, server_id, "error").await?;
                 return Ok(None);
             }
+
+            let digest_set: HashSet<String> = manifest_inputs
+                .iter()
+                .map(|(_, digest)| digest.clone())
+                .collect();
+            if let Err(err) = prune_stale_manifest_entries(
+                pool,
+                &manifest_metrics,
+                server_id,
+                registry,
+                &base_name,
+                manifest_tag,
+                &previous_entries,
+                &digest_set,
+            )
+            .await
+            {
+                tracing::error!(?err, registry = %registry, %server_id, "manifest prune failed");
+                insert_log(pool, server_id, &format!("Manifest prune failed: {err}")).await;
+                set_status_or_log(pool, server_id, "error").await?;
+                return Ok(None);
+            }
+
             registry_image = Some(format!(
                 "{}/{}:{}",
                 registry.trim_end_matches('/'),
@@ -1907,6 +2394,7 @@ mod tests {
     use bollard::models::PushImageInfo;
     use futures_util::stream;
     use httpmock::prelude::*;
+    use std::collections::HashSet;
     use tempfile::{tempdir, NamedTempFile};
     use tokio::sync::Mutex;
 
@@ -2536,6 +3024,134 @@ mod tests {
             Some("linux/amd64")
         );
     }
+
+    #[tokio::test]
+    async fn fetch_existing_manifest_entries_parses_platforms() {
+        let server = MockServer::start_async().await;
+        let registry = format!("http://{}/demo", server.address());
+        let auth_value = Base64Standard.encode("user:pass");
+        let config = NamedTempFile::new().expect("temp docker config");
+        std::fs::write(
+            config.path(),
+            format!(
+                r#"{{"auths": {{"http://{}": {{"auth": "{}"}}}}}}"#,
+                server.address(),
+                auth_value
+            ),
+        )
+        .expect("write docker config");
+        std::env::set_var("REGISTRY_AUTH_DOCKERCONFIG", config.path());
+
+        let manifest_path = "/v2/demo/example/manifests/latest";
+        let payload = json!({
+            "schemaVersion": 2,
+            "manifests": [
+                {
+                    "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                    "digest": "sha256:first",
+                    "platform": {"os": "linux", "architecture": "amd64"}
+                },
+                {
+                    "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                    "digest": "sha256:second",
+                    "platform": {
+                        "os": "linux",
+                        "architecture": "arm64",
+                        "variant": "v8"
+                    }
+                }
+            ]
+        });
+
+        let mock = server
+            .mock_async(|when, then| {
+                when.method("GET")
+                    .path(manifest_path)
+                    .header("authorization", format!("Basic {}", auth_value))
+                    .header(
+                        "accept",
+                        "application/vnd.docker.distribution.manifest.list.v2+json",
+                    );
+                then.status(200).json_body(payload.clone());
+            })
+            .await;
+
+        let entries = fetch_existing_manifest_entries(&registry, "example", "latest")
+            .await
+            .expect("fetch succeeds");
+
+        mock.assert_async().await;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].platform_spec.as_deref(), Some("linux/amd64"));
+        assert_eq!(entries[1].platform_spec.as_deref(), Some("linux/arm64/v8"));
+    }
+
+    #[tokio::test]
+    async fn prune_stale_manifest_entries_removes_old_digests() {
+        let server = MockServer::start_async().await;
+        let registry = format!("http://{}/demo", server.address());
+        let auth_value = Base64Standard.encode("user:pass");
+        let config = NamedTempFile::new().expect("temp docker config");
+        std::fs::write(
+            config.path(),
+            format!(
+                r#"{{"auths": {{"http://{}": {{"auth": "{}"}}}}}}"#,
+                server.address(),
+                auth_value
+            ),
+        )
+        .expect("write docker config");
+        std::env::set_var("REGISTRY_AUTH_DOCKERCONFIG", config.path());
+
+        let delete_path = "/v2/demo/example/manifests/sha256:remove";
+        let delete_mock = server
+            .mock_async(|when, then| {
+                when.method("DELETE")
+                    .path(delete_path)
+                    .header("authorization", format!("Basic {}", auth_value));
+                then.status(202);
+            })
+            .await;
+
+        let logger = RecordingLog::default();
+        let metrics = RecordingMetrics::default();
+        let previous_entries = vec![
+            ExistingManifestEntry {
+                digest: "sha256:keep".to_string(),
+                platform_spec: Some("linux/amd64".to_string()),
+            },
+            ExistingManifestEntry {
+                digest: "sha256:remove".to_string(),
+                platform_spec: Some("linux/arm64".to_string()),
+            },
+        ];
+        let new_digests = HashSet::from(["sha256:keep".to_string()]);
+
+        prune_stale_manifest_entries(
+            &logger,
+            &metrics,
+            9,
+            &registry,
+            "example",
+            "latest",
+            &previous_entries,
+            &new_digests,
+        )
+        .await
+        .expect("prune succeeds");
+
+        delete_mock.assert_async().await;
+        let logs = logger.messages().await;
+        assert!(logs
+            .iter()
+            .any(|entry| entry.contains("Pruned stale manifest digest sha256:remove")));
+
+        let events = metrics.events().await;
+        assert!(events
+            .iter()
+            .any(|(event, _)| event == "manifest_prune_succeeded"));
+    }
+
     #[tokio::test]
     async fn record_push_failure_respects_auth_flag() {
         let cases = vec![(true, "auth_expired"), (false, "remote")];
