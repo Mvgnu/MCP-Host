@@ -108,18 +108,21 @@
     - 2025-11-06 14:40:00 UTC: Landed `RuntimeOrchestrator` with executor registry, capability-aware selection, migration 0022, and passing `cargo test` to close out pluggable backend enforcement.
 
 - ID: BE-EVAL-002
-  Status: PENDING
+  Status: DONE
   Task: Bind evaluation runs to manifest digests and enforce policy gates before deployment.
   Hypothesis: Guaranteeing evaluations certify a specific digest/tier will let the policy engine require passing checks before a placement proceeds, preventing drift between tests and deployed artifacts.
   Log:
     - 2025-11-05 11:16:00 UTC: Added backlog item to extend evaluation schema and integrate with policy decision flow.
+    - 2025-11-07 14:35:00 UTC: Added `evaluation_certifications` schema, REST ingestion/retry endpoints, policy gating, and regression tests covering certification enforcement.
 
 - ID: BE-LIFE-001
-  Status: PENDING
+  Status: DONE
   Task: Implement lifecycle governance (promotion checkpoints, credential rotations, rollbacks) driven by policy decisions.
   Hypothesis: Using persisted policy outcomes and marketplace tiers to coordinate promotions and rotations will replace ad-hoc scripts with governed workflows.
   Log:
     - 2025-11-05 11:17:00 UTC: Logged follow-up to design operator flows once policy engine signals and audit trails are in place.
+    - 2025-11-08 10:45:00 UTC: Added governance workflows schema, runtime gating, REST/SSE routes, and README updates documenting promotion enforcement. `cargo test` passes locally.
+    - 2025-11-09 09:20:00 UTC: Wrapped workflow creation and run seeding in DB transactions to ensure atomic governance state initialization.
 
 - ID: BE-INTEL-001
   Status: PENDING

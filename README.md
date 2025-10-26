@@ -89,11 +89,35 @@ The response schema is described in `backend/src/marketplace.rs` (guarded by a `
 * The image reference that will be booted, reusing promoted registry artifacts when available and falling back to default catalog images when no ledger entry exists.
 * Whether a git build is required, any capability requirements (`gpu`, `image-build`, etc.), and evaluation gating derived from artifact health to enforce staging and certification flows.
 
+### Evaluation certifications & gating
+
+Evaluations are now bound to immutable artifacts via the `evaluation_certifications` table (migration `0023_create_evaluation_certifications.sql`). Each row ties a `build_artifact_run` and `manifest_digest` to a target `tier`, `policy_requirement`, certification `status` (`pending`, `pass`, or `fail`), optional evidence payload, and validity window (`valid_from`/`valid_until`). The API exposes new operator endpoints:
+
+* `GET /api/artifacts/:id/evaluations` lists certifications for a build run.
+* `POST /api/artifacts/:id/evaluations` upserts a certification record; when the payload omits a digest the backend falls back to the persisted run digest.
+* `POST /api/evaluations/:id/retry` resets a certification to `pending`, clearing the validity window so another evaluation can execute.
+
+`RuntimePolicyEngine::evaluate` now loads the latest certification per policy requirement for the selected tier and enforces gating: deployments proceed only when every requirement has an active `pass`. Missing, expired, pending, or failed certifications emit `evaluation:*` notes and flip `evaluation_required` to `true`, blocking launches until operators submit fresh evidence. Healthy, certified artifacts record `evaluation:certified:<tier>:<requirement>` notes for audit visibility. Regression coverage lives in the `policy::tests` module (`backend/src/policy.rs`) to ensure the policy engine refuses to launch uncertified digests.
+
 The runtime policy schema was expanded in migration `backend/migrations/0022_enhance_runtime_policy_decisions.sql` to persist executor metadata (`candidate_backend`, `capability_requirements`, `capabilities_satisfied`, `executor_name`) in addition to the existing manifest digest, artifact run ID, tier, and policy notes. This audit log powers lifecycle automation, rollback decisions, and credential rotations.
 
 Policy outcomes are now enforced through `backend/src/runtime.rs`, which introduces a `RuntimeOrchestrator`. The orchestrator registers pluggable executors (Docker, Kubernetes today, VM-friendly traits tomorrow) and dispatches launches/stop/delete/log operations based on the recorded policy decision. Each executor advertises capabilities through a `RuntimeExecutorDescriptor`, letting the policy engine satisfy GPU or build requirements before launch. Backend assignments are cached per server to streamline follow-up actions such as log streaming.
 
 The `RuntimePolicyEngine` continues to be exposed to the web API via an Axum `Extension`, enabling CLI or control-surface features to reuse the same policy vocabulary without duplicating logic.
+
+### Lifecycle governance workflows
+
+Promotion, rollback, and credential-rotation workflows now have a persistent home backed by migration `backend/migrations/0024_create_governance_workflows.sql`. Operators can define named governance workflows per tier, hydrate them with ordered steps, and initiate workflow runs that target a specific manifest digest or build artifact. The runtime policy engine consults these runs during placement: when no completed promotion exists for the requested tier/digest pair, the decision includes `governance:missing-promotion:*` notes and marks `governance_required = true`, causing the `RuntimeOrchestrator` to pause the launch and set the server status to `pending-governance`.
+
+The governance service lives in `backend/src/governance/` and exposes a typed engine (`GovernanceEngine`) plus REST/SSE routes:
+
+* `GET /api/governance/workflows` / `POST /api/governance/workflows` – list and create reusable workflow definitions.
+* `POST /api/governance/workflows/:id/runs` – start a run for an artifact/tier, automatically seeding step run rows.
+* `GET /api/governance/runs/:id` – fetch run status, including per-step state and audit log entries.
+* `POST /api/governance/runs/:id/status` – transition a run, append audit notes, and, on completion, enqueue a runtime redeploy for the associated policy decision.
+* `GET /api/governance/runs/:id/stream` – emit a single-event SSE snapshot of the run for lightweight operator dashboards.
+
+Route handlers publish updates to the existing job queue so completed promotion runs automatically retrigger deployments. The governance engine also links completed runs back to `runtime_policy_decisions`, ensuring audit trails capture which workflow certified a placement. Contract tags (`key: governance-workflows`, `key: governance-api`) guard the engine and HTTP module for downstream automation.
 
 ### Telemetry consumer audit
 
