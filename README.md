@@ -51,6 +51,16 @@ Build throughput now scales with platform count: `REGISTRY_BUILD_PARALLELISM` (d
 
 Manifest publishing requires registry credentials in the configured `dockerconfigjson`. The helper automatically derives the appropriate authorization header and pushes the manifest via the registry HTTP API, emitting a `manifest_published` metric with the participating architectures and resulting digest. After a successful publish, the service prunes manifests for architectures no longer produced, emitting `manifest_prune_started`/`manifest_prune_succeeded`/`manifest_prune_failed` metrics so operators can verify registry hygiene.
 
+## Artifact persistence
+
+Build metadata is now persisted in Postgres so other subsystems (marketplace, runtime policy, evaluations) can reason about concrete artifacts instead of ephemeral logs. Successful git-driven builds insert a record into `build_artifact_runs` capturing:
+
+* `server_id`, source repository/branch/revision, and the resolved `local_image`/`registry_image` pairing.
+* Timestamps for build start/completion, the manifest tag/digest (when available), and whether the run produced a multi-architecture manifest.
+* Credential lifecycle outcomes (`auth_refresh_*`, `auth_rotation_*`, `credential_health_status`) plus a stable `status` column (`succeeded` today, reserved for richer states later).
+
+Each referenced platform is normalized into `build_artifact_platforms` with the pushed image reference, digest, and per-platform credential/refresh booleans. These rows power queries for architecture coverage, digest-to-run lookups, and future marketplace automation that needs to correlate registry entries back to build outcomes. The persistence layer lives in `backend/src/artifacts.rs` and is guarded by a machine-readable comment so downstream tooling can discover the schema contract automatically.
+
 ### Telemetry consumer audit
 
 The enriched registry telemetry is ingested by several non-UI paths:

@@ -75,3 +75,10 @@
   Log:
     - 2025-11-02 09:15:00 UTC: Initiated task after reviewing `backend/src/build.rs` sequential build loop and identifying lack of manifest lifecycle controls.
     - 2025-11-02 10:05:00 UTC: Implemented parallel build orchestration with cache controls, manifest pruning helpers, and documentation/tests; cargo test passes.
+- ID: BE-ART-001
+  Status: DONE
+  Task: Persist build artifact metadata with per-platform records.
+  Hypothesis: Recording build runs and architecture digests in Postgres unlocks marketplace automation, policy placement, and evaluation binding by replacing ephemeral telemetry with queryable data.
+  Log:
+    - 2025-10-26 08:45:00 UTC: Added schema migration for build_artifact_runs/platforms and persistence helper module.
+    - 2025-10-26 09:15:00 UTC: Wired build_from_git to capture git revision, manifest digests, and credential outcomes before writing run/platform rows; updated README with persistence contract.
