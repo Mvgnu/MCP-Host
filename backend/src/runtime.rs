@@ -2,11 +2,17 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as Base64Engine;
 use base64::Engine;
 use chrono::Utc;
+use dashmap::DashMap;
 use sqlx::PgPool;
+use std::collections::HashMap;
+use std::io;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 
-use crate::policy::{RuntimeBackend, RuntimePolicyEngine};
+use crate::policy::{
+    PolicyDecision, RuntimeBackend, RuntimeCapability, RuntimeExecutorDescriptor,
+    RuntimePolicyEngine,
+};
 
 #[async_trait]
 pub trait ContainerRuntime: Send + Sync {
@@ -29,18 +35,80 @@ pub trait ContainerRuntime: Send + Sync {
     fn stream_logs_task(&self, server_id: i32, pool: PgPool) -> Option<Receiver<String>>;
 }
 
-pub struct DockerRuntime {
-    policy: Arc<RuntimePolicyEngine>,
+#[async_trait]
+pub trait RuntimeExecutor: Send + Sync {
+    fn backend(&self) -> RuntimeBackend;
+
+    fn spawn_server_task(
+        &self,
+        decision: PolicyDecision,
+        server_id: i32,
+        server_type: String,
+        config: Option<serde_json::Value>,
+        api_key: String,
+        use_gpu: bool,
+        pool: PgPool,
+    );
+
+    fn stop_server_task(&self, server_id: i32, pool: PgPool);
+
+    fn delete_server_task(&self, server_id: i32, pool: PgPool);
+
+    async fn fetch_logs(&self, server_id: i32) -> Result<String, bollard::errors::Error>;
+
+    fn stream_logs_task(&self, server_id: i32, pool: PgPool) -> Option<Receiver<String>>;
 }
 
-impl DockerRuntime {
-    pub fn new(policy: Arc<RuntimePolicyEngine>) -> Self {
-        Self { policy }
+pub struct RuntimeOrchestrator {
+    policy: Arc<RuntimePolicyEngine>,
+    executors: Arc<HashMap<RuntimeBackend, Arc<dyn RuntimeExecutor>>>,
+    assignments: Arc<DashMap<i32, RuntimeBackend>>,
+    pool: PgPool,
+}
+
+impl RuntimeOrchestrator {
+    pub fn new(
+        policy: Arc<RuntimePolicyEngine>,
+        pool: PgPool,
+        executors: Vec<Arc<dyn RuntimeExecutor>>,
+    ) -> Self {
+        let mut map = HashMap::new();
+        for executor in executors {
+            map.insert(executor.backend(), executor);
+        }
+        Self {
+            policy,
+            executors: Arc::new(map),
+            assignments: Arc::new(DashMap::new()),
+            pool,
+        }
+    }
+
+    fn executor_for(&self, backend: RuntimeBackend) -> Option<Arc<dyn RuntimeExecutor>> {
+        self.executors.get(&backend).map(Arc::clone)
+    }
+
+    async fn resolve_backend_assignment(&self, server_id: i32) -> Option<RuntimeBackend> {
+        if let Some(entry) = self.assignments.get(&server_id) {
+            return Some(*entry);
+        }
+
+        match self.policy.resolve_backend_for(&self.pool, server_id).await {
+            Ok(Some(backend)) => {
+                self.assignments.insert(server_id, backend);
+                Some(backend)
+            }
+            Ok(None) => None,
+            Err(err) => {
+                tracing::error!(?err, %server_id, "failed to resolve backend assignment");
+                None
+            }
+        }
     }
 }
 
 #[async_trait]
-impl ContainerRuntime for DockerRuntime {
+impl ContainerRuntime for RuntimeOrchestrator {
     fn spawn_server_task(
         &self,
         server_id: i32,
@@ -50,10 +118,232 @@ impl ContainerRuntime for DockerRuntime {
         use_gpu: bool,
         pool: PgPool,
     ) {
+        let policy = self.policy.clone();
+        let executors = self.executors.clone();
+        let assignments = self.assignments.clone();
+        tokio::spawn(async move {
+            let decision = match policy
+                .decide_and_record(&pool, server_id, &server_type, config.as_ref(), use_gpu)
+                .await
+            {
+                Ok(decision) => decision,
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        %server_id,
+                        "failed to evaluate runtime policy for spawn",
+                    );
+                    if let Err(set_err) =
+                        crate::servers::set_status(&pool, server_id, "error").await
+                    {
+                        tracing::error!(
+                            ?set_err,
+                            %server_id,
+                            "failed to set server status after policy error",
+                        );
+                    }
+                    return;
+                }
+            };
+
+            if !decision.capabilities_satisfied {
+                tracing::error!(
+                    %server_id,
+                    backend = %decision.backend.as_str(),
+                    "policy decision failed capability enforcement; aborting launch",
+                );
+                if let Err(set_err) = crate::servers::set_status(&pool, server_id, "error").await {
+                    tracing::error!(
+                        ?set_err,
+                        %server_id,
+                        "failed to set server status after capability failure",
+                    );
+                }
+                assignments.remove(&server_id);
+                return;
+            }
+
+            let backend = decision.backend;
+            let executor = match executors.get(&backend).map(Arc::clone) {
+                Some(executor) => executor,
+                None => {
+                    tracing::error!(
+                        %server_id,
+                        backend = %backend.as_str(),
+                        "no executor registered for backend",
+                    );
+                    if let Err(set_err) =
+                        crate::servers::set_status(&pool, server_id, "error").await
+                    {
+                        tracing::error!(
+                            ?set_err,
+                            %server_id,
+                            "failed to set server status after missing executor",
+                        );
+                    }
+                    return;
+                }
+            };
+
+            assignments.insert(server_id, backend);
+            executor.spawn_server_task(
+                decision,
+                server_id,
+                server_type,
+                config,
+                api_key,
+                use_gpu,
+                pool,
+            );
+        });
+    }
+
+    fn stop_server_task(&self, server_id: i32, pool: PgPool) {
+        let assignments = self.assignments.clone();
+        let policy = self.policy.clone();
+        let executors = self.executors.clone();
+        let history_pool = self.pool.clone();
+        tokio::spawn(async move {
+            let backend = if let Some(entry) = assignments.get(&server_id) {
+                Some(*entry)
+            } else {
+                match policy.resolve_backend_for(&history_pool, server_id).await {
+                    Ok(opt) => opt,
+                    Err(err) => {
+                        tracing::error!(?err, %server_id, "failed to lookup backend for stop");
+                        None
+                    }
+                }
+            };
+
+            let Some(backend) = backend else {
+                tracing::warn!(%server_id, "no backend assignment found for stop request");
+                return;
+            };
+
+            if let Some(executor) = executors.get(&backend).map(Arc::clone) {
+                executor.stop_server_task(server_id, pool);
+            } else {
+                tracing::error!(
+                    %server_id,
+                    backend = %backend.as_str(),
+                    "stop requested but executor not registered",
+                );
+            }
+        });
+    }
+
+    fn delete_server_task(&self, server_id: i32, pool: PgPool) {
+        let assignments = self.assignments.clone();
+        let policy = self.policy.clone();
+        let executors = self.executors.clone();
+        let history_pool = self.pool.clone();
+        tokio::spawn(async move {
+            let backend = if let Some((_, backend)) = assignments.remove(&server_id) {
+                Some(backend)
+            } else {
+                match policy.resolve_backend_for(&history_pool, server_id).await {
+                    Ok(opt) => opt,
+                    Err(err) => {
+                        tracing::error!(?err, %server_id, "failed to lookup backend for delete");
+                        None
+                    }
+                }
+            };
+
+            let Some(backend) = backend else {
+                tracing::warn!(%server_id, "no backend assignment found for delete request");
+                return;
+            };
+
+            if let Some(executor) = executors.get(&backend).map(Arc::clone) {
+                executor.delete_server_task(server_id, pool);
+            } else {
+                tracing::error!(
+                    %server_id,
+                    backend = %backend.as_str(),
+                    "delete requested but executor not registered",
+                );
+            }
+        });
+    }
+
+    async fn fetch_logs(&self, server_id: i32) -> Result<String, bollard::errors::Error> {
+        let backend = match self.resolve_backend_assignment(server_id).await {
+            Some(backend) => backend,
+            None => {
+                return Err(bollard::errors::Error::IOError {
+                    err: io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("no runtime executor recorded for server {server_id}"),
+                    ),
+                });
+            }
+        };
+
+        if let Some(executor) = self.executor_for(backend) {
+            executor.fetch_logs(server_id).await
+        } else {
+            Err(bollard::errors::Error::IOError {
+                err: io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("executor for backend {} not registered", backend.as_str()),
+                ),
+            })
+        }
+    }
+
+    fn stream_logs_task(&self, server_id: i32, pool: PgPool) -> Option<Receiver<String>> {
+        let backend = self.assignments.get(&server_id).map(|entry| *entry);
+        let Some(backend) = backend else {
+            tracing::warn!(
+                %server_id,
+                "stream logs requested before backend assignment was recorded",
+            );
+            return None;
+        };
+
+        self.executor_for(backend)
+            .and_then(|executor| executor.stream_logs_task(server_id, pool))
+    }
+}
+
+pub struct DockerRuntime;
+
+impl DockerRuntime {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn descriptor() -> RuntimeExecutorDescriptor {
+        RuntimeExecutorDescriptor::new(
+            RuntimeBackend::Docker,
+            "Docker containers",
+            [RuntimeCapability::ImageBuild],
+        )
+    }
+}
+
+#[async_trait]
+impl RuntimeExecutor for DockerRuntime {
+    fn backend(&self) -> RuntimeBackend {
+        RuntimeBackend::Docker
+    }
+
+    fn spawn_server_task(
+        &self,
+        decision: PolicyDecision,
+        server_id: i32,
+        _server_type: String,
+        config: Option<serde_json::Value>,
+        api_key: String,
+        use_gpu: bool,
+        pool: PgPool,
+    ) {
         crate::docker::spawn_server_task(
-            self.policy.clone(),
+            decision,
             server_id,
-            server_type,
+            _server_type,
             config,
             api_key,
             use_gpu,
@@ -80,22 +370,34 @@ impl ContainerRuntime for DockerRuntime {
 
 pub struct KubernetesRuntime {
     client: kube::Client,
-    policy: Arc<RuntimePolicyEngine>,
 }
 
 impl KubernetesRuntime {
-    pub async fn new(policy: Arc<RuntimePolicyEngine>) -> Result<Self, kube::Error> {
+    pub async fn new() -> Result<Self, kube::Error> {
         let client = kube::Client::try_default().await?;
-        Ok(Self { client, policy })
+        Ok(Self { client })
+    }
+
+    pub fn descriptor() -> RuntimeExecutorDescriptor {
+        RuntimeExecutorDescriptor::new(
+            RuntimeBackend::Kubernetes,
+            "Kubernetes clusters",
+            [RuntimeCapability::ImageBuild, RuntimeCapability::Gpu],
+        )
     }
 }
 
 #[async_trait]
-impl ContainerRuntime for KubernetesRuntime {
+impl RuntimeExecutor for KubernetesRuntime {
+    fn backend(&self) -> RuntimeBackend {
+        RuntimeBackend::Kubernetes
+    }
+
     fn spawn_server_task(
         &self,
+        decision: PolicyDecision,
         server_id: i32,
-        server_type: String,
+        _server_type: String,
         config: Option<serde_json::Value>,
         api_key: String,
         use_gpu: bool,
@@ -103,44 +405,23 @@ impl ContainerRuntime for KubernetesRuntime {
     ) {
         use k8s_openapi::api::core::v1 as corev1;
         use kube::{
-            api::{DeleteParams, Patch, PatchParams, PostParams},
+            api::{DeleteParams, PostParams},
             Api,
         };
         use std::collections::BTreeMap;
 
         let client = self.client.clone();
         let namespace = crate::config::K8S_NAMESPACE.clone();
-        let policy = self.policy.clone();
+        let cfg_clone = config.clone();
         tokio::spawn(async move {
-            let decision = match policy
-                .decide_and_record(&pool, server_id, &server_type, config.as_ref(), use_gpu)
-                .await
-            {
-                Ok(decision) => decision,
-                Err(err) => {
-                    tracing::error!(
-                        ?err,
-                        %server_id,
-                        "failed to evaluate runtime policy for kubernetes spawn",
-                    );
-                    if let Err(set_err) =
-                        crate::servers::set_status(&pool, server_id, "error").await
-                    {
-                        tracing::error!(?set_err, %server_id, "failed to set status after policy failure");
-                    }
-                    return;
-                }
-            };
-
             if !matches!(decision.backend, RuntimeBackend::Kubernetes) {
                 tracing::warn!(
                     %server_id,
                     backend = %decision.backend.as_str(),
-                    "runtime policy selected a backend different from kubernetes runtime",
+                    "policy selected non-kubernetes backend for kubernetes executor",
                 );
             }
 
-            let cfg_clone = config.clone();
             let branch = cfg_clone
                 .as_ref()
                 .and_then(|v| v.get("branch"))
@@ -148,7 +429,6 @@ impl ContainerRuntime for KubernetesRuntime {
 
             let mut image = decision.image.clone();
 
-            // Build from git repo if provided
             if decision.requires_build {
                 let repo = cfg_clone
                     .as_ref()
@@ -395,20 +675,21 @@ impl ContainerRuntime for KubernetesRuntime {
                 ..Default::default()
             };
 
-            let _ = pods.delete(&pod_name, &DeleteParams::default()).await; // cleanup any old pod
+            let _ = pods.delete(&pod_name, &DeleteParams::default()).await;
             match pods.create(&PostParams::default(), &pod).await {
                 Ok(_) => {
-                    if let Err(err) = crate::servers::set_status(&pool, server_id, "running").await
+                    if let Err(err) = crate::servers::set_status(&pool, server_id, "starting").await
                     {
-                        tracing::error!(?err, %server_id, "failed to set status to running");
+                        tracing::error!(?err, %server_id, "failed to update status to starting");
                     }
-                    let _ = crate::servers::add_metric(&pool, server_id, "start", None).await;
-                    crate::proxy::rebuild_for_server(&pool, server_id).await;
+                    tracing::info!(%server_id, "kubernetes pod launched");
                 }
-                Err(e) => {
-                    tracing::error!(?e, "failed to create pod");
-                    if let Err(err) = crate::servers::set_status(&pool, server_id, "error").await {
-                        tracing::error!(?err, %server_id, "failed to set status to error after runtime failure");
+                Err(err) => {
+                    tracing::error!(?err, %server_id, "failed to create kubernetes pod");
+                    if let Err(set_err) =
+                        crate::servers::set_status(&pool, server_id, "error").await
+                    {
+                        tracing::error!(?set_err, %server_id, "failed to set status after pod error");
                     }
                 }
             }
@@ -418,65 +699,75 @@ impl ContainerRuntime for KubernetesRuntime {
     fn stop_server_task(&self, server_id: i32, pool: PgPool) {
         use k8s_openapi::api::core::v1::Pod;
         use kube::{api::DeleteParams, Api};
+
         let client = self.client.clone();
         let namespace = crate::config::K8S_NAMESPACE.clone();
         tokio::spawn(async move {
             let pods: Api<Pod> = Api::namespaced(client, &namespace);
-            let name = format!("mcp-server-{server_id}");
-            let _ = pods.delete(&name, &DeleteParams::default()).await;
+            let pod_name = format!("mcp-server-{server_id}");
+            let _ = pods.delete(&pod_name, &DeleteParams::default()).await;
             if let Err(err) = crate::servers::set_status(&pool, server_id, "stopped").await {
                 tracing::error!(?err, %server_id, "failed to set status to stopped");
             }
             let _ = crate::servers::add_metric(&pool, server_id, "stop", None).await;
-            crate::proxy::rebuild_for_server(&pool, server_id).await;
+            tracing::info!(%server_id, "kubernetes server stop requested");
         });
     }
 
     fn delete_server_task(&self, server_id: i32, pool: PgPool) {
         use k8s_openapi::api::core::v1::Pod;
         use kube::{api::DeleteParams, Api};
+
         let client = self.client.clone();
         let namespace = crate::config::K8S_NAMESPACE.clone();
         tokio::spawn(async move {
             let pods: Api<Pod> = Api::namespaced(client, &namespace);
-            let name = format!("mcp-server-{server_id}");
-            let _ = pods.delete(&name, &DeleteParams::default()).await;
+            let pod_name = format!("mcp-server-{server_id}");
+            let _ = pods.delete(&pod_name, &DeleteParams::default()).await;
             let _ = sqlx::query("DELETE FROM mcp_servers WHERE id = $1")
                 .bind(server_id)
                 .execute(&pool)
                 .await;
             let _ = crate::servers::add_metric(&pool, server_id, "delete", None).await;
             let _ = tokio::fs::remove_dir_all(format!("storage/{server_id}")).await;
-            crate::proxy::rebuild_for_server(&pool, server_id).await;
+            tracing::info!(%server_id, "kubernetes server deleted");
         });
     }
 
     async fn fetch_logs(&self, server_id: i32) -> Result<String, bollard::errors::Error> {
+        use futures_util::{io::AsyncBufReadExt, StreamExt};
         use k8s_openapi::api::core::v1::Pod;
         use kube::{api::LogParams, Api};
+
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &crate::config::K8S_NAMESPACE);
-        let name = format!("mcp-server-{server_id}");
-        match pods
-            .logs(
-                &name,
+        let stream = pods
+            .log_stream(
+                &format!("mcp-server-{server_id}"),
                 &LogParams {
-                    tail_lines: Some(100),
+                    follow: false,
                     ..LogParams::default()
                 },
             )
             .await
-        {
-            Ok(s) => Ok(s),
-            Err(e) => Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 500,
-                message: e.to_string(),
-            }),
+            .map_err(|err| bollard::errors::Error::IOError {
+                err: io::Error::new(io::ErrorKind::Other, err.to_string()),
+            })?;
+
+        let mut out = String::new();
+        let mut lines = stream.lines();
+        while let Some(item) = lines.next().await {
+            match item {
+                Ok(line) => out.push_str(&line),
+                Err(err) => {
+                    tracing::error!(?err, %server_id, "failed to read kubernetes log chunk");
+                }
+            }
         }
+        Ok(out)
     }
 
     fn stream_logs_task(&self, server_id: i32, pool: PgPool) -> Option<Receiver<String>> {
-        use futures_util::io::AsyncBufReadExt;
-        use futures_util::StreamExt;
+        use futures_util::{io::AsyncBufReadExt, StreamExt};
         use k8s_openapi::api::core::v1::Pod;
         use kube::{api::LogParams, Api};
 
@@ -498,15 +789,17 @@ impl ContainerRuntime for KubernetesRuntime {
             {
                 Ok(stream) => {
                     let mut lines = stream.lines();
-                    while let Some(Ok(line)) = lines.next().await {
-                        let _ = tx.send(line.clone()).await;
-                        let _ = sqlx::query(
-                            "INSERT INTO server_logs (server_id, log_text) VALUES ($1,$2)",
-                        )
-                        .bind(server_id)
-                        .bind(&line)
-                        .execute(&pool)
-                        .await;
+                    while let Some(item) = lines.next().await {
+                        if let Ok(line) = item {
+                            let _ = tx.send(line.clone()).await;
+                            let _ = sqlx::query(
+                                "INSERT INTO server_logs (server_id, log_text) VALUES ($1,$2)",
+                            )
+                            .bind(server_id)
+                            .bind(&line)
+                            .execute(&pool)
+                            .await;
+                        }
                     }
                 }
                 Err(e) => tracing::error!(?e, "k8s log stream failed"),

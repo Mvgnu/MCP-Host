@@ -100,11 +100,12 @@
     - 2025-11-05 11:10:00 UTC: Refactored Docker/Kubernetes runtimes to delegate to the policy engine, persisted decisions, and updated documentation/extensions for downstream consumers.
 
 - ID: BE-RUNTIME-002
-  Status: PENDING
+  Status: DONE
   Task: Enforce runtime backend switching through policy decisions with pluggable executors (Docker, Kubernetes, VMs).
   Hypothesis: Abstracting backend executors behind the policy engine will allow operators to target alternate environments and codify placement fallbacks without modifying launch code.
   Log:
     - 2025-11-05 11:15:00 UTC: Created task to track backend abstraction work after initial policy integration landed.
+    - 2025-11-06 14:40:00 UTC: Landed `RuntimeOrchestrator` with executor registry, capability-aware selection, migration 0022, and passing `cargo test` to close out pluggable backend enforcement.
 
 - ID: BE-EVAL-002
   Status: PENDING
