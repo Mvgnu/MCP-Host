@@ -187,7 +187,7 @@ pub async fn list_marketplace(
     Ok(Json(artifacts))
 }
 
-fn derive_health(
+pub(crate) fn derive_health(
     status: &str,
     run_health: &str,
     platforms: &[MarketplacePlatform],
@@ -225,7 +225,11 @@ fn derive_health(
     }
 }
 
-fn classify_tier(server_type: String, multi_arch: bool, health: &ArtifactHealth) -> String {
+pub(crate) fn classify_tier(
+    server_type: String,
+    multi_arch: bool,
+    health: &ArtifactHealth,
+) -> String {
     let normalized_health = health.overall.as_str();
     if normalized_health == "healthy" && multi_arch {
         format!("gold:{}", server_type)

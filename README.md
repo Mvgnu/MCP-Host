@@ -81,6 +81,16 @@ Supported query parameters:
 
 The response schema is described in `backend/src/marketplace.rs` (guarded by a `key: marketplace-catalog` comment for downstream automation). Each artifact also includes a `health` block listing any issues so lifecycle tooling can stage promotions or credential rotations with awareness of current risk.
 
+### Runtime policy engine
+
+`backend/src/policy.rs` introduces a policy-driven placement core that every runtime invocation now flows through. The engine hydrates marketplace metadata before a launch, deriving tier and health classifications from the latest `build_artifact_runs`/`build_artifact_platforms` entries and reconciling them with the requested configuration. Decisions capture:
+
+* The backend selected for placement (`docker` or `kubernetes`) and any overrides applied for GPU scheduling or explicit runtime hints.
+* The image reference that will be booted, reusing promoted registry artifacts when available and falling back to default catalog images when no ledger entry exists.
+* Whether a git build is required, plus evaluation gating derived from artifact health to enforce staging and certification flows.
+
+Every evaluation is persisted to the new `runtime_policy_decisions` table (see migration `backend/migrations/0021_create_runtime_policy_decisions.sql`) so operators can audit historical placements or drive rollback automation. Each row records the manifest digest, associated artifact run, tier, and free-form notes emitted by the policy engine. The `RuntimePolicyEngine` is exposed to the web API via an Axum `Extension`, enabling upcoming CLI or control-surface features to reuse the same policy vocabulary without duplicating logic.
+
 ### Telemetry consumer audit
 
 The enriched registry telemetry is ingested by several non-UI paths:
