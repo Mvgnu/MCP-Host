@@ -683,3 +683,9 @@ This document tracks development progress and high level notes from the planning
 - Carved out `backend/src/policy.rs` with a policy engine that hydrates marketplace health data, selects runtime backends, and persists placement notes in the new `runtime_policy_decisions` table.
 - Refactored Docker and Kubernetes runtimes to delegate image selection and build triggers through the shared policy layer, warning when the configured backend diverges from policy guidance.
 - Exposed the policy engine via Axum extensions and documented the new workflow in README and design materials to set the stage for operator control surfaces.
+
+## 2025-11-06
+- Introduced `RuntimeOrchestrator` to delegate runtime lifecycle operations to policy-registered executors.
+- Expanded `RuntimePolicyEngine` decisions with executor descriptors, capability enforcement, and persisted metadata via migration 0022.
+- Updated Docker/Kubernetes runtimes to honor policy capability checks and rewrote Kubernetes log streaming for the new `AsyncBufRead` API.
+- Ran `cargo fmt` and `cargo test` from `backend/` to validate the refactor.
