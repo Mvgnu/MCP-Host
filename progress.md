@@ -159,6 +159,11 @@ This document tracks development progress and high level notes from the planning
 ### Next Steps
 - Expand documentation pages and continue refining the frontend layout.
 
+## 2025-11-15
+- Introduced a secure VirtualMachineExecutor with attestation-aware provisioning hooks, persisted VM lifecycle telemetry, and marketplace surfacing for attested capacity.
+- Added database tables for runtime VM instances/events and wired runtime policy selection to initialize VM executors alongside container fallbacks.
+- Documented the change in the runtime problem tracker, noting expansion toward confidential workload governance.
+
 ## 2025-07-17
 - Created reusable `Button`, `Hero`, and `Section` components for a more expressive UI.
 - Added Docs and Blog pages describing MCP Host features and placeholder articles.

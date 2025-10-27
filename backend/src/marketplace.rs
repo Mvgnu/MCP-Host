@@ -32,6 +32,19 @@ pub struct MarketplacePlatform {
     pub credential_health_status: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MarketplaceVmInstance {
+    pub instance_id: String,
+    pub isolation_tier: Option<String>,
+    pub attestation_status: String,
+    pub policy_version: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub terminated_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub capability_notes: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct ArtifactHealth {
     pub overall: String,
@@ -67,6 +80,7 @@ pub struct MarketplaceArtifact {
     pub tier: String,
     pub health: ArtifactHealth,
     pub platforms: Vec<MarketplacePlatform>,
+    pub vm_instances: Vec<MarketplaceVmInstance>,
     pub promotion: Option<MarketplacePromotion>,
     pub promotion_history: Vec<MarketplacePromotion>,
 }
@@ -107,6 +121,7 @@ pub async fn list_marketplace(
             servers.server_type,
             promotion_current.current_promotion,
             promotion_history.promotion_history,
+            COALESCE(vm_instances.instances, '[]'::json) AS vm_instances,
             COALESCE(
                 json_agg(
                     json_build_object(
@@ -172,6 +187,27 @@ pub async fn list_marketplace(
               AND ap.manifest_digest = runs.manifest_digest
               AND t.tier = servers.server_type
         ) promotion_history ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT COALESCE(
+                    json_agg(
+                        json_build_object(
+                            'instance_id', vmi.instance_id,
+                            'isolation_tier', vmi.isolation_tier,
+                            'attestation_status', vmi.attestation_status,
+                            'policy_version', vmi.policy_version,
+                            'created_at', vmi.created_at,
+                            'updated_at', vmi.updated_at,
+                            'terminated_at', vmi.terminated_at,
+                            'last_error', vmi.last_error,
+                            'capability_notes', vmi.capability_notes
+                        )
+                        ORDER BY vmi.created_at DESC
+                    ),
+                    '[]'::json
+                ) AS instances
+            FROM runtime_vm_instances vmi
+            WHERE vmi.server_id = runs.server_id
+        ) vm_instances ON TRUE
         WHERE ($2::text IS NULL OR servers.server_type = $2)
           AND ($3::text IS NULL OR runs.status = $3)
           AND (
@@ -223,6 +259,12 @@ pub async fn list_marketplace(
             })?;
         promotion_history.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
+        let vm_instances_value: serde_json::Value = row.get("vm_instances");
+        let vm_instances: Vec<MarketplaceVmInstance> = serde_json::from_value(vm_instances_value)
+            .map_err(|error| {
+            AppError::Message(format!("failed to deserialize vm instances: {error}"))
+        })?;
+
         let status: String = row.get("status");
         let credential_health_status: String = row.get("credential_health_status");
         let health = derive_health(&status, &credential_health_status, &platforms);
@@ -247,6 +289,7 @@ pub async fn list_marketplace(
             tier: tier.clone(),
             health,
             platforms,
+            vm_instances,
             promotion,
             promotion_history,
         };

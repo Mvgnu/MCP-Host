@@ -35,7 +35,10 @@ use axum::{routing::get, Extension, Router};
 use axum_prometheus::PrometheusMetricLayer;
 use job_queue::start_worker;
 use policy::{RuntimeBackend, RuntimePolicyEngine};
-use runtime::{ContainerRuntime, DockerRuntime, KubernetesRuntime, RuntimeOrchestrator};
+use runtime::{
+    ContainerRuntime, DockerRuntime, InlineEvidenceAttestor, KubernetesRuntime, LocalVmProvisioner,
+    RuntimeOrchestrator, VirtualMachineExecutor,
+};
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -78,6 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let governance_engine = Arc::new(governance::GovernanceEngine::new());
     let mut policy_engine = Arc::new(RuntimePolicyEngine::new(match configured_backend {
         "kubernetes" => RuntimeBackend::Kubernetes,
+        "virtual-machine" => RuntimeBackend::VirtualMachine,
         _ => RuntimeBackend::Docker,
     }));
 
@@ -121,6 +125,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ))
             }
         }
+    } else if configured_backend == "virtual-machine" {
+        policy_engine
+            .register_executor(DockerRuntime::descriptor())
+            .await;
+        let docker_executor: Arc<dyn runtime::RuntimeExecutor> = Arc::new(DockerRuntime::new());
+        let provisioner: Arc<dyn runtime::VmProvisioner> = Arc::new(LocalVmProvisioner);
+        let attestor: Arc<dyn runtime::AttestationVerifier> = Arc::new(InlineEvidenceAttestor);
+        let vm_executor: Arc<dyn runtime::RuntimeExecutor> = Arc::new(VirtualMachineExecutor::new(
+            pool.clone(),
+            provisioner,
+            attestor,
+        ));
+        policy_engine
+            .register_executor(VirtualMachineExecutor::descriptor())
+            .await;
+        policy_engine
+            .attach_governance(governance_engine.clone())
+            .await;
+        let executors: Vec<Arc<dyn runtime::RuntimeExecutor>> = vec![docker_executor, vm_executor];
+        Arc::new(RuntimeOrchestrator::new(
+            policy_engine.clone(),
+            pool.clone(),
+            executors,
+        ))
     } else {
         policy_engine
             .register_executor(DockerRuntime::descriptor())

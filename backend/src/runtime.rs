@@ -1,3 +1,5 @@
+pub mod vm;
+
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as Base64Engine;
 use base64::Engine;
@@ -12,6 +14,10 @@ use tokio::sync::mpsc::Receiver;
 use crate::policy::{
     PolicyDecision, RuntimeBackend, RuntimeCapability, RuntimeExecutorDescriptor,
     RuntimePolicyEngine,
+};
+pub use vm::{
+    AttestationVerifier, InlineEvidenceAttestor, LocalVmProvisioner, VirtualMachineExecutor,
+    VmProvisioner,
 };
 
 #[async_trait]
