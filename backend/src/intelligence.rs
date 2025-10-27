@@ -124,14 +124,12 @@ pub async fn ensure_scores(
 ) -> Result<HashMap<String, IntelligenceScore>, IntelligenceError> {
     let mut scores = load_scores(pool, context.server_id).await?;
     let stale_threshold = Utc::now() - Duration::minutes(15);
-    let needs_refresh = context
+    let needs_refresh = context.capability_keys.iter().any(
+        |cap| matches!(scores.get(cap), Some(score) if score.last_observed_at < stale_threshold),
+    ) || context
         .capability_keys
         .iter()
-        .any(|cap| matches!(scores.get(cap), Some(score) if score.last_observed_at < stale_threshold))
-        || context
-            .capability_keys
-            .iter()
-            .any(|cap| !scores.contains_key(cap));
+        .any(|cap| !scores.contains_key(cap));
 
     if needs_refresh {
         let recomputed = recompute_scores(pool, context).await?;
@@ -194,7 +192,7 @@ pub async fn recompute_scores(
 }
 
 fn build_base_score(signals: &ScoreSignals) -> f32 {
-    let mut score = 85.0;
+    let mut score: f32 = 85.0;
     if let Some(health) = signals.artifact_health.as_deref() {
         match health {
             "healthy" => score += 5.0,
@@ -421,11 +419,7 @@ pub async fn list_scores(
         })
         .collect();
 
-    payload.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(Ordering::Equal)
-    });
+    payload.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 
     Ok(Json(payload))
 }
@@ -496,7 +490,12 @@ async fn upsert_score(
         IntelligenceStatus::Warning => "warning",
         IntelligenceStatus::Critical => "critical",
     };
-    let notes_json = Value::Array(notes.iter().map(|note| Value::String(note.clone())).collect());
+    let notes_json = Value::Array(
+        notes
+            .iter()
+            .map(|note| Value::String(note.clone()))
+            .collect(),
+    );
     let evidence_json = Value::Array(evidence.iter().cloned().collect());
 
     let row = sqlx::query(
@@ -667,7 +666,9 @@ async fn load_signals(pool: &PgPool, server_id: i32) -> Result<ScoreSignals, Int
 
 fn derive_artifact_health(status: Option<&str>, credential: Option<&str>) -> String {
     match (status, credential) {
-        (Some(status), Some(credential)) if matches_success(status) && matches_healthy(credential) => {
+        (Some(status), Some(credential))
+            if matches_success(status) && matches_healthy(credential) =>
+        {
             "healthy".to_string()
         }
         (Some(status), Some(credential)) if matches_success(status) => {

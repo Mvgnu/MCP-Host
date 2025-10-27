@@ -137,6 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
     };
     let job_tx = start_worker(pool.clone(), runtime.clone());
+    evaluations::scheduler::spawn(pool.clone(), job_tx.clone());
     ingestion::start_ingestion_worker(pool.clone());
     let (prometheus_layer, metrics_handle) = PrometheusMetricLayer::pair();
     let app = Router::new()

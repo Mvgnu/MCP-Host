@@ -9,6 +9,7 @@ from typing import Callable, Dict
 
 from ..client import APIClient
 from ..renderers import dumps_json, render_table
+from . import evaluations as evaluations_commands
 
 CommandFn = Callable[[APIClient, bool, Dict[str, object]], None]
 
@@ -119,17 +120,7 @@ def install_governance(subparsers: _SubParsersAction[ArgumentParser]) -> None:
 
 
 def install_evaluations(subparsers: _SubParsersAction[ArgumentParser]) -> None:
-    parser = subparsers.add_parser("evaluations", help="Evaluation lifecycle commands")
-    evaluations_sub = parser.add_subparsers(dest="evaluations_cmd", required=True)
-
-    list_parser = evaluations_sub.add_parser("list", help="List evaluations across artifacts")
-    list_parser.set_defaults(handler=_evaluations_list)
-    _add_common_arguments(list_parser)
-
-    retry_parser = evaluations_sub.add_parser("retry", help="Retry a certification")
-    retry_parser.add_argument("evaluation_id", type=int)
-    retry_parser.set_defaults(handler=_evaluations_retry)
-    _add_common_arguments(retry_parser)
+    evaluations_commands.install(subparsers, _add_common_arguments)
 
 
 def install_scaffold(subparsers: _SubParsersAction[ArgumentParser]) -> None:
@@ -296,33 +287,6 @@ def _governance_get_run(client: APIClient, as_json: bool, args: Dict[str, object
     else:
         columns = ["id", "workflow_id", "status", "updated_at"]
         print(render_table([detail], columns))
-
-
-def _evaluations_list(client: APIClient, as_json: bool, _: Dict[str, object]) -> None:
-    results = client.get("/api/evaluations")
-    if as_json:
-        print(dumps_json(results))
-        return
-    columns = ["id", "artifact_id", "tier", "status", "valid_until"]
-    rows = [{
-        "id": item.get("id"),
-        "artifact_id": item.get("artifact_id") or item.get("artifact"),
-        "tier": item.get("tier"),
-        "status": item.get("status"),
-        "valid_until": item.get("valid_until"),
-    } for item in results]
-    print(render_table(rows, columns))
-
-
-def _evaluations_retry(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
-    result = client.post(f"/api/evaluations/{args['evaluation_id']}/retry")
-    if as_json:
-        print(dumps_json(result))
-    else:
-        columns = ["id", "status", "scheduled_at"]
-        print(render_table([result], columns))
-
-
 def _scaffold_fetch(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
     data = client.get(f"/api/servers/{args['server_id']}/client-config")
     if as_json:

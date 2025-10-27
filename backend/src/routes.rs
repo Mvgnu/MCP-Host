@@ -118,6 +118,14 @@ pub fn api_routes() -> Router {
             "/api/evaluations/:id/retry",
             post(evaluation::retry_certification),
         )
+        .route(
+            "/api/evaluations/:id/status",
+            get(evaluation::certification_status).patch(evaluation::override_certification_plan),
+        )
+        .route(
+            "/api/evaluations/:id/lineage",
+            get(evaluation::certification_lineage),
+        )
         .route("/api/evaluations/summary", get(evaluation::scores_summary))
         .merge(governance::routes())
         .merge(promotions::routes())

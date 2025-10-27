@@ -131,3 +131,11 @@
   Log:
     - 2025-11-05 11:18:00 UTC: Added backlog entry to explore rule-based or learned scoring feeding into runtime policy decisions.
     - 2025-11-10 09:45:00 UTC: Implemented capability intelligence schema, recomputation workers, policy gating, REST/CLI surfacing, and regression tests validating degraded scores trigger visibility.
+
+- ID: BE-EVAL-004
+  Status: DONE
+  Task: Automate evaluation evidence lifecycle management.
+  Hypothesis: Capturing cadence metadata, scheduling refresh jobs, and enforcing policy blocks on stale evidence will retire manual babysitting of evaluation certifications.
+  Log:
+    - 2025-11-12 09:00:00 UTC: Initiated task after auditing evaluation_certifications schema and loader usage for cadence and refresh gaps.
+    - 2025-11-12 12:30:00 UTC: Added cadence/lineage columns, scheduler integration, policy stale blocking, CLI controls, and tests for refresh planning workflows.
