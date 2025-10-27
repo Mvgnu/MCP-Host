@@ -1,5 +1,6 @@
+use crate::policy::trust::evaluate_placement_gate;
 use crate::runtime::ContainerRuntime;
-use crate::{evaluations, intelligence};
+use crate::{evaluations, intelligence, servers};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
@@ -87,6 +88,34 @@ pub fn start_worker(pool: PgPool, runtime: Arc<dyn ContainerRuntime>) -> Sender<
                     api_key,
                     use_gpu,
                 } => {
+                    match evaluate_placement_gate(&pool, server_id).await {
+                        Ok(Some(gate)) if gate.blocked => {
+                            let status = gate.blocked_status();
+                            if let Err(err) = servers::set_status(&pool, server_id, status).await {
+                                tracing::error!(
+                                    ?err,
+                                    %server_id,
+                                    status,
+                                    "failed to persist status after trust preemption",
+                                );
+                            }
+                            tracing::warn!(
+                                %server_id,
+                                stale = gate.stale,
+                                notes = %gate.notes.join(","),
+                                "preempting start job due to trust gate",
+                            );
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::error!(
+                                ?err,
+                                %server_id,
+                                "failed to evaluate trust gate before dispatching job",
+                            );
+                        }
+                    }
                     let rt = runtime.clone();
                     rt.spawn_server_task(
                         server_id,

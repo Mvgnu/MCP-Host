@@ -1,6 +1,7 @@
 use crate::error::{AppError, AppResult};
 use crate::extractor::AuthUser;
 use crate::invocations::record_invocation;
+use crate::policy::trust::{evaluate_placement_gate, TrustPlacementGate};
 use crate::runtime::ContainerRuntime;
 use crate::telemetry::{validate_metric_details, Metric, MetricError};
 use axum::{
@@ -20,7 +21,7 @@ use std::convert::Infallible;
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 #[derive(Serialize)]
@@ -183,6 +184,23 @@ pub enum SetStatusError {
 async fn set_status_guard(pool: &PgPool, server_id: i32, status: &str, context: &str) {
     if let Err(err) = set_status(pool, server_id, status).await {
         error!(?err, %server_id, status = %status, context, "failed to persist status update");
+    }
+}
+
+async fn trust_gate_for(pool: &PgPool, server_id: i32) -> AppResult<Option<TrustPlacementGate>> {
+    evaluate_placement_gate(pool, server_id)
+        .await
+        .map_err(AppError::Db)
+}
+
+fn trust_gate_message(gate: &TrustPlacementGate) -> String {
+    if gate.notes.is_empty() {
+        "trust registry lifecycle prevents launch".to_string()
+    } else {
+        format!(
+            "trust registry lifecycle prevents launch ({})",
+            gate.notes.join(",")
+        )
     }
 }
 
@@ -492,7 +510,7 @@ pub async fn create_server(
     let status: String = rec.get("status");
     let created_at: chrono::DateTime<chrono::Utc> = rec.get("created_at");
 
-    let info = ServerInfo {
+    let mut info = ServerInfo {
         id,
         name: payload.name,
         server_type: payload.server_type.clone(),
@@ -505,15 +523,34 @@ pub async fn create_server(
         created_at,
     };
 
-    let job = Job::Start {
-        server_id: id,
-        server_type: payload.server_type,
-        config: payload.config,
-        api_key,
-        use_gpu: payload.use_gpu.unwrap_or(false),
-    };
-    enqueue_job(&pool, &job).await;
-    let _ = job_tx.send(job).await;
+    let gate = trust_gate_for(&pool, id).await?;
+    let mut blocked = false;
+    if let Some(ref gate) = gate {
+        if gate.blocked {
+            let status = gate.blocked_status();
+            set_status_guard(&pool, id, status, "trust gate preemption").await;
+            info.status = status.to_string();
+            warn!(
+                %id,
+                stale = gate.stale,
+                notes = %gate.notes.join(","),
+                "trust gate blocked server start during creation"
+            );
+            blocked = true;
+        }
+    }
+
+    if !blocked {
+        let job = Job::Start {
+            server_id: id,
+            server_type: payload.server_type,
+            config: payload.config,
+            api_key,
+            use_gpu: payload.use_gpu.unwrap_or(false),
+        };
+        enqueue_job(&pool, &job).await;
+        let _ = job_tx.send(job).await;
+    }
 
     Ok(Json(info))
 }
@@ -550,6 +587,20 @@ pub async fn start_server(
     let config: Option<serde_json::Value> = rec.try_get("config").ok();
     let api_key: String = rec.get("api_key");
     let use_gpu: bool = rec.get("use_gpu");
+
+    if let Some(gate) = trust_gate_for(&pool, id).await? {
+        if gate.blocked {
+            let status = gate.blocked_status();
+            set_status_guard(&pool, id, status, "trust gate preemption").await;
+            warn!(
+                %id,
+                stale = gate.stale,
+                notes = %gate.notes.join(","),
+                "trust gate blocked manual start request"
+            );
+            return Err(AppError::Conflict(trust_gate_message(&gate)));
+        }
+    }
 
     set_status_guard(&pool, id, "starting", "user start request").await;
 
@@ -648,6 +699,20 @@ pub async fn redeploy_server(
     let api_key: String = rec.get("api_key");
     let use_gpu: bool = rec.get("use_gpu");
 
+    if let Some(gate) = trust_gate_for(&pool, id).await? {
+        if gate.blocked {
+            let status = gate.blocked_status();
+            set_status_guard(&pool, id, status, "trust gate preemption").await;
+            warn!(
+                %id,
+                stale = gate.stale,
+                notes = %gate.notes.join(","),
+                "trust gate blocked redeploy request"
+            );
+            return Err(AppError::Conflict(trust_gate_message(&gate)));
+        }
+    }
+
     set_status_guard(&pool, id, "redeploying", "user redeploy request").await;
 
     let job = Job::Start {
@@ -694,6 +759,20 @@ pub async fn webhook_redeploy(
     let config: Option<serde_json::Value> = rec.try_get("config").ok();
     let api_key: String = rec.get("api_key");
     let use_gpu: bool = rec.get("use_gpu");
+
+    if let Some(gate) = trust_gate_for(&pool, id).await? {
+        if gate.blocked {
+            let status = gate.blocked_status();
+            set_status_guard(&pool, id, status, "trust gate preemption").await;
+            warn!(
+                %id,
+                stale = gate.stale,
+                notes = %gate.notes.join(","),
+                "trust gate blocked webhook redeploy request"
+            );
+            return Err(AppError::Conflict(trust_gate_message(&gate)));
+        }
+    }
 
     set_status_guard(&pool, id, "redeploying", "webhook redeploy request").await;
 
@@ -759,9 +838,23 @@ pub async fn github_webhook(
     }
 
     let server_type: String = rec.get("server_type");
-    let config: Option<serde_json::Value> = rec.try_get("config").ok();
-    let api_key: String = rec.get("api_key");
-    let use_gpu: bool = rec.get("use_gpu");
+   let config: Option<serde_json::Value> = rec.try_get("config").ok();
+   let api_key: String = rec.get("api_key");
+   let use_gpu: bool = rec.get("use_gpu");
+
+    if let Some(gate) = trust_gate_for(&pool, id).await? {
+        if gate.blocked {
+            let status = gate.blocked_status();
+            set_status_guard(&pool, id, status, "trust gate preemption").await;
+            warn!(
+                %id,
+                stale = gate.stale,
+                notes = %gate.notes.join(","),
+                "trust gate blocked GitHub webhook redeploy"
+            );
+            return Err(AppError::Conflict(trust_gate_message(&gate)));
+        }
+    }
 
     set_status_guard(&pool, id, "redeploying", "github webhook").await;
 

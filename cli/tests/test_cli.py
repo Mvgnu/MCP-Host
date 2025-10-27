@@ -31,6 +31,7 @@ sys.modules.setdefault("requests", requests_stub)
 import pytest
 
 from mcpctl import cli as cli_module
+from mcpctl.commands import _render_trust_event
 
 
 class FakeClient:
@@ -244,6 +245,51 @@ def test_policy_watch_renders_stream(capsys: pytest.CaptureFixture[str]) -> None
     assert FakeClient.calls[-1][0] == "STREAM"
     assert "Latest posture: trusted" in output
     assert "Active instance: vm-alpha" in output
+
+
+def test_trust_registry_lists_entries(capsys: pytest.CaptureFixture[str]) -> None:
+    FakeClient.responses[("GET", "/api/trust/registry")] = [
+        {
+            "server_name": "alpha",
+            "server_id": 9,
+            "instance_id": "vm-alpha",
+            "vm_instance_id": 101,
+            "attestation_status": "untrusted",
+            "lifecycle_state": "quarantined",
+            "remediation_state": "remediation:pending",
+            "remediation_attempts": 2,
+            "stale": True,
+            "updated_at": "2025-11-21T10:00:00Z",
+        }
+    ]
+
+    cli_module.main(["trust", "registry"])
+    output = capsys.readouterr().out
+    assert "vm-alpha" in output
+    assert "quarantined" in output
+
+
+def test_render_trust_event_handles_missing_fields() -> None:
+    event = {
+        "server_id": 7,
+        "vm_instance_id": 55,
+        "triggered_at": "2025-11-21T12:00:00Z",
+        "attestation_status": "trusted",
+        "previous_attestation_status": "untrusted",
+        "lifecycle_state": "restored",
+        "previous_lifecycle_state": "remediating",
+        "stale": False,
+        "remediation_attempts": None,
+        "transition_reason": None,
+        "version": 3,
+    }
+
+    rendered = _render_trust_event(event)
+    assert "server 7" in rendered
+    assert "status untrusted -> trusted" in rendered
+    assert "restored" in rendered
+    assert "attempts -" in rendered
+    assert rendered.endswith("v3")
 
 
 def test_evaluations_plan_overrides_payload() -> None:

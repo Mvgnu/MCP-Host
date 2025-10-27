@@ -20,6 +20,8 @@ pub enum AppError {
     Forbidden,
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("bad gateway: {0}")]
     BadGateway(String),
     #[error("{0}")]
@@ -33,6 +35,7 @@ impl IntoResponse for AppError {
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::Forbidden => StatusCode::FORBIDDEN,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::BadGateway(_) => StatusCode::BAD_GATEWAY,
             AppError::Db(_) | AppError::Docker(_) | AppError::Vault(_) | AppError::Message(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR

@@ -43,3 +43,14 @@ Key integration points:
 - **Intelligence scoring:** scoring logic folds lifecycle state, remediation attempts, freshness deadlines, and provenance hints into capability notes and evidence payloads. Servers with degraded posture incur score penalties proportional to remediation churn and stale evidence windows.
 
 Refer to `progress.md` for the operational rollout plan covering notification listeners, CLI affordances, and intelligence feedback loops built on top of the trust registry.
+
+### Trust control plane API
+
+The trust registry now exposes a REST and streaming control surface so remediation services, policy engines, and operator tooling can coordinate without direct database access.
+
+- **Registry listing:** `GET /api/trust/registry` returns the latest lifecycle snapshot for the authenticated owner. Query parameters (`server_id`, `lifecycle_state`, `attestation_status`, `stale`) provide filtered views.
+- **Instance detail:** `GET /api/trust/registry/:vm_instance_id` returns the most recent posture for a specific VM instance, while `GET /api/trust/registry/:vm_instance_id/history` surfaces lifecycle transitions capped by a configurable limit.
+- **State transitions:** `POST /api/trust/registry/:vm_instance_id/transition` applies guarded state changes with optimistic concurrency tokens. The handler persists a new history row and rebroadcasts the enriched payload to downstream consumers.
+- **Streaming events:** `GET /api/trust/registry/stream` streams SSE payloads that mirror the Postgres NOTIFY channel. Filters match the REST list parameters so dashboards and the CLI can watch targeted lifecycles without custom fan-out code.
+
+The remediation orchestrator listens to the in-process broadcast channel, starting automation playbooks when quarantined lifecycles appear. Placeholder automation marks runs complete after basic verification; replace the stub in `backend/src/remediation.rs` as production playbooks mature. Use migration `0033_remediation_orchestrator.sql` before deploying the control plane.

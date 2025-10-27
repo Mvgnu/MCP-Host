@@ -43,6 +43,14 @@ Lists marketplace artifacts and their active status. Pass `--json` to receive ra
 * `mcpctl policy intelligence SERVER_ID [--json]` – display capability intelligence scores, status, and recent anomaly notes for the specified server.
 * `mcpctl policy vm SERVER_ID [--json]` – inspect VM attestation status, isolation tier, and active instance details for confidential workloads.
 
+### Trust control plane
+
+* `mcpctl trust registry [--server-id ID] [--lifecycle STATE] [--status STATUS] [--stale|--fresh]` – list the latest registry snapshots with optional filters.
+* `mcpctl trust get VM_INSTANCE_ID` – show lifecycle, remediation, and provenance metadata for a specific VM instance.
+* `mcpctl trust history VM_INSTANCE_ID [--limit N]` – display recent registry transitions.
+* `mcpctl trust transition VM_INSTANCE_ID --status STATUS --lifecycle STATE [options]` – submit a guarded lifecycle transition. Supply `--expected-version` to honour optimistic locking tokens.
+* `mcpctl trust watch [--server-id ID] [--lifecycle STATE] [--status STATUS]` – stream live trust registry transitions via SSE.
+
 ### Scaffolding helpers
 
 The legacy scaffolding commands remain available under the `scaffold` group:

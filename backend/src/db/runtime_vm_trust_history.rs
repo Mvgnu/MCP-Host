@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::{postgres::PgRow, PgPool, Row};
+use sqlx::{postgres::PgRow, Executor, PgPool, Postgres, Row};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RuntimeVmTrustEvent {
@@ -40,10 +40,13 @@ pub struct NewRuntimeVmTrustEvent<'a> {
     pub metadata: Option<&'a Value>,
 }
 
-pub async fn insert_trust_event(
-    pool: &PgPool,
+pub async fn insert_trust_event<'c, E>(
+    executor: E,
     input: NewRuntimeVmTrustEvent<'_>,
-) -> Result<RuntimeVmTrustEvent, sqlx::Error> {
+) -> Result<RuntimeVmTrustEvent, sqlx::Error>
+where
+    E: Executor<'c, Database = Postgres>,
+{
     let row = sqlx::query(
         r#"
         INSERT INTO runtime_vm_trust_history (
@@ -93,7 +96,7 @@ pub async fn insert_trust_event(
     .bind(input.provenance_ref)
     .bind(input.provenance)
     .bind(input.metadata)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     Ok(map_row(&row))
