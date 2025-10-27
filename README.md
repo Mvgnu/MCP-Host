@@ -109,6 +109,8 @@ Policy outcomes are now enforced through `backend/src/runtime.rs`, which introdu
 
 The `RuntimePolicyEngine` continues to be exposed to the web API via an Axum `Extension`, enabling CLI or control-surface features to reuse the same policy vocabulary without duplicating logic.
 
+Operators can now fetch attestation posture directly via `GET /api/servers/:id/vm`, which returns the latest VM instances, attestation statuses, isolation tiers, and lifecycle events recorded in `runtime_vm_instances`/`runtime_vm_events`. The `mcpctl policy vm` command consumes this endpoint to render active instance summaries and highlight fallback conditions alongside timestamps so on-call engineers no longer need to query the database by hand when validating confidential workload launches.
+
 ### Lifecycle governance workflows
 
 Promotion, rollback, and credential-rotation workflows now have a persistent home backed by migration `backend/migrations/0024_create_governance_workflows.sql`. Operators can define named governance workflows per tier, hydrate them with ordered steps, and initiate workflow runs that target a specific manifest digest or build artifact. The runtime policy engine consults these runs during placement: when no completed promotion exists for the requested tier/digest pair, the decision includes `governance:missing-promotion:*` notes and marks `governance_required = true`, causing the `RuntimeOrchestrator` to pause the launch and set the server status to `pending-governance`.

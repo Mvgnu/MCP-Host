@@ -147,3 +147,11 @@
   Log:
     - 2025-11-15 08:05:00 UTC: Captured requirements for VM provisioning metadata, attestation plumbing, and marketplace exposure.
     - 2025-11-15 10:35:00 UTC: Implemented VM executor scaffolding with attestation verification, lifecycle persistence, marketplace surfacing, and documentation/test updates.
+
+- ID: BE-RUNTIME-011
+  Status: DONE
+  Task: Surface VM attestation lifecycle telemetry to operators via REST/CLI.
+  Hypothesis: Providing dedicated VM posture endpoints and CLI visibility will let operators trust runtime policy fallbacks and triage attestation regressions without manual SQL queries.
+  Log:
+    - 2025-11-16 13:10:00 UTC: Initiated task after confirming absence of VM telemetry routes and CLI coverage despite persisted runtime_vm_instances data.
+    - 2025-11-16 14:05:00 UTC: Added `/api/servers/:id/vm`, CLI summaries, docs, and unit coverage to expose attestation posture and active instance insights.

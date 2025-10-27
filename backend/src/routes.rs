@@ -27,6 +27,7 @@ pub fn api_routes() -> Router {
         .route("/api/servers/:id/github", post(servers::github_webhook))
         .route("/api/servers/:id/invoke", post(servers::invoke_server))
         .route("/api/servers/:id/manifest", get(servers::get_manifest))
+        .route("/api/servers/:id/vm", get(servers::vm_runtime_details))
         .route(
             "/api/servers/:id/client-config",
             get(servers::client_config),

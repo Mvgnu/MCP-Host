@@ -171,6 +171,37 @@ def test_policy_intelligence_displays_scores(
     assert "82.5" in captured
 
 
+def test_policy_vm_runtime_outputs_summary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    FakeClient.responses[("GET", "/api/servers/7/vm")] = {
+        "latest_status": "trusted",
+        "last_updated_at": "2025-11-16T12:00:00Z",
+        "active_instance_id": "vm-alpha",
+        "instances": [
+            {
+                "instance_id": "vm-alpha",
+                "attestation_status": "trusted",
+                "isolation_tier": "coco",
+                "updated_at": "2025-11-16T12:00:00Z",
+            },
+            {
+                "instance_id": "vm-beta",
+                "attestation_status": "untrusted",
+                "isolation_tier": None,
+                "updated_at": "2025-11-15T09:30:00Z",
+            },
+        ],
+    }
+
+    cli_module.main(["policy", "vm", "7"])
+    captured = capsys.readouterr().out
+    assert "vm-alpha" in captured
+    assert "trusted" in captured
+    assert "Latest posture: trusted" in captured
+    assert "Active instance: vm-alpha" in captured
+
+
 def test_evaluations_plan_overrides_payload() -> None:
     FakeClient.responses[("PATCH", "/api/evaluations/42/status")] = {
         "id": 42,
