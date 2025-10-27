@@ -28,3 +28,17 @@ Passwords can be rotated without restarts by updating `LIBVIRT_PASSWORD_FILE` to
 
 ## Troubleshooting Console Access
 If log retrieval returns empty output, verify `LIBVIRT_CONSOLE_SOURCE` matches the domain's serial device configuration and that `LIBVIRT_LOG_TAIL` is large enough to capture recent lines. The new streaming test covers channel setup end-to-end; if streaming fails in production, confirm `virtlogd` is running and that SELinux/AppArmor policies allow read access to the console device.
+
+## Attestation Trust Fabric
+
+The VM runtime now persists posture transitions in a dedicated `runtime_vm_trust_history` table. Each attestation outcome recorded through `policy::trust::persist_vm_attestation_outcome` emits a `pg_notify` event, appends history rows, and updates derived lineage columns on `evaluation_certifications` (`last_attestation_status`, `fallback_launched_at`, `remediation_attempts`). These updates keep evaluation refresh scheduling and intelligence scoring aligned with the active trust posture.
+
+Key integration points:
+
+- **Scheduler:** `evaluations::scheduler` skips refreshes when the latest attestation status is `untrusted`, appends governance notes, and preserves fallback timestamps so operators can audit paused evidence. Trusted states resume the cadence automatically.
+- **Trust notifications:** `trust::spawn_trust_listener` subscribes to the `runtime_vm_trust_transition` channel, recalculates evaluation plans in real time, and triggers intelligence recomputes whenever posture changes arrive from Postgres.
+- **Policy engine:** placement decisions hydrate the latest trust event via `runtime_vm_trust_history` and emit `vm:trust-event` notes, enabling downstream scoring and telemetry to reason about posture transitions and remediation state.
+- **Operator tooling:** `/api/evaluations` and the CLI surface lineage fields for trust, fallback attempts, and remediation counts so consoles can highlight blocked evidence and remediation activity.
+- **Intelligence scoring:** scoring logic folds trust transitions, remediation attempts, and transition reasons into capability notes and evidence payloads. Servers with degraded posture incur score penalties proportional to remediation churn.
+
+Refer to `progress.md` for the operational rollout plan covering notification listeners, CLI affordances, and intelligence feedback loops built on top of the trust registry.

@@ -21,6 +21,9 @@ use tokio::sync::{broadcast, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::config;
+use crate::db::runtime_vm_trust_history::{
+    latest_for_instance as latest_trust_event, RuntimeVmTrustEvent,
+};
 use crate::evaluations::{self, CertificationStatus};
 use crate::extractor::AuthUser;
 use crate::governance::GovernanceEngine;
@@ -578,7 +581,7 @@ impl RuntimePolicyEngine {
             let stale_limit = Duration::seconds(stale_seconds.max(60));
             let vm_row = sqlx::query(
                 r#"
-                SELECT attestation_status, updated_at, terminated_at
+                SELECT id, attestation_status, updated_at, terminated_at
                 FROM runtime_vm_instances
                 WHERE server_id = $1
                 ORDER BY created_at DESC
@@ -589,11 +592,19 @@ impl RuntimePolicyEngine {
             .fetch_optional(pool)
             .await?;
 
-            let record = vm_row.map(|row| VmAttestationRecord {
+            let mut record = vm_row.map(|row| VmAttestationRecord {
+                instance_id: row.get("id"),
                 status: row.get("attestation_status"),
                 updated_at: row.get("updated_at"),
                 terminated_at: row.get("terminated_at"),
+                trust_event: None,
             });
+
+            if let Some(ref mut record) = record {
+                if let Ok(Some(event)) = latest_trust_event(pool, record.instance_id).await {
+                    record.trust_event = Some(event);
+                }
+            }
 
             let posture =
                 evaluate_vm_attestation_posture(record, Utc::now(), stale_limit, fallback_backend);
@@ -1046,9 +1057,11 @@ impl RuntimePolicyEngine {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VmAttestationRecord {
+    pub instance_id: i64,
     pub status: String,
     pub updated_at: DateTime<Utc>,
     pub terminated_at: Option<DateTime<Utc>>,
+    pub trust_event: Option<RuntimeVmTrustEvent>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -1081,6 +1094,15 @@ pub fn evaluate_vm_attestation_posture(
                 outcome
                     .notes
                     .push(format!("vm:last-terminated:{}", terminated.to_rfc3339()));
+            }
+            if let Some(trust_event) = &record.trust_event {
+                outcome.notes.push(format!(
+                    "vm:trust-event:{}:{}",
+                    trust_event.id, trust_event.current_status
+                ));
+                if let Some(reason) = &trust_event.transition_reason {
+                    outcome.notes.push(format!("vm:trust-reason:{}", reason));
+                }
             }
 
             match record.status.as_str() {

@@ -89,6 +89,10 @@ pub struct ScoreSignals {
     pub capabilities_satisfied: Option<bool>,
     pub policy_notes: Vec<String>,
     pub policy_decided_at: Option<DateTime<Utc>>,
+    pub trust_status: Option<String>,
+    pub trust_transition_reason: Option<String>,
+    pub trust_triggered_at: Option<DateTime<Utc>>,
+    pub trust_remediation_attempts: Option<i32>,
 }
 
 impl Default for ScoreSignals {
@@ -106,6 +110,10 @@ impl Default for ScoreSignals {
             capabilities_satisfied: None,
             policy_notes: Vec::new(),
             policy_decided_at: None,
+            trust_status: None,
+            trust_transition_reason: None,
+            trust_triggered_at: None,
+            trust_remediation_attempts: None,
         }
     }
 }
@@ -244,6 +252,35 @@ fn compute_capability_score(
         if policy_backend != backend {
             score -= 5.0;
             notes.push(format!("backend:diverged:{}->{}", policy_backend, backend));
+        }
+    }
+
+    if let Some(trust_status) = signals.trust_status.as_deref() {
+        evidence.push(json!({
+            "trust_status": trust_status,
+            "trust_transition_reason": signals.trust_transition_reason,
+            "trust_triggered_at": signals.trust_triggered_at,
+            "trust_remediation_attempts": signals.trust_remediation_attempts,
+        }));
+        match trust_status {
+            "untrusted" => {
+                score -= 40.0;
+                notes.push("trust:untrusted".into());
+            }
+            "unknown" => {
+                score -= 10.0;
+                notes.push("trust:unknown".into());
+            }
+            _ => {
+                notes.push(format!("trust:{}", trust_status));
+            }
+        }
+    }
+
+    if let Some(attempts) = signals.trust_remediation_attempts {
+        if attempts > 0 {
+            score -= (attempts as f32).min(3.0) * 3.0;
+            notes.push(format!("trust:remediation-attempts:{attempts}"));
         }
     }
 
@@ -659,6 +696,46 @@ async fn load_signals(pool: &PgPool, server_id: i32) -> Result<ScoreSignals, Int
             _ => Vec::new(),
         };
         signals.policy_decided_at = Some(row.get("decided_at"));
+    }
+
+    if let Some(row) = sqlx::query(
+        r#"
+        SELECT
+            h.current_status,
+            h.transition_reason,
+            h.triggered_at
+        FROM runtime_vm_instances i
+        JOIN runtime_vm_trust_history h ON h.runtime_vm_instance_id = i.id
+        WHERE i.server_id = $1
+        ORDER BY h.triggered_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(server_id)
+    .fetch_optional(pool)
+    .await?
+    {
+        signals.trust_status = row.get("current_status");
+        signals.trust_transition_reason = row.get("transition_reason");
+        signals.trust_triggered_at = Some(row.get("triggered_at"));
+    }
+
+    if signals.trust_remediation_attempts.is_none() {
+        if let Some(row) = sqlx::query(
+            r#"
+            SELECT MAX(remediation_attempts) AS attempts
+            FROM evaluation_certifications
+            WHERE build_artifact_run_id IN (
+                SELECT id FROM build_artifact_runs WHERE server_id = $1
+            )
+            "#,
+        )
+        .bind(server_id)
+        .fetch_optional(pool)
+        .await?
+        {
+            signals.trust_remediation_attempts = row.get::<Option<i32>, _>("attempts");
+        }
     }
 
     Ok(signals)

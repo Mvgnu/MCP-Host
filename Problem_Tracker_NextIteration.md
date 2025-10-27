@@ -182,3 +182,5 @@
     - 2025-11-19 09:15:00 UTC: Began work on trust registry foundation by auditing existing VM instance persistence and attestation verifier logic.
     - 2025-11-19 14:20:00 UTC: Routed TPM verifier through shared normalization helpers, surfaced SEV/TDX trust outcomes, and persisted raw attestation quotes for policy consumers.
     - 2025-11-19 15:00:00 UTC: Aligned runtime/libvirt test imports with new re-exports, expanded attestation fixture coverage, and reran `cargo test --no-run` for regression confidence.
+    - 2025-11-20 09:00:00 UTC: Spun up "Attestation Trust Fabric" iteration blueprint, confirmed scope across scheduler, policy, operator tooling, and intelligence integrations.
+    - 2025-11-20 15:45:00 UTC: Implemented Postgres notification listener for `runtime_vm_trust_transition`, taught scheduler to react to live posture changes, blocked evaluation retries on untrusted posture, and added SQLx-backed regression tests.

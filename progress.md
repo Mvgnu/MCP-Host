@@ -10,6 +10,14 @@ This document tracks development progress and high level notes from the planning
 ### Next Steps
 - Surface libvirt hypervisor metadata and attestation hints in operator tooling for remediation workflows.
 
+## 2025-11-20
+- Introduced a persistent `runtime_vm_trust_history` table with NOTIFY triggers so every attestation outcome emits a structured trust transition payload.
+- Extended `policy::trust::persist_vm_attestation_outcome` to enrich evaluation certifications with posture lineage, remediation attempt counters, and fallback timestamps while broadcasting trust events to the SSE layer.
+- Updated the evaluation scheduler to pause refreshes when posture degrades to `untrusted`, append governance notes, and automatically resume once trust recovers.
+- Added a dedicated `trust::spawn_trust_listener` worker that consumes Postgres notifications, purges queued refresh jobs on posture degradation, and immediately requeues trusted evaluations while triggering intelligence recomputes.
+- Refined CLI and REST payloads to include trust posture history and lineage metadata, and wired intelligence scoring to penalize degraded trust with provenance evidence.
+- Documented the trust fabric responsibilities in `backend/README.md` to guide operators and downstream integrators.
+
 ## 2025-11-16
 - Runtime policy engine now reads persisted VM attestation records when selecting executors, emitting decision notes for status, timestamps, and teardown metadata.
 - Policy evaluation automatically falls back to Docker when the latest attestation is marked untrusted and flags stale pending evidence for remediation scheduling.

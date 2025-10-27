@@ -508,6 +508,20 @@ def _render_policy_event(
                 f"attestation {current} (was {_colorize_status(str(previous), use_color)})"
             )
 
+    trust_event = event.get("trust_event")
+    if isinstance(trust_event, dict):
+        summary["trust_event_id"] = trust_event.get("id")
+        reason = trust_event.get("transition_reason") or "posture"
+        triggered = trust_event.get("triggered_at")
+        descriptor = f"trust {reason}"
+        if triggered:
+            descriptor += f" @ {triggered}"
+        changes.append(descriptor)
+
+    trust_event_id = event.get("trust_event_id")
+    if trust_event_id is not None:
+        summary["trust_event_id"] = trust_event_id
+
     stale_flag = event.get("stale")
     if isinstance(stale_flag, bool):
         previous = summary.get("stale")

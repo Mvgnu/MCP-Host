@@ -8,6 +8,9 @@ use sqlx::PgPool;
 use crate::db::runtime_vm_attestations::{
     insert_attestation, NewRuntimeVmAttestation, RuntimeVmAttestationRecord,
 };
+use crate::db::runtime_vm_trust_history::{
+    insert_trust_event, NewRuntimeVmTrustEvent, RuntimeVmTrustEvent,
+};
 use crate::runtime::vm::attestation::{AttestationOutcome, AttestationStatus};
 
 #[derive(Debug, Clone, Serialize)]
@@ -19,6 +22,7 @@ pub struct TrustTransition {
     pub posture_changed: bool,
     pub freshness_expires_at: Option<DateTime<Utc>>,
     pub attestation: RuntimeVmAttestationRecord,
+    pub trust_event: RuntimeVmTrustEvent,
 }
 
 impl TrustTransition {
@@ -34,6 +38,12 @@ impl TrustTransition {
             "previous_status": self.previous_status,
             "freshness_expires_at": self.freshness_expires_at,
             "attestation_id": self.attestation.id,
+            "trust_event": {
+                "id": self.trust_event.id,
+                "triggered_at": self.trust_event.triggered_at,
+                "transition_reason": self.trust_event.transition_reason,
+                "remediation_state": self.trust_event.remediation_state,
+            }
         })
     }
 }
@@ -85,6 +95,64 @@ pub async fn persist_vm_attestation_outcome(
     .await?;
 
     let posture_changed = previous_status.as_deref() != Some(outcome.status.as_str());
+    let metadata = outcome.evidence.as_ref().map(|value| {
+        serde_json::json!({
+            "attestation_kind": outcome.attestation_kind.as_str(),
+            "claims": value,
+        })
+    });
+
+    let trust_event = insert_trust_event(
+        pool,
+        NewRuntimeVmTrustEvent {
+            runtime_vm_instance_id: vm_instance_id,
+            attestation_id: Some(attestation.id),
+            previous_status: previous_status.as_deref(),
+            current_status: outcome.status.as_str(),
+            transition_reason: Some("attestation"),
+            remediation_state: remediation_notes.first().map(String::as_str),
+            metadata: metadata.as_ref(),
+        },
+    )
+    .await?;
+
+    let posture_note = format!(
+        "{} trust:{}:{}",
+        Utc::now().to_rfc3339(),
+        outcome.attestation_kind.as_str(),
+        outcome.status.as_str()
+    );
+
+    sqlx::query(
+        r#"
+        UPDATE evaluation_certifications
+        SET
+            last_attestation_status = $1,
+            fallback_launched_at = CASE
+                WHEN $1 = 'untrusted' THEN COALESCE(fallback_launched_at, NOW())
+                WHEN $1 = 'trusted' THEN NULL
+                ELSE fallback_launched_at
+            END,
+            remediation_attempts = CASE
+                WHEN $1 = 'untrusted' THEN remediation_attempts + 1
+                ELSE remediation_attempts
+            END,
+            governance_notes = CASE
+                WHEN governance_notes IS NULL OR governance_notes = '' THEN $3
+                ELSE governance_notes || E'\n' || $3
+            END,
+            updated_at = NOW()
+        WHERE build_artifact_run_id IN (
+            SELECT id FROM build_artifact_runs WHERE server_id = $2
+        )
+        "#,
+    )
+    .bind(outcome.status.as_str())
+    .bind(server_id)
+    .bind(&posture_note)
+    .execute(pool)
+    .await?;
+
     Ok(TrustTransition {
         vm_instance_id,
         server_id,
@@ -93,6 +161,7 @@ pub async fn persist_vm_attestation_outcome(
         posture_changed,
         freshness_expires_at: outcome.freshness_deadline,
         attestation,
+        trust_event,
     })
 }
 
