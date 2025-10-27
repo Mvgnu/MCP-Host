@@ -15,12 +15,9 @@ use crate::policy::{
     PolicyDecision, RuntimeBackend, RuntimeCapability, RuntimeExecutorDescriptor,
     RuntimePolicyEngine,
 };
-pub use vm::libvirt::testing::InMemoryLibvirtDriver;
 #[cfg(feature = "libvirt-executor")]
 pub use vm::libvirt::RealLibvirtDriver;
-pub use vm::libvirt::{
-    LibvirtAuthConfig, LibvirtDriver, LibvirtProvisioningConfig, LibvirtVmProvisioner,
-};
+pub use vm::libvirt::{LibvirtAuthConfig, LibvirtProvisioningConfig};
 pub use vm::{
     AttestationVerifier, HttpHypervisorProvisioner, TpmAttestationVerifier, VirtualMachineExecutor,
     VmProvisioner,

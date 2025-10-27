@@ -6,11 +6,12 @@ use std::time::Duration;
 use backend::policy::{
     evaluate_vm_attestation_posture, PolicyDecision, RuntimeBackend, VmAttestationRecord,
 };
-use backend::runtime::vm::libvirt::{
-    testing::InMemoryLibvirtDriver, LibvirtProvisioningConfig, LibvirtVmProvisioner,
+use backend::runtime::vm::libvirt::LibvirtVmProvisioner;
+use backend::runtime::vm::{
+    libvirt::testing::InMemoryLibvirtDriver, AttestationStatus, HypervisorSnapshot,
+    TpmAttestationVerifier, VmProvisioningResult,
 };
-use backend::runtime::vm::{HypervisorSnapshot, TpmAttestationVerifier, VmProvisioningResult};
-use backend::runtime::{AttestationVerifier, VmProvisioner};
+use backend::runtime::{AttestationVerifier, LibvirtProvisioningConfig, VmProvisioner};
 use base64::engine::general_purpose::STANDARD as Base64Engine;
 use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -79,6 +80,39 @@ fn sample_decision() -> PolicyDecision {
     }
 }
 
+fn sample_keypair() -> Keypair {
+    let secret_bytes = [0x11u8; 32];
+    let secret = SecretKey::from_bytes(&secret_bytes).expect("secret key");
+    let public = PublicKey::from(&secret);
+    Keypair { secret, public }
+}
+
+fn build_tpm_evidence(
+    keypair: &Keypair,
+    measurement: &str,
+    timestamp: chrono::DateTime<Utc>,
+    nonce: Option<&str>,
+) -> serde_json::Value {
+    let mut report = json!({
+        "measurement": measurement,
+        "timestamp": timestamp.to_rfc3339(),
+    });
+    if let Some(nonce_value) = nonce {
+        report["nonce"] = json!(nonce_value);
+    }
+
+    let message = serde_json::to_vec(&report).expect("serialize report");
+    let signature = keypair.sign(&message);
+
+    json!({
+        "quote": {
+            "report": report,
+            "signature": Base64Engine.encode(signature.to_bytes()),
+            "public_key": Base64Engine.encode(keypair.public.as_bytes()),
+        }
+    })
+}
+
 fn sample_config() -> LibvirtProvisioningConfig {
     let network_json = json!({ "name": "default", "model": "virtio" }).to_string();
     let volume_json = json!({
@@ -116,7 +150,7 @@ async fn libvirt_provisioner_respects_log_tail_limits() {
         ("LIBVIRT_PASSWORD_FILE", None),
     ];
     let config = load_libvirt_config(&overrides);
-    let driver = Arc::new(InMemoryLibvirtDriver::new());
+    let driver = Arc::new(InMemoryLibvirtDriver::default());
     let provisioner = LibvirtVmProvisioner::new(driver, config);
     let decision = sample_decision();
 
@@ -251,8 +285,153 @@ fn libvirt_config_overrides_apply() {
 }
 
 #[tokio::test]
+async fn tpm_attestation_happy_path_trusts_measurement() {
+    let keypair = sample_keypair();
+    let measurement = "trusted-image";
+    let evidence = build_tpm_evidence(&keypair, measurement, Utc::now(), Some("nonce-123"));
+
+    let verifier = TpmAttestationVerifier::new(
+        HashSet::from([measurement.to_string()]),
+        vec![keypair.public],
+        Duration::from_secs(600),
+    );
+
+    let provisioning = VmProvisioningResult::new(
+        "vm-123".to_string(),
+        Some("confidential".to_string()),
+        Some(evidence.clone()),
+        "ghcr.io/example/app:latest".to_string(),
+        Some(HypervisorSnapshot::new(
+            "test".to_string(),
+            None,
+            None,
+            None,
+            None,
+        )),
+    );
+
+    let outcome = verifier
+        .verify(7, &sample_decision(), &provisioning, None)
+        .await
+        .expect("attestation should succeed");
+
+    assert_eq!(outcome.status, AttestationStatus::Trusted);
+    assert!(outcome
+        .notes
+        .iter()
+        .any(|note| note == "attestation:kind:tpm"));
+    assert!(outcome
+        .notes
+        .iter()
+        .any(|note| note.contains("attestation:measurement:trusted-image")));
+    assert!(outcome.freshness_deadline.is_some());
+    assert_eq!(outcome.evidence, Some(evidence));
+}
+
+#[tokio::test]
+async fn tpm_attestation_rejects_stale_reports() {
+    let keypair = sample_keypair();
+    let measurement = "trusted-image";
+    let stale_time = Utc::now() - ChronoDuration::minutes(15);
+    let evidence = build_tpm_evidence(&keypair, measurement, stale_time, None);
+
+    let verifier = TpmAttestationVerifier::new(
+        HashSet::from([measurement.to_string()]),
+        vec![keypair.public],
+        Duration::from_secs(60),
+    );
+
+    let provisioning = VmProvisioningResult::new(
+        "vm-456".to_string(),
+        None,
+        Some(evidence.clone()),
+        "ghcr.io/example/app:latest".to_string(),
+        None,
+    );
+
+    let outcome = verifier
+        .verify(9, &sample_decision(), &provisioning, None)
+        .await
+        .expect("attestation should complete");
+
+    assert_eq!(outcome.status, AttestationStatus::Untrusted);
+    assert!(outcome.notes.iter().any(|note| note == "attestation:stale"));
+    assert_eq!(outcome.evidence, Some(evidence));
+}
+
+#[tokio::test]
+async fn tpm_attestation_rejects_signature_mismatch() {
+    let keypair = sample_keypair();
+    let measurement = "trusted-image";
+    let evidence = build_tpm_evidence(&keypair, measurement, Utc::now(), None);
+
+    // Tamper with the measurement after signing to invalidate signature.
+    let mut tampered = evidence.clone();
+    tampered["quote"]["report"]["measurement"] = json!("tampered-image");
+
+    let verifier = TpmAttestationVerifier::new(
+        HashSet::from([measurement.to_string()]),
+        vec![keypair.public],
+        Duration::from_secs(600),
+    );
+
+    let provisioning = VmProvisioningResult::new(
+        "vm-789".to_string(),
+        None,
+        Some(tampered.clone()),
+        "ghcr.io/example/app:latest".to_string(),
+        None,
+    );
+
+    let outcome = verifier
+        .verify(5, &sample_decision(), &provisioning, None)
+        .await
+        .expect("attestation should complete");
+
+    assert_eq!(outcome.status, AttestationStatus::Untrusted);
+    assert!(outcome
+        .notes
+        .iter()
+        .any(|note| note == "attestation:signature-invalid"));
+    assert_eq!(outcome.evidence, Some(tampered));
+}
+
+#[tokio::test]
+async fn tpm_attestation_blocks_untrusted_measurement() {
+    let keypair = sample_keypair();
+    let measurement = "untrusted-image";
+    let evidence = build_tpm_evidence(&keypair, measurement, Utc::now(), None);
+
+    let verifier = TpmAttestationVerifier::new(
+        HashSet::from(["trusted-image".to_string()]),
+        vec![keypair.public],
+        Duration::from_secs(600),
+    );
+
+    let provisioning = VmProvisioningResult::new(
+        "vm-321".to_string(),
+        None,
+        Some(evidence.clone()),
+        "ghcr.io/example/app:latest".to_string(),
+        None,
+    );
+
+    let outcome = verifier
+        .verify(3, &sample_decision(), &provisioning, None)
+        .await
+        .expect("attestation should complete");
+
+    assert_eq!(outcome.status, AttestationStatus::Untrusted);
+    assert!(outcome
+        .notes
+        .iter()
+        .any(|note| note.contains("attestation:measurement:untrusted")));
+    assert_eq!(outcome.evidence, Some(evidence));
+}
+
+#[tokio::test]
 async fn libvirt_provisioner_covers_lifecycle() {
-    let driver = Arc::new(InMemoryLibvirtDriver::new());
+    let driver = Arc::new(InMemoryLibvirtDriver::default());
     let config = sample_config();
     let provisioner = LibvirtVmProvisioner::new(driver, config);
     let decision = sample_decision();
@@ -291,7 +470,7 @@ async fn libvirt_provisioner_covers_lifecycle() {
 
 #[tokio::test]
 async fn libvirt_provisioner_surfaces_shutdown_errors() {
-    let driver = Arc::new(InMemoryLibvirtDriver::new());
+    let driver = Arc::new(InMemoryLibvirtDriver::default());
     let config = sample_config();
     let provisioner = LibvirtVmProvisioner::new(driver, config);
 

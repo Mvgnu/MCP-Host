@@ -1,5 +1,6 @@
 mod artifacts;
 mod auth;
+mod db;
 mod docker;
 mod extractor;
 mod governance;
@@ -39,10 +40,12 @@ use ed25519_dalek::PublicKey;
 use job_queue::start_worker;
 use policy::{RuntimeBackend, RuntimePolicyEngine};
 #[cfg(feature = "libvirt-executor")]
+use runtime::vm::libvirt::LibvirtVmProvisioner;
+#[cfg(feature = "libvirt-executor")]
 use runtime::RealLibvirtDriver;
 use runtime::{
     ContainerRuntime, DockerRuntime, HttpHypervisorProvisioner, KubernetesRuntime,
-    LibvirtVmProvisioner, RuntimeOrchestrator, TpmAttestationVerifier, VirtualMachineExecutor,
+    RuntimeOrchestrator, TpmAttestationVerifier, VirtualMachineExecutor,
 };
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;

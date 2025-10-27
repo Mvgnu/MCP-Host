@@ -1,14 +1,8 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use base64::engine::general_purpose::STANDARD as Base64Engine;
-use base64::Engine;
-use chrono::Utc;
-use chrono::{DateTime, Duration as ChronoDuration};
-use ed25519_dalek::{PublicKey, Signature};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -17,10 +11,14 @@ use sqlx::PgPool;
 use sqlx::Row;
 use tokio::sync::mpsc::Receiver;
 
+use crate::policy::trust::{persist_vm_attestation_outcome, remediation_notes_for_status};
 use crate::policy::{publish_policy_event, PolicyDecision, PolicyEvent, RuntimeBackend};
 use crate::servers::{add_metric, set_status};
 
+pub mod attestation;
 pub mod libvirt;
+
+pub use attestation::{AttestationStatus, AttestationVerifier, TpmAttestationVerifier};
 
 // key: runtime-vm-executor -> attestation,policy-hooks
 
@@ -85,48 +83,6 @@ impl HypervisorSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum AttestationStatus {
-    Trusted,
-    Untrusted,
-    Unknown,
-}
-
-impl AttestationStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AttestationStatus::Trusted => "trusted",
-            AttestationStatus::Untrusted => "untrusted",
-            AttestationStatus::Unknown => "unknown",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttestationOutcome {
-    pub status: AttestationStatus,
-    pub evidence: Option<Value>,
-    pub notes: Vec<String>,
-}
-
-impl AttestationOutcome {
-    pub fn trusted(evidence: Option<Value>, notes: Vec<String>) -> Self {
-        Self {
-            status: AttestationStatus::Trusted,
-            evidence,
-            notes,
-        }
-    }
-
-    pub fn untrusted(evidence: Option<Value>, notes: Vec<String>) -> Self {
-        Self {
-            status: AttestationStatus::Untrusted,
-            evidence,
-            notes,
-        }
-    }
-}
-
 #[async_trait]
 pub trait VmProvisioner: Send + Sync {
     async fn provision(
@@ -145,17 +101,6 @@ pub trait VmProvisioner: Send + Sync {
     async fn fetch_logs(&self, instance_id: &str) -> Result<String>;
 
     async fn stream_logs(&self, instance_id: &str) -> Result<Option<Receiver<String>>>;
-}
-
-#[async_trait]
-pub trait AttestationVerifier: Send + Sync {
-    async fn verify(
-        &self,
-        server_id: i32,
-        decision: &PolicyDecision,
-        provisioning: &VmProvisioningResult,
-        config: Option<&Value>,
-    ) -> Result<AttestationOutcome>;
 }
 
 pub struct VirtualMachineExecutor {
@@ -336,14 +281,9 @@ impl crate::runtime::RuntimeExecutor for VirtualMachineExecutor {
                     "server_type": server_type,
                     "use_gpu": use_gpu,
                 });
-                add_metric(
-                    &pool,
-                    server_id,
-                    "vm.provision.start",
-                    Some(&start_metric),
-                )
-                .await
-                .ok();
+                add_metric(&pool, server_id, "vm.provision.start", Some(&start_metric))
+                    .await
+                    .ok();
 
                 let provisioning = provisioner
                     .provision(server_id, &decision, config.as_ref())
@@ -351,9 +291,14 @@ impl crate::runtime::RuntimeExecutor for VirtualMachineExecutor {
                     .context("provisioner failed to allocate VM")?;
 
                 vm_id = Some(
-                    VirtualMachineExecutor::persist_instance(&pool, server_id, &provisioning, &decision)
-                        .await
-                        .context("failed to persist VM instance")?,
+                    VirtualMachineExecutor::persist_instance(
+                        &pool,
+                        server_id,
+                        &provisioning,
+                        &decision,
+                    )
+                    .await
+                    .context("failed to persist VM instance")?,
                 );
 
                 if let Some(record_id) = vm_id {
@@ -375,8 +320,46 @@ impl crate::runtime::RuntimeExecutor for VirtualMachineExecutor {
                     .await
                     .context("attestation verification failed")?;
 
-                let attestation_notes = attestation.notes.clone();
+                let attestation_notes_for_event;
+
                 if let Some(record_id) = vm_id {
+                    let remediation = remediation_notes_for_status(attestation.status);
+                    let mut attestation_notes = attestation.notes.clone();
+                    let mut transition_payload = None;
+
+                    match persist_vm_attestation_outcome(
+                        &pool,
+                        server_id,
+                        record_id,
+                        &attestation,
+                        &remediation,
+                    )
+                    .await
+                    {
+                        Ok(transition) => {
+                            if transition.posture_changed {
+                                attestation_notes.push("attestation:posture:changed".to_string());
+                            }
+                            if let Some(freshness) = transition.freshness_expires_at {
+                                attestation_notes.push(format!(
+                                    "attestation:freshness-expires:{}",
+                                    freshness.to_rfc3339()
+                                ));
+                            }
+                            if transition.should_invalidate_cache() {
+                                attestation_notes.push("attestation:cache:invalidate".to_string());
+                            }
+                            transition_payload = Some(transition.broadcast_payload());
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                ?err,
+                                %server_id,
+                                "failed to persist attestation trust transition"
+                            );
+                        }
+                    }
+
                     VirtualMachineExecutor::record_event(
                         &pool,
                         record_id,
@@ -384,20 +367,17 @@ impl crate::runtime::RuntimeExecutor for VirtualMachineExecutor {
                         json!({
                             "status": attestation.status.as_str(),
                             "notes": attestation_notes.clone(),
+                            "kind": attestation.attestation_kind.as_str(),
+                            "freshness_expires_at": attestation.freshness_deadline,
+                            "transition": transition_payload,
                         }),
                     )
                     .await
                     .ok();
 
-                    sqlx::query(
-                        "UPDATE runtime_vm_instances SET attestation_status = $1, attestation_evidence = COALESCE($2, attestation_evidence) WHERE id = $3",
-                    )
-                    .bind(attestation.status.as_str())
-                    .bind(attestation.evidence.clone())
-                    .bind(record_id)
-                    .execute(&pool)
-                    .await
-                    .ok();
+                    attestation_notes_for_event = attestation_notes;
+                } else {
+                    attestation_notes_for_event = attestation.notes.clone();
                 }
 
                 match sqlx::query("SELECT owner_id FROM mcp_servers WHERE id = $1")
@@ -413,7 +393,7 @@ impl crate::runtime::RuntimeExecutor for VirtualMachineExecutor {
                             &decision.backend,
                             Some(provisioning.instance_id.clone()),
                             attestation.status.as_str().to_string(),
-                            attestation_notes.clone(),
+                            attestation_notes_for_event.clone(),
                             None,
                         ));
                     }
@@ -437,8 +417,7 @@ impl crate::runtime::RuntimeExecutor for VirtualMachineExecutor {
                         set_status(&pool, server_id, "running")
                             .await
                             .context("failed to set running status")?;
-                        let success_metric =
-                            json!({ "instance_id": provisioning.instance_id });
+                        let success_metric = json!({ "instance_id": provisioning.instance_id });
                         add_metric(
                             &pool,
                             server_id,
@@ -852,197 +831,5 @@ impl VmProvisioner for HttpHypervisorProvisioner {
         });
 
         Ok(Some(rx))
-    }
-}
-
-pub struct TpmAttestationVerifier {
-    trusted_measurements: HashSet<String>,
-    trust_roots: Vec<PublicKey>,
-    max_age: Duration,
-}
-
-impl TpmAttestationVerifier {
-    pub fn new(
-        trusted_measurements: HashSet<String>,
-        trust_roots: Vec<PublicKey>,
-        max_age: Duration,
-    ) -> Self {
-        Self {
-            trusted_measurements,
-            trust_roots,
-            max_age,
-        }
-    }
-
-    fn normalize_measurement(value: &str) -> String {
-        value.trim().to_ascii_lowercase()
-    }
-
-    fn parse_signature(value: &Value) -> Result<Signature> {
-        let signature_b64 = value
-            .as_str()
-            .context("attestation signature must be string")?;
-        let decoded = Base64Engine
-            .decode(signature_b64)
-            .context("invalid attestation signature encoding")?;
-        let bytes: [u8; 64] = decoded
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid signature length"))?;
-        let signature =
-            Signature::from_bytes(&bytes).context("failed to parse attestation signature")?;
-        Ok(signature)
-    }
-
-    fn extract_quote<'a>(evidence: &'a Value) -> Result<(&'a Value, &'a Value, &'a Value)> {
-        let quote = evidence.get("quote").context("missing attestation quote")?;
-        let report = quote.get("report").context("missing attestation report")?;
-        let signature = quote
-            .get("signature")
-            .context("missing attestation signature")?;
-        Ok((quote, report, signature))
-    }
-
-    fn extract_public_keys<'a>(
-        &self,
-        quote: &'a Value,
-        evidence: &'a Value,
-    ) -> Result<Vec<PublicKey>> {
-        let mut keys = Vec::new();
-        if let Some(key_value) = quote
-            .get("public_key")
-            .or_else(|| evidence.get("public_key"))
-        {
-            if let Some(key_str) = key_value.as_str() {
-                let decoded = Base64Engine
-                    .decode(key_str)
-                    .context("invalid attestation public key encoding")?;
-                if decoded.len() == 32 {
-                    let mut bytes = [0u8; 32];
-                    bytes.copy_from_slice(&decoded);
-                    if let Ok(verifying) = PublicKey::from_bytes(&bytes) {
-                        keys.push(verifying);
-                    }
-                }
-            }
-        }
-
-        if keys.is_empty() {
-            keys.extend(self.trust_roots.iter().cloned());
-        }
-
-        if keys.is_empty() {
-            anyhow::bail!("no attestation trust roots configured");
-        }
-
-        Ok(keys)
-    }
-
-    fn parse_timestamp(report: &Value) -> Result<DateTime<Utc>> {
-        let ts = report
-            .get("timestamp")
-            .and_then(|v| v.as_str())
-            .context("missing attestation timestamp")?;
-        let parsed = DateTime::parse_from_rfc3339(ts).context("invalid attestation timestamp")?;
-        Ok(parsed.with_timezone(&Utc))
-    }
-}
-
-#[async_trait]
-impl AttestationVerifier for TpmAttestationVerifier {
-    async fn verify(
-        &self,
-        _server_id: i32,
-        decision: &PolicyDecision,
-        provisioning: &VmProvisioningResult,
-        config: Option<&Value>,
-    ) -> Result<AttestationOutcome> {
-        let evidence = match provisioning.attestation_evidence.as_ref() {
-            Some(evidence) => evidence,
-            None => {
-                return Ok(AttestationOutcome::untrusted(
-                    None,
-                    vec!["attestation:missing-evidence".to_string()],
-                ))
-            }
-        };
-
-        let (quote, report, signature_value) = Self::extract_quote(evidence)?;
-        let measurement = report
-            .get("measurement")
-            .and_then(|v| v.as_str())
-            .map(Self::normalize_measurement)
-            .context("missing attestation measurement")?;
-
-        let timestamp = Self::parse_timestamp(report)?;
-        if Utc::now() - timestamp
-            > ChronoDuration::from_std(self.max_age).unwrap_or_else(|_| ChronoDuration::minutes(5))
-        {
-            return Ok(AttestationOutcome::untrusted(
-                Some(evidence.clone()),
-                vec!["attestation:stale".to_string()],
-            ));
-        }
-
-        if !self.trusted_measurements.contains(&measurement) {
-            return Ok(AttestationOutcome::untrusted(
-                Some(evidence.clone()),
-                vec![format!("attestation:measurement:untrusted:{measurement}")],
-            ));
-        }
-
-        if let Some(required_nonce) = config
-            .and_then(|cfg| cfg.get("attestation"))
-            .and_then(|cfg| cfg.get("nonce"))
-            .and_then(|value| value.as_str())
-        {
-            let observed_nonce = report
-                .get("nonce")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            if observed_nonce != required_nonce {
-                return Ok(AttestationOutcome::untrusted(
-                    Some(evidence.clone()),
-                    vec![format!(
-                        "attestation:nonce-mismatch:expected:{required_nonce}:actual:{observed_nonce}"
-                    )],
-                ));
-            }
-        }
-
-        let signature = Self::parse_signature(signature_value)?;
-        let message = serde_json::to_vec(report).context("failed to canonicalize report")?;
-        let keys = self.extract_public_keys(quote, evidence)?;
-
-        for key in keys {
-            if key.verify_strict(&message, &signature).is_ok() {
-                let mut notes = vec![
-                    format!("attestation:measurement:{measurement}"),
-                    format!("attestation:timestamp:{}", timestamp.to_rfc3339()),
-                ];
-                if let Some(nonce_value) = report.get("nonce").and_then(|v| v.as_str()) {
-                    notes.push(format!("attestation:nonce:{nonce_value}"));
-                }
-                notes.push(format!("attestation:policy:{}", decision.policy_version));
-                return Ok(AttestationOutcome::trusted(Some(evidence.clone()), notes));
-            }
-        }
-
-        Ok(AttestationOutcome::untrusted(
-            Some(evidence.clone()),
-            vec!["attestation:signature-invalid".to_string()],
-        ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn attestation_status_strings_are_stable() {
-        assert_eq!(AttestationStatus::Trusted.as_str(), "trusted");
-        assert_eq!(AttestationStatus::Untrusted.as_str(), "untrusted");
-        assert_eq!(AttestationStatus::Unknown.as_str(), "unknown");
     }
 }
