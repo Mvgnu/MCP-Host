@@ -2,6 +2,10 @@
 
 A Model Context Protocol hosting platform.
 
+## Operator mission-control CLI
+
+Install the mission-control tooling with `pip install -e ./cli` and use the `mcpctl` entry point to drive promotions, governance runs, evaluations, and marketplace inspection without crafting manual HTTP requests. See [cli/README.md](cli/README.md) for full usage documentation and examples.
+
 ## Backend configuration
 
 The backend exposes several environment variables to control startup behavior:
