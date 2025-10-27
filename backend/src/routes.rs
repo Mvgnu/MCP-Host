@@ -5,8 +5,8 @@ use axum::{
 
 use crate::{
     auth, capabilities, domains, evaluation, file_store, governance, ingestion, intelligence,
-    invocations, marketplace, organizations, policy, promotions, secrets, servers, services,
-    trust, vector_dbs, workflows,
+    invocations, marketplace, organizations, policy, promotions, secrets, servers, services, trust,
+    vector_dbs, workflows,
 };
 
 pub fn api_routes() -> Router {
@@ -128,10 +128,7 @@ pub fn api_routes() -> Router {
             get(evaluation::certification_lineage),
         )
         .route("/api/evaluations/summary", get(evaluation::scores_summary))
-        .route(
-            "/api/trust/registry",
-            get(trust::list_registry_states),
-        )
+        .route("/api/trust/registry", get(trust::list_registry_states))
         .route(
             "/api/trust/registry/stream",
             get(trust::stream_trust_events),

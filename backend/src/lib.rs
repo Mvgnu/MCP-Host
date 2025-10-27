@@ -4,6 +4,7 @@ pub mod intelligence;
 pub mod policy;
 pub mod runtime;
 pub mod telemetry;
+pub mod trust;
 
 mod artifacts;
 mod build;

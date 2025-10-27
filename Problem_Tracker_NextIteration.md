@@ -186,6 +186,7 @@
     - 2025-11-20 15:45:00 UTC: Implemented Postgres notification listener for `runtime_vm_trust_transition`, taught scheduler to react to live posture changes, blocked evaluation retries on untrusted posture, and added SQLx-backed regression tests.
     - 2025-11-21 11:30:00 UTC: Added lifecycle-aware trust registry schema with optimistic locking, updated attestation persistence to populate remediation attempts and provenance, taught scheduler/orchestrator/CLI/API/intelligence layers to surface lifecycle state and remediation context, and enriched SSE payloads for operator workflows.
     - 2025-11-21 16:45:00 UTC: Enabled runtime orchestrator placement gating via the trust registry so quarantined or stale lifecycles block launches, flipping servers into pending remediation/attestation states with detailed tracing notes.
+    - 2025-11-23 22:31:00 UTC: Exported trust module through the crate root and derived serde deserialization for `TrustRegistryView` so integration scaffolding can compile under `cargo test --no-run`.
 - ID: BE-TRUST-002
   Status: IN_PROGRESS
   Task: Expose trust registry control plane APIs and event mesh.
@@ -193,6 +194,7 @@
   Log:
     - 2025-11-22 09:05:00 UTC: Scoped registry queries, mutation guardrails, and event streaming requirements after reviewing existing listener implementation.
     - 2025-11-22 17:45:00 UTC: Documented REST/SSE contracts, added registry filter/unit coverage, and tightened CLI rendering for streamed trust transitions.
+    - 2025-11-23 22:31:00 UTC: Restored Axum handler visibility for tests by re-exporting trust routes, keeping transition endpoints buildable ahead of full integration coverage.
 - ID: BE-TRUST-003
   Status: IN_PROGRESS
   Task: Extend policy and scheduler layers to preempt placements targeting distrusted infrastructure before queue admission.
