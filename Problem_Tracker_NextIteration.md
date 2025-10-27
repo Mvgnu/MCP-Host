@@ -139,3 +139,11 @@
   Log:
     - 2025-11-12 09:00:00 UTC: Initiated task after auditing evaluation_certifications schema and loader usage for cadence and refresh gaps.
     - 2025-11-12 12:30:00 UTC: Added cadence/lineage columns, scheduler integration, policy stale blocking, CLI controls, and tests for refresh planning workflows.
+
+- ID: BE-RUNTIME-010
+  Status: DONE
+  Task: Stand up secure VM runtime executor with attestation scaffolding.
+  Hypothesis: Adding a virtual machine executor with attestation enforcement and persisted lifecycle telemetry unlocks policy-managed confidential workloads beyond containers.
+  Log:
+    - 2025-11-15 08:05:00 UTC: Captured requirements for VM provisioning metadata, attestation plumbing, and marketplace exposure.
+    - 2025-11-15 10:35:00 UTC: Implemented VM executor scaffolding with attestation verification, lifecycle persistence, marketplace surfacing, and documentation/test updates.
