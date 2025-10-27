@@ -1,5 +1,6 @@
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use backend::policy::{
@@ -14,7 +15,43 @@ use base64::engine::general_purpose::STANDARD as Base64Engine;
 use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
 use ed25519_dalek::{Keypair, PublicKey, SecretKey, Signer};
+use once_cell::sync::Lazy;
 use serde_json::json;
+
+static ENV_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+fn with_env<T>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> T) -> T {
+    let guard = ENV_GUARD.lock().expect("env guard poisoned");
+    let mut previous = Vec::with_capacity(vars.len());
+    for (key, value) in vars {
+        previous.push(((*key).to_string(), std::env::var(key).ok()));
+        match value {
+            Some(val) => std::env::set_var(key, val),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    let result = catch_unwind(AssertUnwindSafe(f));
+
+    for (key, old) in previous.into_iter() {
+        if let Some(val) = old {
+            std::env::set_var(&key, val);
+        } else {
+            std::env::remove_var(&key);
+        }
+    }
+
+    drop(guard);
+
+    match result {
+        Ok(value) => value,
+        Err(panic) => resume_unwind(panic),
+    }
+}
+
+fn load_libvirt_config(vars: &[(&str, Option<&str>)]) -> LibvirtProvisioningConfig {
+    with_env(vars, || backend::libvirt_provisioning_config_from_env())
+}
 
 fn sample_decision() -> PolicyDecision {
     PolicyDecision {
@@ -43,23 +80,174 @@ fn sample_decision() -> PolicyDecision {
 }
 
 fn sample_config() -> LibvirtProvisioningConfig {
-    LibvirtProvisioningConfig {
-        connection_uri: "test:///default".to_string(),
-        auth: None,
-        default_isolation_tier: Some("coco".to_string()),
-        default_memory_mib: 4096,
-        default_vcpu_count: 4,
-        log_tail: 200,
-        network_template: json!({ "name": "default", "model": "virtio" }),
-        volume_template: json!({
+    let network_json = json!({ "name": "default", "model": "virtio" }).to_string();
+    let volume_json = json!({
+        "path": "/var/lib/libvirt/images/mcp.qcow2",
+        "driver": "qcow2",
+        "target_dev": "vda",
+        "target_bus": "virtio"
+    })
+    .to_string();
+    let gpu_json = json!({ "enabled": false }).to_string();
+    let overrides = vec![
+        ("LIBVIRT_CONNECTION_URI", Some("test:///default")),
+        ("LIBVIRT_DEFAULT_ISOLATION_TIER", Some("coco")),
+        ("LIBVIRT_DEFAULT_MEMORY_MIB", Some("4096")),
+        ("LIBVIRT_DEFAULT_VCPU_COUNT", Some("4")),
+        ("LIBVIRT_LOG_TAIL", Some("200")),
+        ("LIBVIRT_NETWORK_TEMPLATE", Some(network_json.as_str())),
+        ("LIBVIRT_VOLUME_TEMPLATE", Some(volume_json.as_str())),
+        ("LIBVIRT_GPU_POLICY", Some(gpu_json.as_str())),
+        ("LIBVIRT_CONSOLE_SOURCE", Some("pty")),
+        ("LIBVIRT_USERNAME", None),
+        ("LIBVIRT_PASSWORD", None),
+        ("LIBVIRT_PASSWORD_FILE", None),
+    ];
+    load_libvirt_config(&overrides)
+}
+
+#[tokio::test]
+async fn libvirt_provisioner_respects_log_tail_limits() {
+    let overrides = vec![
+        ("LIBVIRT_CONNECTION_URI", Some("test:///default")),
+        ("LIBVIRT_LOG_TAIL", Some("1")),
+        ("LIBVIRT_USERNAME", None),
+        ("LIBVIRT_PASSWORD", None),
+        ("LIBVIRT_PASSWORD_FILE", None),
+    ];
+    let config = load_libvirt_config(&overrides);
+    let driver = Arc::new(InMemoryLibvirtDriver::new());
+    let provisioner = LibvirtVmProvisioner::new(driver, config);
+    let decision = sample_decision();
+
+    let provisioning = provisioner
+        .provision(21, &decision, None)
+        .await
+        .expect("provisioning should succeed");
+
+    provisioner
+        .start(&provisioning.instance_id)
+        .await
+        .expect("start should succeed");
+    provisioner
+        .stop(&provisioning.instance_id)
+        .await
+        .expect("stop should succeed");
+
+    let logs = provisioner
+        .fetch_logs(&provisioning.instance_id)
+        .await
+        .expect("logs should be available");
+    assert_eq!(logs.trim(), "vm-stopped");
+
+    let mut stream = provisioner
+        .stream_logs(&provisioning.instance_id)
+        .await
+        .expect("stream creation should succeed")
+        .expect("stream should be present");
+    let first = stream.recv().await.expect("first log line present");
+    assert_eq!(first, "vm-started");
+}
+
+#[test]
+fn libvirt_config_defaults_apply() {
+    let overrides = vec![
+        ("LIBVIRT_CONNECTION_URI", Some("test:///minimal")),
+        ("LIBVIRT_USERNAME", None),
+        ("LIBVIRT_PASSWORD", None),
+        ("LIBVIRT_PASSWORD_FILE", None),
+        ("LIBVIRT_DEFAULT_ISOLATION_TIER", None),
+        ("LIBVIRT_DEFAULT_MEMORY_MIB", None),
+        ("LIBVIRT_DEFAULT_VCPU_COUNT", None),
+        ("LIBVIRT_LOG_TAIL", None),
+        ("LIBVIRT_NETWORK_TEMPLATE", None),
+        ("LIBVIRT_VOLUME_TEMPLATE", None),
+        ("LIBVIRT_GPU_POLICY", None),
+        ("LIBVIRT_CONSOLE_SOURCE", None),
+    ];
+    let config = load_libvirt_config(&overrides);
+
+    assert_eq!(config.connection_uri, "test:///minimal");
+    assert!(config.auth.is_none());
+    assert!(config.default_isolation_tier.is_none());
+    assert_eq!(config.default_memory_mib, 4096);
+    assert_eq!(config.default_vcpu_count, 4);
+    assert_eq!(config.log_tail, *backend::VM_LOG_TAIL_LINES);
+    assert_eq!(
+        config.network_template,
+        json!({ "name": "default", "model": "virtio" })
+    );
+    assert_eq!(
+        config.volume_template,
+        json!({
             "path": "/var/lib/libvirt/images/mcp.qcow2",
             "driver": "qcow2",
             "target_dev": "vda",
             "target_bus": "virtio"
-        }),
-        gpu_passthrough_policy: json!({ "enabled": false }),
-        console_source: Some("pty".to_string()),
-    }
+        })
+    );
+    assert_eq!(config.gpu_passthrough_policy, json!({ "enabled": false }));
+    assert!(config.console_source.is_none());
+}
+
+#[test]
+fn libvirt_config_overrides_apply() {
+    let network_json = json!({ "name": "isolated", "model": "virtio" }).to_string();
+    let volume_json = json!({
+        "path": "/var/lib/libvirt/images/custom.qcow2",
+        "driver": "qcow2",
+        "target_dev": "vdb",
+        "target_bus": "virtio"
+    })
+    .to_string();
+    let gpu_json = json!({
+        "enabled": true,
+        "devices": [{
+            "domain": "0x0000",
+            "bus": "0x65",
+            "slot": "0x00",
+            "function": "0x0"
+        }]
+    })
+    .to_string();
+    let overrides = vec![
+        ("LIBVIRT_CONNECTION_URI", Some("qemu+ssh://libvirt/system")),
+        ("LIBVIRT_USERNAME", Some("operator")),
+        ("LIBVIRT_PASSWORD", Some("secret-token")),
+        ("LIBVIRT_PASSWORD_FILE", None),
+        ("LIBVIRT_DEFAULT_ISOLATION_TIER", Some("sev")),
+        ("LIBVIRT_DEFAULT_MEMORY_MIB", Some("8192")),
+        ("LIBVIRT_DEFAULT_VCPU_COUNT", Some("6")),
+        ("LIBVIRT_LOG_TAIL", Some("42")),
+        ("LIBVIRT_NETWORK_TEMPLATE", Some(network_json.as_str())),
+        ("LIBVIRT_VOLUME_TEMPLATE", Some(volume_json.as_str())),
+        ("LIBVIRT_GPU_POLICY", Some(gpu_json.as_str())),
+        ("LIBVIRT_CONSOLE_SOURCE", Some("serial")),
+    ];
+    let config = load_libvirt_config(&overrides);
+
+    assert_eq!(config.connection_uri, "qemu+ssh://libvirt/system");
+    let auth = config.auth.expect("auth should be configured");
+    assert_eq!(auth.username.as_deref(), Some("operator"));
+    assert_eq!(auth.password.as_deref(), Some("secret-token"));
+    assert_eq!(config.default_isolation_tier.as_deref(), Some("sev"));
+    assert_eq!(config.default_memory_mib, 8192);
+    assert_eq!(config.default_vcpu_count, 6);
+    assert_eq!(config.log_tail, 42);
+    assert_eq!(
+        config.network_template,
+        serde_json::from_str::<serde_json::Value>(&network_json)
+            .expect("network json should parse")
+    );
+    assert_eq!(
+        config.volume_template,
+        serde_json::from_str::<serde_json::Value>(&volume_json).expect("volume json should parse")
+    );
+    assert_eq!(
+        config.gpu_passthrough_policy,
+        serde_json::from_str::<serde_json::Value>(&gpu_json).expect("gpu json should parse")
+    );
+    assert_eq!(config.console_source.as_deref(), Some("serial"));
 }
 
 #[tokio::test]

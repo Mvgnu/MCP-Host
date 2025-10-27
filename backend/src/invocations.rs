@@ -1,8 +1,11 @@
-use axum::{extract::{Extension, Path}, Json};
+use crate::error::{AppError, AppResult};
+use crate::extractor::AuthUser;
+use axum::{
+    extract::{Extension, Path},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
-use crate::extractor::AuthUser;
-use crate::error::{AppError, AppResult};
 
 #[derive(Serialize)]
 pub struct InvocationTrace {
@@ -22,19 +25,24 @@ pub async fn list_invocations(
         .bind(user_id)
         .fetch_optional(&pool)
         .await?;
-    if rec.is_none() { return Err(AppError::NotFound); }
+    if rec.is_none() {
+        return Err(AppError::NotFound);
+    }
     let rows = sqlx::query(
         "SELECT id, input_json, output_text, created_at FROM invocation_traces WHERE server_id = $1 ORDER BY id DESC LIMIT 50"
     )
     .bind(server_id)
     .fetch_all(&pool)
     .await?;
-    let traces = rows.into_iter().map(|r| InvocationTrace {
-        id: r.get("id"),
-        input_json: r.get("input_json"),
-        output_text: r.get("output_text"),
-        created_at: r.get("created_at"),
-    }).collect();
+    let traces = rows
+        .into_iter()
+        .map(|r| InvocationTrace {
+            id: r.get("id"),
+            input_json: r.get("input_json"),
+            output_text: r.get("output_text"),
+            created_at: r.get("created_at"),
+        })
+        .collect();
     Ok(Json(traces))
 }
 

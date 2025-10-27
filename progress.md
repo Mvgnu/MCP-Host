@@ -2,6 +2,14 @@
 
 This document tracks development progress and high level notes from the planning materials in `README.md`.
 
+## 2025-11-18
+- Hydrated libvirt executor configuration from environment variables covering credentials, isolation defaults, memory/vCPU sizing, templates, GPU policy, and console preferences.
+- Added a runtime provisioner driver switch that selects the libvirt executor when enabled, persisting sanitized hypervisor snapshots and attestation hints for downstream consumers.
+- Expanded VM integration tests with environment-driven fixtures plus log tail assertions, and documented libvirt deployment prerequisites and runbooks.
+
+### Next Steps
+- Surface libvirt hypervisor metadata and attestation hints in operator tooling for remediation workflows.
+
 ## 2025-11-16
 - Runtime policy engine now reads persisted VM attestation records when selecting executors, emitting decision notes for status, timestamps, and teardown metadata.
 - Policy evaluation automatically falls back to Docker when the latest attestation is marked untrusted and flags stale pending evidence for remediation scheduling.
@@ -731,3 +739,8 @@ This document tracks development progress and high level notes from the planning
 - Added chrono-backed tests covering fresh, invalid, and expired bearer tokens so CLI and REST consumers inherit the stricter authentication posture without regressions.
 - Wired runtime policy decisions and VM attestation outcomes into a `/api/policy/stream` SSE feed and delivered `mcpctl policy watch` to colorize backend shifts, fallback triggers, and stale evidence from the terminal.
 - Followed up by fixing the SSE stream filter to return awaited futures, restored the Axum handler signature, and expanded CLI rendering/tests so attestation posture and active-instance summaries stream without breaking the build.
+
+## 2025-11-18
+- Reintroduced the HTTP hypervisor executor with hypervisor snapshot exports so `VM_PROVISIONER_DRIVER=http` remains functional alongside libvirt.
+- Patched runtime VM unit tests to account for the new hypervisor snapshot argument and removed duplicate libvirt configuration cases in `tests/vm.rs`.
+- Ran `cargo test` from `backend/` to ensure the restored HTTP driver and updated tests pass under the expanded configuration matrix.

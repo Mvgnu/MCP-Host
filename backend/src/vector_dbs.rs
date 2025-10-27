@@ -1,7 +1,11 @@
-use crate::extractor::AuthUser;
 use crate::docker;
-use axum::{extract::{Extension, Path}, Json, http::StatusCode};
-use serde::{Serialize, Deserialize};
+use crate::extractor::AuthUser;
+use axum::{
+    extract::{Extension, Path},
+    http::StatusCode,
+    Json,
+};
+use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use tracing::error;
 
@@ -21,14 +25,16 @@ pub struct CreateVectorDb {
     pub db_type: String,
 }
 
-fn default_db_type() -> String { "chroma".into() }
+fn default_db_type() -> String {
+    "chroma".into()
+}
 
 pub async fn list_vector_dbs(
     Extension(pool): Extension<PgPool>,
     AuthUser { user_id, .. }: AuthUser,
 ) -> Result<Json<Vec<VectorDb>>, (StatusCode, String)> {
     let rows = sqlx::query(
-        "SELECT id, name, db_type, url, created_at FROM vector_dbs WHERE owner_id = $1 ORDER BY id"
+        "SELECT id, name, db_type, url, created_at FROM vector_dbs WHERE owner_id = $1 ORDER BY id",
     )
     .bind(user_id)
     .fetch_all(&pool)
@@ -37,13 +43,16 @@ pub async fn list_vector_dbs(
         error!(?e, "DB error listing vector dbs");
         (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
     })?;
-    let list = rows.into_iter().map(|r| VectorDb{
-        id: r.get("id"),
-        name: r.get("name"),
-        db_type: r.get("db_type"),
-        url: r.try_get("url").ok(),
-        created_at: r.get("created_at"),
-    }).collect();
+    let list = rows
+        .into_iter()
+        .map(|r| VectorDb {
+            id: r.get("id"),
+            name: r.get("name"),
+            db_type: r.get("db_type"),
+            url: r.try_get("url").ok(),
+            created_at: r.get("created_at"),
+        })
+        .collect();
     Ok(Json(list))
 }
 
@@ -67,7 +76,13 @@ pub async fn create_vector_db(
     let id: i32 = rec.get("id");
     let created_at: chrono::DateTime<chrono::Utc> = rec.get("created_at");
     docker::spawn_vector_db_task(id, payload.db_type.clone(), pool.clone());
-    Ok(Json(VectorDb { id, name: payload.name, db_type: payload.db_type, url: None, created_at }))
+    Ok(Json(VectorDb {
+        id,
+        name: payload.name,
+        db_type: payload.db_type,
+        url: None,
+        created_at,
+    }))
 }
 
 pub async fn delete_vector_db(
@@ -84,7 +99,7 @@ pub async fn delete_vector_db(
             (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
         })?;
     match rec {
-        Some(r) if r.get::<i32,_>("owner_id") == user_id => {},
+        Some(r) if r.get::<i32, _>("owner_id") == user_id => {}
         _ => return Err((StatusCode::NOT_FOUND, "Vector DB not found".into())),
     }
     docker::delete_vector_db_task(id, pool.clone());

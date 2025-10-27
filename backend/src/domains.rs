@@ -4,9 +4,9 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use tracing::error;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
+use tracing::error;
 
 #[derive(Serialize)]
 pub struct Domain {
@@ -79,17 +79,15 @@ pub async fn create_domain(
     if rec.is_none() {
         return Err((StatusCode::NOT_FOUND, "Server not found".into()));
     }
-    sqlx::query(
-        "INSERT INTO custom_domains (server_id, domain) VALUES ($1, $2)",
-    )
-    .bind(server_id)
-    .bind(&payload.domain)
-    .execute(&pool)
-    .await
-    .map_err(|e| {
-        error!(?e, "DB error inserting domain");
-        (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
-    })?;
+    sqlx::query("INSERT INTO custom_domains (server_id, domain) VALUES ($1, $2)")
+        .bind(server_id)
+        .bind(&payload.domain)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            error!(?e, "DB error inserting domain");
+            (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
+        })?;
     proxy::rebuild_for_server(&pool, server_id).await;
     Ok(StatusCode::CREATED)
 }
@@ -111,17 +109,15 @@ pub async fn delete_domain(
     if rec.is_none() {
         return Err((StatusCode::NOT_FOUND, "Server not found".into()));
     }
-    let result = sqlx::query(
-        "DELETE FROM custom_domains WHERE id = $1 AND server_id = $2",
-    )
-    .bind(domain_id)
-    .bind(server_id)
-    .execute(&pool)
-    .await
-    .map_err(|e| {
-        error!(?e, "DB error deleting domain");
-        (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
-    })?;
+    let result = sqlx::query("DELETE FROM custom_domains WHERE id = $1 AND server_id = $2")
+        .bind(domain_id)
+        .bind(server_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            error!(?e, "DB error deleting domain");
+            (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
+        })?;
     if result.rows_affected() == 0 {
         return Err((StatusCode::NOT_FOUND, "Domain not found".into()));
     }

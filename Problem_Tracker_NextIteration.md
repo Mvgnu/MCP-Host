@@ -164,3 +164,12 @@
     - 2025-11-17 12:00:00 UTC: Planned SSE channel + CLI renderer after reviewing runtime policy evaluation and VM executor attestation hooks.
     - 2025-11-17 14:45:00 UTC: Shipped `/api/policy/stream`, colored CLI diff rendering, regression tests, and README updates so operators can monitor trust posture live.
     - 2025-11-17 16:20:00 UTC: Repaired backend compile errors from async SSE filter usage, restored Axum handler compatibility, and tightened CLI streaming output/tests to cover attestation summaries.
+
+- ID: BE-RUNTIME-012
+  Status: DONE
+  Task: Finish libvirt executor wiring and configuration.
+  Hypothesis: Hydrating libvirt provisioning config from env, wiring runtime selection, persisting metadata, and extending tests/docs will graduate the executor from scaffolding to production readiness.
+  Log:
+    - 2025-11-18 09:00:00 UTC: Initiated integration work after confirming runtime main.rs still instantiates the HTTP hypervisor provisioner and config lacks libvirt plumbing.
+    - 2025-11-18 12:40:00 UTC: Wired libvirt provisioner selection, configuration loader, DB persistence, and tests; documented deployment runbook and console troubleshooting.
+    - 2025-11-18 15:45:00 UTC: Restored the HTTP executor implementation, captured hypervisor snapshots for the legacy driver, resolved runtime VM test failures, and validated the stack with `cargo test`.

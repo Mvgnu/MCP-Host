@@ -1,6 +1,6 @@
 use reqwest::Client;
-use std::time::Duration;
 use serde_json::Value;
+use std::time::Duration;
 
 pub struct VaultClient {
     base: String,
@@ -26,7 +26,12 @@ impl VaultClient {
         }
     }
 
-    async fn request(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value, reqwest::Error> {
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, reqwest::Error> {
         let url = format!("{}/v1/{}", self.base, path);
         let mut req = self
             .client
@@ -55,7 +60,10 @@ impl VaultClient {
 
     pub async fn read_secret(&self, path: &str) -> Result<String, reqwest::Error> {
         let val = self.request(reqwest::Method::GET, path, None).await?;
-        Ok(val["data"]["data"]["value"].as_str().unwrap_or("").to_string())
+        Ok(val["data"]["data"]["value"]
+            .as_str()
+            .unwrap_or("")
+            .to_string())
     }
 
     pub async fn delete_secret(&self, path: &str) -> Result<(), reqwest::Error> {
@@ -71,4 +79,3 @@ trait Clear {
 impl Clear for Value {
     fn clear(self) {}
 }
-

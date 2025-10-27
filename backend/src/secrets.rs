@@ -5,9 +5,9 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use tracing::error;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
+use tracing::error;
 
 #[derive(Serialize)]
 pub struct SecretInfo {
@@ -99,18 +99,16 @@ pub async fn create_secret(
                 error!(?e, "Vault error storing secret");
                 (StatusCode::INTERNAL_SERVER_ERROR, "Vault error".into())
             })?;
-        sqlx::query(
-            "INSERT INTO server_secrets (server_id, name, value) VALUES ($1, $2, $3)",
-        )
-        .bind(server_id)
-        .bind(&payload.name)
-        .bind(format!("vault:{}", path))
-        .execute(&pool)
-        .await
-        .map_err(|e| {
-            error!(?e, "DB error inserting secret path");
-            (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
-        })?;
+        sqlx::query("INSERT INTO server_secrets (server_id, name, value) VALUES ($1, $2, $3)")
+            .bind(server_id)
+            .bind(&payload.name)
+            .bind(format!("vault:{}", path))
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!(?e, "DB error inserting secret path");
+                (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
+            })?;
     } else {
         let key = encryption_key();
         sqlx::query(
@@ -147,17 +145,16 @@ pub async fn get_secret(
     if rec.is_none() {
         return Err((StatusCode::NOT_FOUND, "Server not found".into()));
     }
-    let row = sqlx::query(
-        "SELECT name, value FROM server_secrets WHERE id = $1 AND server_id = $2",
-    )
-    .bind(secret_id)
-    .bind(server_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!(?e, "DB error fetching secret");
-        (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
-    })?;
+    let row =
+        sqlx::query("SELECT name, value FROM server_secrets WHERE id = $1 AND server_id = $2")
+            .bind(secret_id)
+            .bind(server_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| {
+                error!(?e, "DB error fetching secret");
+                (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
+            })?;
     if let Some(r) = row {
         let name: String = r.get("name");
         let value: String = r.get("value");
@@ -169,21 +166,22 @@ pub async fn get_secret(
                 })?;
                 Ok(Json(CreateSecret { name, value: val }))
             } else {
-                Err((StatusCode::INTERNAL_SERVER_ERROR, "Vault not configured".into()))
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Vault not configured".into(),
+                ))
             }
         } else {
             let key = encryption_key();
-            let row = sqlx::query(
-                "SELECT pgp_sym_decrypt($1::bytea, $2) as value",
-            )
-            .bind(value)
-            .bind(&key)
-            .fetch_one(&pool)
-            .await
-            .map_err(|e| {
-                error!(?e, "DB error decrypting secret");
-                (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
-            })?;
+            let row = sqlx::query("SELECT pgp_sym_decrypt($1::bytea, $2) as value")
+                .bind(value)
+                .bind(&key)
+                .fetch_one(&pool)
+                .await
+                .map_err(|e| {
+                    error!(?e, "DB error decrypting secret");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
+                })?;
             let val: String = row.get("value");
             Ok(Json(CreateSecret { name, value: val }))
         }
@@ -210,27 +208,33 @@ pub async fn update_secret(
     if rec.is_none() {
         return Err((StatusCode::NOT_FOUND, "Server not found".into()));
     }
-    let row = sqlx::query(
-        "SELECT value FROM server_secrets WHERE id = $1 AND server_id = $2",
-    )
-    .bind(secret_id)
-    .bind(server_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!(?e, "DB error fetching secret");
-        (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
-    })?;
-    let Some(r) = row else { return Err((StatusCode::NOT_FOUND, "Secret not found".into())); };
+    let row = sqlx::query("SELECT value FROM server_secrets WHERE id = $1 AND server_id = $2")
+        .bind(secret_id)
+        .bind(server_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| {
+            error!(?e, "DB error fetching secret");
+            (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
+        })?;
+    let Some(r) = row else {
+        return Err((StatusCode::NOT_FOUND, "Secret not found".into()));
+    };
     let stored: String = r.get("value");
     if let Some(path) = stored.strip_prefix("vault:") {
         if let Some(vault) = VaultClient::from_env() {
-            vault.store_secret(path, &payload.value).await.map_err(|e| {
-                error!(?e, "Vault error updating secret");
-                (StatusCode::INTERNAL_SERVER_ERROR, "Vault error".into())
-            })?;
+            vault
+                .store_secret(path, &payload.value)
+                .await
+                .map_err(|e| {
+                    error!(?e, "Vault error updating secret");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Vault error".into())
+                })?;
         } else {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, "Vault not configured".into()));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Vault not configured".into(),
+            ));
         }
     } else {
         let key = encryption_key();
@@ -271,18 +275,18 @@ pub async fn delete_secret(
     if rec.is_none() {
         return Err((StatusCode::NOT_FOUND, "Server not found".into()));
     }
-    let row = sqlx::query(
-        "SELECT value FROM server_secrets WHERE id = $1 AND server_id = $2",
-    )
-    .bind(secret_id)
-    .bind(server_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!(?e, "DB error fetching secret");
-        (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
-    })?;
-    let Some(r) = row else { return Err((StatusCode::NOT_FOUND, "Secret not found".into())); };
+    let row = sqlx::query("SELECT value FROM server_secrets WHERE id = $1 AND server_id = $2")
+        .bind(secret_id)
+        .bind(server_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| {
+            error!(?e, "DB error fetching secret");
+            (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
+        })?;
+    let Some(r) = row else {
+        return Err((StatusCode::NOT_FOUND, "Secret not found".into()));
+    };
     let stored: String = r.get("value");
     if let Some(path) = stored.strip_prefix("vault:") {
         if let Some(vault) = VaultClient::from_env() {
@@ -291,20 +295,21 @@ pub async fn delete_secret(
                 (StatusCode::INTERNAL_SERVER_ERROR, "Vault error".into())
             })?;
         } else {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, "Vault not configured".into()));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Vault not configured".into(),
+            ));
         }
     }
-    let result = sqlx::query(
-        "DELETE FROM server_secrets WHERE id = $1 AND server_id = $2",
-    )
-    .bind(secret_id)
-    .bind(server_id)
-    .execute(&pool)
-    .await
-    .map_err(|e| {
-        error!(?e, "DB error deleting secret");
-        (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
-    })?;
+    let result = sqlx::query("DELETE FROM server_secrets WHERE id = $1 AND server_id = $2")
+        .bind(secret_id)
+        .bind(server_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            error!(?e, "DB error deleting secret");
+            (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
+        })?;
     if result.rows_affected() == 0 {
         return Err((StatusCode::NOT_FOUND, "Secret not found".into()));
     }

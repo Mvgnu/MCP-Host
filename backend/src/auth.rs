@@ -1,3 +1,4 @@
+use crate::error::{AppError, AppResult};
 use crate::extractor::AuthUser;
 use argon2::password_hash::{PasswordHash, SaltString};
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
@@ -6,13 +7,12 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use tracing::error;
-use crate::error::{AppError, AppResult};
 use chrono::{Duration, Utc};
 use jsonwebtoken::{encode, EncodingKey, Header};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
+use tracing::error;
 
 #[derive(Deserialize)]
 pub struct RegisterRequest {
@@ -87,11 +87,10 @@ pub async fn login_user(
     let id: i32 = rec.get("id");
     let pass_hash: String = rec.get("password_hash");
     let role: String = rec.get("role");
-    let parsed = PasswordHash::new(&pass_hash)
-        .map_err(|e| {
-            error!(?e, "Hash parse error");
-            AppError::Message(format!("Hash error: {}", e))
-        })?;
+    let parsed = PasswordHash::new(&pass_hash).map_err(|e| {
+        error!(?e, "Hash parse error");
+        AppError::Message(format!("Hash error: {}", e))
+    })?;
     if Argon2::default()
         .verify_password(payload.password.as_bytes(), &parsed)
         .is_err()
@@ -102,7 +101,11 @@ pub async fn login_user(
         .checked_add_signed(Duration::hours(24))
         .expect("valid timestamp")
         .timestamp() as usize;
-    let claims = Claims { sub: id, role: role.clone(), exp };
+    let claims = Claims {
+        sub: id,
+        role: role.clone(),
+        exp,
+    };
     let secret = crate::config::JWT_SECRET.as_str();
     let token = encode(
         &Header::default(),
@@ -151,5 +154,10 @@ pub async fn current_user(
     };
     let email: String = row.get("email");
     let quota: i32 = row.get("server_quota");
-    Ok(Json(UserInfo { id: user_id, email, role, server_quota: quota }))
+    Ok(Json(UserInfo {
+        id: user_id,
+        email,
+        role,
+        server_quota: quota,
+    }))
 }
