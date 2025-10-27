@@ -68,6 +68,67 @@ def install_policy(subparsers: _SubParsersAction[ArgumentParser]) -> None:
     _add_common_arguments(watch_parser)
 
 
+def install_trust(subparsers: _SubParsersAction[ArgumentParser]) -> None:
+    parser = subparsers.add_parser("trust", help="Trust registry control plane")
+    trust_sub = parser.add_subparsers(dest="trust_cmd", required=True)
+
+    registry_parser = trust_sub.add_parser(
+        "registry", help="List runtime VM trust registry entries",
+    )
+    registry_parser.add_argument("--server-id", type=int, dest="server_id")
+    registry_parser.add_argument("--lifecycle", dest="lifecycle_state")
+    registry_parser.add_argument("--status", dest="attestation_status")
+    stale_group = registry_parser.add_mutually_exclusive_group()
+    stale_group.add_argument("--stale", dest="stale", action="store_true")
+    stale_group.add_argument("--fresh", dest="stale", action="store_false")
+    registry_parser.set_defaults(stale=None)
+    registry_parser.set_defaults(handler=_trust_registry)
+    _add_common_arguments(registry_parser)
+
+    get_parser = trust_sub.add_parser(
+        "get", help="Fetch trust registry state for a VM instance",
+    )
+    get_parser.add_argument("vm_instance_id", type=int)
+    get_parser.set_defaults(handler=_trust_get)
+    _add_common_arguments(get_parser)
+
+    history_parser = trust_sub.add_parser(
+        "history", help="Show lifecycle history for a VM instance",
+    )
+    history_parser.add_argument("vm_instance_id", type=int)
+    history_parser.add_argument("--limit", type=int, default=25)
+    history_parser.set_defaults(handler=_trust_history)
+    _add_common_arguments(history_parser)
+
+    transition_parser = trust_sub.add_parser(
+        "transition", help="Apply a registry transition for a VM instance",
+    )
+    transition_parser.add_argument("vm_instance_id", type=int)
+    transition_parser.add_argument("--status", dest="attestation_status", required=True)
+    transition_parser.add_argument("--lifecycle", dest="lifecycle_state", required=True)
+    transition_parser.add_argument("--remediation-state", dest="remediation_state")
+    transition_parser.add_argument(
+        "--remediation-attempts", dest="remediation_attempts", type=int
+    )
+    transition_parser.add_argument("--freshness-deadline", dest="freshness_deadline")
+    transition_parser.add_argument("--provenance-ref", dest="provenance_ref")
+    transition_parser.add_argument("--provenance", dest="provenance")
+    transition_parser.add_argument("--metadata", dest="metadata")
+    transition_parser.add_argument("--reason", dest="transition_reason")
+    transition_parser.add_argument("--expected-version", dest="expected_version", type=int)
+    transition_parser.set_defaults(handler=_trust_transition)
+    _add_common_arguments(transition_parser)
+
+    watch_parser = trust_sub.add_parser(
+        "watch", help="Stream live trust registry transitions",
+    )
+    watch_parser.add_argument("--server-id", type=int, dest="server_id")
+    watch_parser.add_argument("--lifecycle", dest="lifecycle_state")
+    watch_parser.add_argument("--status", dest="attestation_status")
+    watch_parser.set_defaults(handler=_trust_watch)
+    _add_common_arguments(watch_parser)
+
+
 def install_promotions(subparsers: _SubParsersAction[ArgumentParser]) -> None:
     parser = subparsers.add_parser("promotions", help="Promotion workflow commands")
     promotions_sub = parser.add_subparsers(dest="promotions_cmd", required=True)
@@ -633,5 +694,235 @@ def _colorize_status(status: str, use_color: bool) -> str:
     }
     color = mapping.get(normalized, _CYAN)
     return f"{color}{normalized}{_RESET}"
+
+
+def _trust_registry(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
+    params: Dict[str, Any] = {}
+    server_id = args.get("server_id")
+    if server_id is not None:
+        params["server_id"] = server_id
+    lifecycle = args.get("lifecycle_state")
+    if lifecycle:
+        params["lifecycle_state"] = lifecycle
+    status = args.get("attestation_status")
+    if status:
+        params["attestation_status"] = status
+    stale = args.get("stale")
+    if stale is not None:
+        params["stale"] = "true" if stale else "false"
+
+    entries = client.get("/api/trust/registry", params=params or None)
+    if as_json:
+        print(dumps_json(entries))
+        return
+
+    if not entries:
+        print("No trust registry entries found")
+        return
+
+    columns = [
+        "server",
+        "instance",
+        "status",
+        "lifecycle",
+        "remediation",
+        "attempts",
+        "stale",
+        "updated",
+    ]
+    rows: list[Dict[str, Any]] = []
+    for entry in entries:
+        server = entry.get("server_name") or "unknown"
+        server_id_val = entry.get("server_id")
+        rows.append(
+            {
+                "server": f"{server} ({server_id_val})",
+                "instance": entry.get("instance_id"),
+                "status": entry.get("attestation_status"),
+                "lifecycle": entry.get("lifecycle_state"),
+                "remediation": entry.get("remediation_state") or "-",
+                "attempts": entry.get("remediation_attempts"),
+                "stale": "yes" if entry.get("stale") else "",
+                "updated": entry.get("updated_at"),
+            }
+        )
+
+    print(render_table(rows, columns))
+
+
+def _trust_get(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
+    instance_id = args["vm_instance_id"]
+    state = client.get(f"/api/trust/registry/{instance_id}")
+    if as_json:
+        print(dumps_json(state))
+        return
+
+    server_name = state.get("server_name") or "unknown"
+    print(f"Server: {server_name} ({state.get('server_id')})")
+    print(f"VM Instance: {state.get('instance_id')} ({state.get('vm_instance_id')})")
+    print(f"Attestation: {state.get('attestation_status')}")
+    print(f"Lifecycle: {state.get('lifecycle_state')}")
+    remediation_state = state.get("remediation_state") or "-"
+    print(f"Remediation: {remediation_state} (attempts {state.get('remediation_attempts')})")
+    freshness = state.get("freshness_deadline") or "unset"
+    print(f"Freshness deadline: {freshness}")
+    print(f"Provenance ref: {state.get('provenance_ref') or '-'}")
+    print(f"Version: {state.get('version')} (updated {state.get('updated_at')})")
+
+
+def _trust_history(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
+    instance_id = args["vm_instance_id"]
+    params: Dict[str, Any] = {}
+    limit = args.get("limit")
+    if limit:
+        params["limit"] = limit
+    history = client.get(
+        f"/api/trust/registry/{instance_id}/history", params=params or None
+    )
+    if as_json:
+        print(dumps_json(history))
+        return
+
+    print(
+        f"Server {history.get('server_name')} ({history.get('server_id')})"
+        f" instance {history.get('instance_id')}"
+    )
+    events = history.get("events", [])
+    if not events:
+        print("No trust transitions recorded")
+        return
+
+    columns = ["triggered", "status", "lifecycle", "remediation", "attempts", "reason"]
+    rows = []
+    for event in events:
+        rows.append(
+            {
+                "triggered": event.get("triggered_at"),
+                "status": event.get("current_status"),
+                "lifecycle": event.get("current_lifecycle_state"),
+                "remediation": event.get("remediation_state") or "-",
+                "attempts": event.get("remediation_attempts"),
+                "reason": event.get("transition_reason") or "-",
+            }
+        )
+
+    print(render_table(rows, columns))
+
+
+def _trust_transition(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
+    instance_id = args["vm_instance_id"]
+    payload: Dict[str, Any] = {
+        "attestation_status": args["attestation_status"],
+        "lifecycle_state": args["lifecycle_state"],
+    }
+    if args.get("remediation_state"):
+        payload["remediation_state"] = args["remediation_state"]
+    if args.get("remediation_attempts") is not None:
+        payload["remediation_attempts"] = args["remediation_attempts"]
+    if args.get("freshness_deadline"):
+        payload["freshness_deadline"] = args["freshness_deadline"]
+    if args.get("provenance_ref"):
+        payload["provenance_ref"] = args["provenance_ref"]
+    if args.get("transition_reason"):
+        payload["transition_reason"] = args["transition_reason"]
+    if args.get("expected_version") is not None:
+        payload["expected_version"] = args["expected_version"]
+
+    for field in ("provenance", "metadata"):
+        value = args.get(field)
+        if value:
+            try:
+                payload[field] = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON for --{field.replace('_', '-')}: {exc}")
+
+    result = client.post(
+        f"/api/trust/registry/{instance_id}/transition", json_body=payload
+    )
+    if as_json:
+        print(dumps_json(result))
+        return
+
+    print("Transition applied")
+    _trust_get(client, False, {"vm_instance_id": instance_id, "json": False})
+
+
+def _trust_watch(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
+    params: Dict[str, Any] = {}
+    for key in ("server_id", "lifecycle_state", "attestation_status"):
+        value = args.get(key)
+        if value:
+            params[key] = value
+
+    try:
+        for payload in client.stream_sse(
+            "/api/trust/registry/stream", params=params or None
+        ):
+            if not payload:
+                continue
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError:
+                if as_json:
+                    print(payload)
+                continue
+
+            if as_json:
+                print(dumps_json(event))
+                continue
+
+            rendered = _render_trust_event(event)
+            if rendered:
+                print(rendered)
+    except KeyboardInterrupt:  # pragma: no cover - user initiated
+        pass
+
+
+def _render_trust_event(event: Dict[str, Any]) -> str:
+    server_id = event.get("server_id")
+    vm_instance_id = event.get("vm_instance_id")
+    if not isinstance(server_id, int) or not isinstance(vm_instance_id, int):
+        return ""
+
+    triggered = event.get("triggered_at") or "unknown"
+    server_name = (event.get("server_name") or "").strip()
+    status = event.get("attestation_status") or "unknown"
+    previous_status = event.get("previous_attestation_status") or "-"
+    lifecycle = event.get("lifecycle_state") or "-"
+    previous_lifecycle = event.get("previous_lifecycle_state") or "-"
+    remediation_state = event.get("remediation_state") or "-"
+    attempts = event.get("remediation_attempts")
+    attempts_text = attempts if isinstance(attempts, int) and attempts >= 0 else "-"
+    freshness_deadline = event.get("freshness_deadline")
+    stale_flag = bool(event.get("stale"))
+    freshness_state = "stale" if stale_flag else "fresh"
+    if freshness_deadline:
+        freshness_state = f"{freshness_state} (deadline {freshness_deadline})"
+    reason = event.get("transition_reason") or "-"
+    provenance_ref = event.get("provenance_ref") or "-"
+    version = event.get("version")
+    version_text = f"v{version}" if isinstance(version, int) else ""
+
+    header = f"[{triggered}] server {server_id}"
+    if server_name:
+        header += f" ({server_name})"
+    header += f" vm {vm_instance_id}"
+
+    segments = [
+        header,
+        f"status {previous_status} -> {status}",
+        f"lifecycle {previous_lifecycle} -> {lifecycle}",
+        f"remediation {remediation_state} (attempts {attempts_text})",
+        f"freshness {freshness_state}",
+    ]
+
+    if provenance_ref != "-":
+        segments.append(f"provenance {provenance_ref}")
+    if reason != "-":
+        segments.append(f"reason {reason}")
+    if version_text:
+        segments.append(version_text)
+
+    return " | ".join(segment.strip() for segment in segments if segment.strip())
 
 

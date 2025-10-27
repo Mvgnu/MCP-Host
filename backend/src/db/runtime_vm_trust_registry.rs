@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::{postgres::PgRow, PgPool, Row};
+use sqlx::{postgres::PgRow, Executor, PgPool, Postgres, Row};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RuntimeVmTrustRegistryState {
@@ -30,10 +30,13 @@ pub struct UpsertRuntimeVmTrustRegistryState<'a> {
     pub expected_version: Option<i64>,
 }
 
-pub async fn get_state(
-    pool: &PgPool,
+pub async fn get_state<'c, E>(
+    executor: E,
     runtime_vm_instance_id: i64,
-) -> Result<Option<RuntimeVmTrustRegistryState>, sqlx::Error> {
+) -> Result<Option<RuntimeVmTrustRegistryState>, sqlx::Error>
+where
+    E: Executor<'c, Database = Postgres>,
+{
     let row = sqlx::query(
         r#"
         SELECT
@@ -52,16 +55,19 @@ pub async fn get_state(
         "#,
     )
     .bind(runtime_vm_instance_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     Ok(row.map(|row| map_row(&row)))
 }
 
-pub async fn upsert_state(
-    pool: &PgPool,
+pub async fn upsert_state<'c, E>(
+    executor: E,
     input: UpsertRuntimeVmTrustRegistryState<'_>,
-) -> Result<RuntimeVmTrustRegistryState, sqlx::Error> {
+) -> Result<RuntimeVmTrustRegistryState, sqlx::Error>
+where
+    E: Executor<'c, Database = Postgres>,
+{
     let expected_version = input.expected_version.unwrap_or(-1);
     let row = sqlx::query(
         r#"
@@ -103,7 +109,7 @@ pub async fn upsert_state(
     .bind(input.provenance_ref)
     .bind(input.provenance)
     .bind(expected_version)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     match row {

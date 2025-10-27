@@ -186,3 +186,24 @@
     - 2025-11-20 15:45:00 UTC: Implemented Postgres notification listener for `runtime_vm_trust_transition`, taught scheduler to react to live posture changes, blocked evaluation retries on untrusted posture, and added SQLx-backed regression tests.
     - 2025-11-21 11:30:00 UTC: Added lifecycle-aware trust registry schema with optimistic locking, updated attestation persistence to populate remediation attempts and provenance, taught scheduler/orchestrator/CLI/API/intelligence layers to surface lifecycle state and remediation context, and enriched SSE payloads for operator workflows.
     - 2025-11-21 16:45:00 UTC: Enabled runtime orchestrator placement gating via the trust registry so quarantined or stale lifecycles block launches, flipping servers into pending remediation/attestation states with detailed tracing notes.
+- ID: BE-TRUST-002
+  Status: IN_PROGRESS
+  Task: Expose trust registry control plane APIs and event mesh.
+  Hypothesis: Shipping authenticated REST endpoints with optimistic concurrency tokens plus broadcast trust lifecycle events will unlock operator tooling, remediation services, and downstream consumers without direct database access.
+  Log:
+    - 2025-11-22 09:05:00 UTC: Scoped registry queries, mutation guardrails, and event streaming requirements after reviewing existing listener implementation.
+    - 2025-11-22 17:45:00 UTC: Documented REST/SSE contracts, added registry filter/unit coverage, and tightened CLI rendering for streamed trust transitions.
+- ID: BE-TRUST-003
+  Status: IN_PROGRESS
+  Task: Extend policy and scheduler layers to preempt placements targeting distrusted infrastructure before queue admission.
+  Hypothesis: Enforcing trust vetoes at submission and queue stages, then preempting queued work towards quarantined assets, will eliminate exposure of untrusted capacity ahead of runtime launch.
+  Log:
+    - 2025-11-22 09:20:00 UTC: Audited runtime orchestrator, job queue submission, and scheduler hooks to identify trust preemption integration points.
+    - 2025-11-22 17:50:00 UTC: Exercised CLI trust registry flows in tests and refined event formatting so operators can parse preemption reasons quickly.
+- ID: BE-TRUST-004
+  Status: IN_PROGRESS
+  Task: Introduce a remediation orchestrator that can launch playbooks and coordinate lifecycle transitions.
+  Hypothesis: Automating remediation execution with registry-backed progress updates and operator approval hooks will unfreeze workloads while preserving auditability.
+  Log:
+    - 2025-11-22 09:35:00 UTC: Outlined remediation playbook schema needs, automation triggers, and override flows aligned with registry lifecycle states.
+    - 2025-11-22 17:55:00 UTC: Captured orchestrator rollout notes in backend docs and highlighted the placeholder automation window for future playbook wiring.

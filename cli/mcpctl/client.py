@@ -145,3 +145,39 @@ class APIClient:
             payload = response.text
         message = payload if isinstance(payload, str) else payload.get("error") or json.dumps(payload)
         raise APIError(response.status_code, message, payload=payload)
+
+    def stream_sse(
+        self,
+        path: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+    ) -> Iterator[str]:
+        url = self._join(path)
+        headers = self._build_headers({"Accept": "text/event-stream"})
+        with self.session.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=self.timeout,
+            stream=True,
+        ) as response:
+            if not 200 <= response.status_code < 300:
+                try:
+                    payload = response.json()
+                except json.JSONDecodeError:
+                    payload = response.text
+                message = (
+                    payload
+                    if isinstance(payload, str)
+                    else payload.get("error") or json.dumps(payload)
+                )
+                raise APIError(response.status_code, message, payload=payload)
+
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if raw_line is None:
+                    continue
+                line = raw_line.strip()
+                if not line or line.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    yield line[5:].strip()

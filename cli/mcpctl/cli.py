@@ -16,6 +16,7 @@ from .commands import (
     install_policy,
     install_promotions,
     install_scaffold,
+    install_trust,
 )
 
 ENV_HOST = "MCP_HOST_URL"
@@ -42,6 +43,7 @@ def build_parser() -> ArgumentParser:
     install_promotions(subparsers)
     install_governance(subparsers)
     install_evaluations(subparsers)
+    install_trust(subparsers)
     install_scaffold(subparsers)
     return parser
 
