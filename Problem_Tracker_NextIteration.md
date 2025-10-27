@@ -125,8 +125,9 @@
     - 2025-11-09 09:20:00 UTC: Wrapped workflow creation and run seeding in DB transactions to ensure atomic governance state initialization.
 
 - ID: BE-INTEL-001
-  Status: PENDING
+  Status: DONE
   Task: Layer anomaly scoring on the artifact ledger to influence policy thresholds.
   Hypothesis: Highlighting build latency spikes, credential churn, or missing architectures via scoring will let policy dynamically adjust promotions and evaluation requirements.
   Log:
     - 2025-11-05 11:18:00 UTC: Added backlog entry to explore rule-based or learned scoring feeding into runtime policy decisions.
+    - 2025-11-10 09:45:00 UTC: Implemented capability intelligence schema, recomputation workers, policy gating, REST/CLI surfacing, and regression tests validating degraded scores trigger visibility.

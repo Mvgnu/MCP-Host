@@ -11,6 +11,8 @@ use tokio::sync::RwLock;
 
 use crate::evaluations::{self, CertificationStatus};
 use crate::governance::GovernanceEngine;
+use crate::intelligence::{self, IntelligenceError, IntelligenceStatus, RecomputeContext};
+use crate::job_queue;
 use crate::marketplace::{classify_tier, derive_health, MarketplacePlatform};
 
 // key: runtime-policy -> placement-decisions,marketplace-health
@@ -185,6 +187,8 @@ impl RuntimePolicyEngine {
             .evaluate(pool, server_id, server_type, config, use_gpu)
             .await?;
         let decision_id = self.record_decision(pool, server_id, &decision).await?;
+
+        job_queue::enqueue_intelligence_refresh(pool, server_id).await;
 
         if let Some(run_id) = decision.governance_run_id {
             if let Some(engine) = self.governance.read().await.clone() {
@@ -386,6 +390,65 @@ impl RuntimePolicyEngine {
             .await;
 
         let mut evaluation_required = false;
+
+        let capability_keys: Vec<String> = capability_requirements
+            .iter()
+            .map(|cap| cap.as_str().to_string())
+            .collect();
+
+        let intelligence_context = RecomputeContext {
+            server_id,
+            backend: backend.as_str(),
+            tier: tier.as_deref(),
+            capability_keys: &capability_keys,
+            fallback_capabilities_satisfied: capabilities_satisfied,
+        };
+
+        let intelligence_scores = intelligence::ensure_scores(pool, &intelligence_context)
+            .await
+            .map_err(|err| match err {
+                IntelligenceError::Database(db_err) => PolicyError::Database(db_err),
+            })?;
+
+        if intelligence_scores.is_empty() {
+            evaluation_required = true;
+            notes.push("intelligence:missing-scores".to_string());
+        }
+
+        for (capability, score) in &intelligence_scores {
+            let threshold = intelligence::minimum_threshold(capability, tier.as_deref());
+            notes.push(format!(
+                "intelligence:{}:{:.1}:threshold:{:.1}",
+                capability, score.score, threshold
+            ));
+            if score.score < threshold || matches!(score.status, IntelligenceStatus::Critical) {
+                evaluation_required = true;
+                notes.push(format!(
+                    "intelligence:degraded:{}:{}:{:.1}",
+                    capability,
+                    match score.status {
+                        IntelligenceStatus::Healthy => "healthy",
+                        IntelligenceStatus::Warning => "warning",
+                        IntelligenceStatus::Critical => "critical",
+                    },
+                    score.score
+                ));
+                if matches!(score.status, IntelligenceStatus::Critical) {
+                    governance_required = true;
+                }
+            } else {
+                notes.push(format!(
+                    "intelligence:stable:{}:{}:{:.1}",
+                    capability,
+                    match score.status {
+                        IntelligenceStatus::Healthy => "healthy",
+                        IntelligenceStatus::Warning => "warning",
+                        IntelligenceStatus::Critical => "critical",
+                    },
+                    score.score
+                ));
+            }
+        }
 
         if requires_build {
             evaluation_required = true;

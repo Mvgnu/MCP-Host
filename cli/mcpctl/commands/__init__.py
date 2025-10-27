@@ -26,6 +26,18 @@ def install_marketplace(subparsers: _SubParsersAction[ArgumentParser]) -> None:
     _add_common_arguments(list_parser)
 
 
+def install_policy(subparsers: _SubParsersAction[ArgumentParser]) -> None:
+    parser = subparsers.add_parser("policy", help="Runtime policy insights")
+    policy_sub = parser.add_subparsers(dest="policy_cmd", required=True)
+
+    intelligence_parser = policy_sub.add_parser(
+        "intelligence", help="Show capability intelligence scores for a server"
+    )
+    intelligence_parser.add_argument("server_id", type=int)
+    intelligence_parser.set_defaults(handler=_policy_intelligence_scores)
+    _add_common_arguments(intelligence_parser)
+
+
 def install_promotions(subparsers: _SubParsersAction[ArgumentParser]) -> None:
     parser = subparsers.add_parser("promotions", help="Promotion workflow commands")
     promotions_sub = parser.add_subparsers(dest="promotions_cmd", required=True)
@@ -354,3 +366,36 @@ def _scaffold_create(client: APIClient, as_json: bool, args: Dict[str, object]) 
     write_fastapi_project(project_dir, cfg)
     if not as_json:
         print(f"Scaffold created in {project_dir}")
+
+def _policy_intelligence_scores(
+    client: APIClient, as_json: bool, args: Dict[str, object]
+) -> None:
+    server_id = args["server_id"]
+    scores = client.get(f"/api/intelligence/servers/{server_id}/scores")
+    if as_json:
+        print(dumps_json(scores))
+        return
+
+    columns = [
+        "capability",
+        "score",
+        "status",
+        "backend",
+        "tier",
+        "observed_at",
+        "notes",
+    ]
+    rows = []
+    for entry in scores:
+        rows.append({
+            "capability": entry.get("capability"),
+            "score": f"{entry.get('score', 0):.1f}",
+            "status": entry.get("status"),
+            "backend": entry.get("backend") or "-",
+            "tier": entry.get("tier") or "-",
+            "observed_at": entry.get("last_observed_at"),
+            "notes": "; ".join(entry.get("notes", [])[:3]),
+        })
+    print(render_table(rows, columns))
+
+

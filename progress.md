@@ -119,6 +119,11 @@ This document tracks development progress and high level notes from the planning
 - Added page headings and improved form layout across login, registration and new server pages.
 - Enhanced servers page with better error handling for start/stop/delete actions and cleaner log viewing controls.
 
+## 2025-11-10
+- Added capability intelligence scoring with new persistence schema and recomputation workers.
+- Updated runtime policy evaluation to enforce intelligence thresholds and emit provenance notes for degraded scores.
+- Exposed REST and CLI surfaces (`/api/intelligence/servers/:id/scores`, `mcpctl policy intelligence`) for operator visibility.
+
 ### Next Steps
 - Finish UI polish and begin integrating metrics collection.
 
