@@ -126,6 +126,8 @@ def _list(client: APIClient, as_json: bool, _: Dict[str, object]) -> None:
                     "tier": item.get("tier"),
                     "status": item.get("status"),
                     "next_refresh_at": item.get("next_refresh_at"),
+                    "trust": item.get("last_attestation_status"),
+                    "fallback": item.get("fallback_launched_at"),
                 }
             )
         elif isinstance(item, (list, tuple)) and len(item) >= 4:
@@ -138,7 +140,7 @@ def _list(client: APIClient, as_json: bool, _: Dict[str, object]) -> None:
                     "next_refresh_at": item[3],
                 }
             )
-    columns = ["id", "artifact", "tier", "status", "next_refresh_at"]
+    columns = ["id", "artifact", "tier", "status", "next_refresh_at", "trust", "fallback"]
     print(render_table(rows, columns))
 
 
@@ -164,6 +166,9 @@ def _status(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
         "next_refresh_at",
         "refresh_cadence_seconds",
         "governance_notes",
+        "last_attestation_status",
+        "fallback_launched_at",
+        "remediation_attempts",
     ]
     print(render_table([data], columns))
 

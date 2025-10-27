@@ -212,9 +212,11 @@ async fn tpm_attestor_rejects_mismatched_measurement() {
 #[test]
 fn vm_posture_falls_back_on_stale_pending() {
     let record = VmAttestationRecord {
+        instance_id: 1,
         status: "pending".to_string(),
         updated_at: Utc::now() - ChronoDuration::minutes(15),
         terminated_at: None,
+        trust_event: None,
     };
     let outcome = evaluate_vm_attestation_posture(
         Some(record),

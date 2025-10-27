@@ -349,7 +349,23 @@ impl crate::runtime::RuntimeExecutor for VirtualMachineExecutor {
                             if transition.should_invalidate_cache() {
                                 attestation_notes.push("attestation:cache:invalidate".to_string());
                             }
-                            transition_payload = Some(transition.broadcast_payload());
+                            let mut payload = transition.broadcast_payload();
+                            if let Value::Object(ref mut map) = payload {
+                                map.insert(
+                                    "trust_event_id".to_string(),
+                                    transition.trust_event.id.into(),
+                                );
+                                map.insert(
+                                    "trust_transition_reason".to_string(),
+                                    transition
+                                        .trust_event
+                                        .transition_reason
+                                        .clone()
+                                        .map(Value::from)
+                                        .unwrap_or(Value::Null),
+                                );
+                            }
+                            transition_payload = Some(payload);
                         }
                         Err(err) => {
                             tracing::warn!(

@@ -3,6 +3,7 @@ pub mod scheduler;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
+use scheduler::record_trust_block;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{postgres::PgRow, PgPool, Row};
@@ -51,6 +52,9 @@ pub struct EvaluationCertification {
     pub refresh_cadence_seconds: Option<i64>,
     pub next_refresh_at: Option<DateTime<Utc>>,
     pub governance_notes: Option<String>,
+    pub last_attestation_status: Option<String>,
+    pub fallback_launched_at: Option<DateTime<Utc>>,
+    pub remediation_attempts: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -112,6 +116,9 @@ pub async fn get_certification(
             refresh_cadence_seconds,
             next_refresh_at,
             governance_notes,
+            last_attestation_status,
+            fallback_launched_at,
+            remediation_attempts,
             created_at,
             updated_at
         FROM evaluation_certifications
@@ -179,6 +186,9 @@ pub async fn upsert_certification(
             refresh_cadence_seconds,
             next_refresh_at,
             governance_notes,
+            last_attestation_status,
+            fallback_launched_at,
+            remediation_attempts,
             created_at,
             updated_at
         "#,
@@ -223,6 +233,9 @@ pub async fn list_for_run(
             refresh_cadence_seconds,
             next_refresh_at,
             governance_notes,
+            last_attestation_status,
+            fallback_launched_at,
+            remediation_attempts,
             created_at,
             updated_at
         FROM evaluation_certifications
@@ -259,6 +272,9 @@ pub async fn list_for_digest_and_tier(
             refresh_cadence_seconds,
             next_refresh_at,
             governance_notes,
+            last_attestation_status,
+            fallback_launched_at,
+            remediation_attempts,
             created_at,
             updated_at
         FROM evaluation_certifications
@@ -278,6 +294,29 @@ pub async fn retry_certification(
     pool: &PgPool,
     certification_id: i32,
 ) -> Result<Option<EvaluationCertification>, sqlx::Error> {
+    let state = sqlx::query(
+        r#"
+        SELECT last_attestation_status, remediation_attempts, fallback_launched_at
+        FROM evaluation_certifications
+        WHERE id = $1
+        "#,
+    )
+    .bind(certification_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(state) = state else {
+        return Ok(None);
+    };
+
+    let last_status: Option<String> = state.try_get("last_attestation_status").unwrap_or(None);
+    if matches!(last_status.as_deref(), Some("untrusted")) {
+        let attempts: i32 = state.try_get("remediation_attempts").unwrap_or(0);
+        let fallback_launched_at = state.try_get("fallback_launched_at").unwrap_or(None);
+        record_trust_block(pool, certification_id, attempts, fallback_launched_at).await?;
+        return Ok(None);
+    }
+
     let row = sqlx::query(
         r#"
         UPDATE evaluation_certifications
@@ -395,6 +434,13 @@ fn map_certification(row: PgRow) -> EvaluationCertification {
         governance_notes: row
             .try_get::<Option<String>, _>("governance_notes")
             .unwrap_or(None),
+        last_attestation_status: row
+            .try_get::<Option<String>, _>("last_attestation_status")
+            .unwrap_or(None),
+        fallback_launched_at: row
+            .try_get::<Option<DateTime<Utc>>, _>("fallback_launched_at")
+            .unwrap_or(None),
+        remediation_attempts: row.try_get::<i32, _>("remediation_attempts").unwrap_or(0),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }

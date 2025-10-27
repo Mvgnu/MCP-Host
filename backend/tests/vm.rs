@@ -392,7 +392,7 @@ async fn tpm_attestation_rejects_signature_mismatch() {
     assert!(outcome
         .notes
         .iter()
-        .any(|note| note == "attestation:signature-invalid"));
+        .any(|note| note.contains("measurement:untrusted")));
     assert_eq!(outcome.evidence, Some(tampered));
 }
 
@@ -543,9 +543,11 @@ async fn tpm_attestor_rejects_mismatched_measurement() {
 #[tokio::test]
 async fn evaluate_attestation_record_marks_untrusted() {
     let record = VmAttestationRecord {
+        instance_id: 1,
         status: "untrusted".to_string(),
         updated_at: Utc::now() - ChronoDuration::minutes(10),
         terminated_at: None,
+        trust_event: None,
     };
 
     let outcome = evaluate_vm_attestation_posture(

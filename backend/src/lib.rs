@@ -15,6 +15,8 @@ pub use config::{
     VM_LOG_TAIL_LINES, VM_PROVISIONER_DRIVER,
 };
 
+pub use job_queue::Job;
+
 mod docker;
 mod evaluation;
 mod evaluations;

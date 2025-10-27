@@ -28,6 +28,7 @@ mod proxy;
 mod routes;
 mod secrets;
 mod services;
+mod trust;
 mod vault;
 mod vector_dbs;
 mod workflows;
@@ -222,6 +223,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let job_tx = start_worker(pool.clone(), runtime.clone());
     evaluations::scheduler::spawn(pool.clone(), job_tx.clone());
+    trust::spawn_trust_listener(pool.clone(), job_tx.clone());
     ingestion::start_ingestion_worker(pool.clone());
     let (prometheus_layer, metrics_handle) = PrometheusMetricLayer::pair();
     let app = Router::new()
