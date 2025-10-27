@@ -63,6 +63,71 @@ pub struct LogEntry {
     pub log_text: String,
 }
 
+// key: runtime-vm-api -> attestation-visibility
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VmEventView {
+    pub event_type: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VmInstanceView {
+    pub id: i64,
+    pub instance_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation_tier: Option<String>,
+    pub attestation_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminated_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_evidence: Option<serde_json::Value>,
+    #[serde(default)]
+    pub capability_notes: Vec<String>,
+    #[serde(default)]
+    pub events: Vec<VmEventView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VmRuntimeSummary {
+    pub server_id: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_instance_id: Option<String>,
+    pub instances: Vec<VmInstanceView>,
+}
+
+impl VmRuntimeSummary {
+    pub fn from_instances(server_id: i32, instances: Vec<VmInstanceView>) -> Self {
+        let latest_status = instances
+            .first()
+            .map(|instance| instance.attestation_status.clone());
+        let last_updated_at = instances.first().map(|instance| instance.updated_at);
+        let active_instance_id = instances
+            .iter()
+            .find(|instance| instance.terminated_at.is_none())
+            .map(|instance| instance.instance_id.clone());
+
+        Self {
+            server_id,
+            latest_status,
+            last_updated_at,
+            active_instance_id,
+            instances,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct MetricInput {
     pub event_type: String,
@@ -226,6 +291,65 @@ mod tests {
         assert_eq!(round_trip["details"]["auth_expired"].as_bool(), Some(false));
 
         METRIC_CHANNELS.remove(&server_id);
+    }
+
+    #[test]
+    fn vm_event_view_round_trips_through_json() {
+        let now = chrono::Utc::now();
+        let event = VmEventView {
+            event_type: "provisioned".to_string(),
+            created_at: now,
+            payload: Some(json!({ "instance_id": "vm-1" })),
+        };
+
+        let serialized =
+            serde_json::to_value(vec![event.clone()]).expect("vm events serialize to json");
+        let decoded: Vec<VmEventView> =
+            serde_json::from_value(serialized).expect("vm events decode from json");
+
+        assert_eq!(decoded, vec![event]);
+    }
+
+    #[test]
+    fn vm_runtime_summary_flags_active_instance() {
+        let now = chrono::Utc::now();
+        let active = VmInstanceView {
+            id: 1,
+            instance_id: "vm-active".to_string(),
+            isolation_tier: Some("coco".to_string()),
+            attestation_status: "trusted".to_string(),
+            policy_version: Some("policy:v1".to_string()),
+            created_at: now,
+            updated_at: now,
+            terminated_at: None,
+            last_error: None,
+            attestation_evidence: None,
+            capability_notes: vec!["attestation:ok".to_string()],
+            events: vec![],
+        };
+        let stale = VmInstanceView {
+            id: 2,
+            instance_id: "vm-old".to_string(),
+            isolation_tier: None,
+            attestation_status: "untrusted".to_string(),
+            policy_version: Some("policy:v0".to_string()),
+            created_at: now - chrono::Duration::hours(1),
+            updated_at: now - chrono::Duration::hours(1),
+            terminated_at: Some(now - chrono::Duration::minutes(30)),
+            last_error: Some("attestation rejected".to_string()),
+            attestation_evidence: Some(json!({ "quote": { "report": {"measurement": "bad"}} })),
+            capability_notes: vec!["attestation:untrusted".to_string()],
+            events: vec![],
+        };
+
+        let summary = VmRuntimeSummary::from_instances(99, vec![active.clone(), stale]);
+
+        assert_eq!(summary.server_id, 99);
+        assert_eq!(summary.active_instance_id.as_deref(), Some("vm-active"));
+        assert_eq!(summary.latest_status.as_deref(), Some("trusted"));
+        assert_eq!(summary.last_updated_at, Some(now));
+        assert_eq!(summary.instances.len(), 2);
+        assert_eq!(summary.instances[0], active);
     }
 }
 
@@ -698,6 +822,98 @@ pub async fn stream_logs(
     };
     let stream = ReceiverStream::new(rx).map(|line| Ok(Event::default().data(line)));
     Ok(Sse::new(stream))
+}
+
+pub async fn vm_runtime_details(
+    Extension(pool): Extension<PgPool>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(server_id): Path<i32>,
+) -> AppResult<Json<VmRuntimeSummary>> {
+    let server = sqlx::query("SELECT id FROM mcp_servers WHERE id = $1 AND owner_id = $2")
+        .bind(server_id)
+        .bind(user_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|error| {
+            error!(?error, %server_id, "failed to verify VM server ownership");
+            AppError::Db(error)
+        })?;
+
+    if server.is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            vmi.id,
+            vmi.instance_id,
+            vmi.isolation_tier,
+            vmi.attestation_status,
+            vmi.policy_version,
+            vmi.created_at,
+            vmi.updated_at,
+            vmi.terminated_at,
+            vmi.last_error,
+            vmi.attestation_evidence,
+            vmi.capability_notes,
+            COALESCE(
+                (
+                    SELECT json_agg(
+                        json_build_object(
+                            'event_type', ev.event_type,
+                            'created_at', ev.created_at,
+                            'payload', ev.event_payload
+                        )
+                        ORDER BY ev.created_at ASC
+                    )
+                    FROM runtime_vm_events ev
+                    WHERE ev.vm_instance_id = vmi.id
+                ),
+                '[]'::json
+            ) AS events
+        FROM runtime_vm_instances vmi
+        WHERE vmi.server_id = $1
+        ORDER BY vmi.created_at DESC
+        LIMIT 10
+        "#,
+    )
+    .bind(server_id)
+    .fetch_all(&pool)
+    .await
+    .map_err(|error| {
+        error!(?error, %server_id, "failed to load VM instances");
+        AppError::Db(error)
+    })?;
+
+    let mut instances = Vec::with_capacity(rows.len());
+    for row in rows {
+        let events_value: serde_json::Value = row.get("events");
+        let events: Vec<VmEventView> = serde_json::from_value(events_value).map_err(|error| {
+            error!(?error, %server_id, "failed to decode VM event payloads");
+            AppError::Message("Failed to decode VM event payloads".into())
+        })?;
+
+        let instance = VmInstanceView {
+            id: row.get("id"),
+            instance_id: row.get("instance_id"),
+            isolation_tier: row.get("isolation_tier"),
+            attestation_status: row.get("attestation_status"),
+            policy_version: row.get("policy_version"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+            terminated_at: row.get("terminated_at"),
+            last_error: row.get("last_error"),
+            attestation_evidence: row.get("attestation_evidence"),
+            capability_notes: row
+                .try_get::<Vec<String>, _>("capability_notes")
+                .unwrap_or_default(),
+            events,
+        };
+        instances.push(instance);
+    }
+
+    Ok(Json(VmRuntimeSummary::from_instances(server_id, instances)))
 }
 
 pub async fn add_metric(

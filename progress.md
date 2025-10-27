@@ -6,6 +6,7 @@ This document tracks development progress and high level notes from the planning
 - Runtime policy engine now reads persisted VM attestation records when selecting executors, emitting decision notes for status, timestamps, and teardown metadata.
 - Policy evaluation automatically falls back to Docker when the latest attestation is marked untrusted and flags stale pending evidence for remediation scheduling.
 - Documented telemetry propagation ensures governance layers can observe VM trust posture without relying on manual log review.
+- Added `/api/servers/:id/vm` plus `mcpctl policy vm` so operators can inspect VM lifecycle telemetry, attestation posture, and active instance state without direct database access.
 
 ### Next Steps
 - Surface attestation-derived fallbacks in the operator console and CLI streaming views.

@@ -38,6 +38,14 @@ def install_policy(subparsers: _SubParsersAction[ArgumentParser]) -> None:
     intelligence_parser.set_defaults(handler=_policy_intelligence_scores)
     _add_common_arguments(intelligence_parser)
 
+    vm_parser = policy_sub.add_parser(
+        "vm",
+        help="Inspect virtual machine attestation posture for a server",
+    )
+    vm_parser.add_argument("server_id", type=int)
+    vm_parser.set_defaults(handler=_policy_vm_runtime)
+    _add_common_arguments(vm_parser)
+
 
 def install_promotions(subparsers: _SubParsersAction[ArgumentParser]) -> None:
     parser = subparsers.add_parser("promotions", help="Promotion workflow commands")
@@ -361,5 +369,40 @@ def _policy_intelligence_scores(
             "notes": "; ".join(entry.get("notes", [])[:3]),
         })
     print(render_table(rows, columns))
+
+
+def _policy_vm_runtime(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
+    server_id = args["server_id"]
+    summary = client.get(f"/api/servers/{server_id}/vm")
+    if as_json:
+        print(dumps_json(summary))
+        return
+
+    instances = summary.get("instances", [])
+    if not instances:
+        print("No VM instances recorded for this server")
+        return
+
+    columns = ["instance", "status", "tier", "updated", "active"]
+    active = summary.get("active_instance_id")
+    rows = []
+    for entry in instances:
+        instance_id = entry.get("instance_id")
+        rows.append(
+            {
+                "instance": instance_id,
+                "status": entry.get("attestation_status"),
+                "tier": entry.get("isolation_tier") or "-",
+                "updated": entry.get("updated_at"),
+                "active": "yes" if active and instance_id == active else "",
+            }
+        )
+
+    print(render_table(rows, columns))
+    latest = summary.get("latest_status", "unknown")
+    updated = summary.get("last_updated_at", "unknown")
+    print(f"Latest posture: {latest} (updated {updated})")
+    if active:
+        print(f"Active instance: {active}")
 
 
