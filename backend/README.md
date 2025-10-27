@@ -54,3 +54,19 @@ The trust registry now exposes a REST and streaming control surface so remediati
 - **Streaming events:** `GET /api/trust/registry/stream` streams SSE payloads that mirror the Postgres NOTIFY channel. Filters match the REST list parameters so dashboards and the CLI can watch targeted lifecycles without custom fan-out code.
 
 The remediation orchestrator listens to the in-process broadcast channel, starting automation playbooks when quarantined lifecycles appear. Placeholder automation marks runs complete after basic verification; replace the stub in `backend/src/remediation.rs` as production playbooks mature. Use migration `0033_remediation_orchestrator.sql` before deploying the control plane.
+
+## Remediation Control Plane & Execution Engine
+
+Remediation is now a first-class control plane built on top of three persistent tables introduced in migration `0034_remediation_control_plane.sql`:
+
+- `runtime_vm_remediation_playbooks` stores catalog metadata for each playbook (`playbook_key`, executor type, owner assignment, `approval_required`, `sla_duration_seconds`, version column for optimistic locking, and arbitrary JSONB metadata). Updates must supply the prior `version` to avoid stomping concurrent edits. The Axum control plane and CLI surface both use this table to render catalog listings and enforce ownership.
+- `runtime_vm_remediation_runs` represents individual automation attempts. New runs start in `status = 'pending'` with `approval_state` seeded to `pending` or `auto-approved` depending on the playbook. Additional columns track assigned owner, SLA deadline, cancellation fields, structured metadata, and a `failure_reason` enum string so policy consumers can distinguish transient vs. structural failures.
+- `runtime_vm_remediation_artifacts` captures log bundles, evidence attachments, and automation outputs with JSON metadata so downstream policy engines can ingest remediation intelligence.
+
+The orchestrator (`backend/src/remediation.rs`) wires these tables into a stateful execution engine:
+
+- `RemediationExecutor` is a pluggable trait with default shell, Ansible, and cloud API adapters. Each executor streams `RemediationLogEvent` structures (stdout/stderr/system), supports cancellation tokens, and returns structured `RemediationExitStatus` values annotated with a `RemediationFailureReason`.
+- A queue worker (`dispatch_next_run`) dequeues approved `runtime_vm_remediation_runs`, flips the trust registry into `remediation:automation-running`, and launches executors asynchronously. Execution results checkpoint run status, persist logs as artifacts, and write typed remediation states (`automation-complete`, `automation-failed`, `transient-failure`, etc.) back into `runtime_vm_trust_registry` using optimistic locking.
+- The quarantine event listener now materializes playbook-backed runs with provenance metadata, owner assignment, and SLA deadlines, distinguishing between approval-gated and automation-ready lifecycles.
+
+Operators should consult the remediation API/CLI roadmap before enabling automated playbooks in production. The data contracts documented above are considered stable for downstream integrations, and telemetry should consume the high-signal log artifacts rather than raw executor stdout.
