@@ -89,6 +89,18 @@ pub struct VmInstanceView {
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation_evidence: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_hint: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hypervisor_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hypervisor_credentials: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hypervisor_network_template: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hypervisor_volume_template: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_passthrough_policy: Option<serde_json::Value>,
     #[serde(default)]
     pub capability_notes: Vec<String>,
     #[serde(default)]
@@ -324,6 +336,12 @@ mod tests {
             terminated_at: None,
             last_error: None,
             attestation_evidence: None,
+            attestation_hint: None,
+            hypervisor_endpoint: None,
+            hypervisor_credentials: None,
+            hypervisor_network_template: None,
+            hypervisor_volume_template: None,
+            gpu_passthrough_policy: None,
             capability_notes: vec!["attestation:ok".to_string()],
             events: vec![],
         };
@@ -338,6 +356,12 @@ mod tests {
             terminated_at: Some(now - chrono::Duration::minutes(30)),
             last_error: Some("attestation rejected".to_string()),
             attestation_evidence: Some(json!({ "quote": { "report": {"measurement": "bad"}} })),
+            attestation_hint: None,
+            hypervisor_endpoint: None,
+            hypervisor_credentials: None,
+            hypervisor_network_template: None,
+            hypervisor_volume_template: None,
+            gpu_passthrough_policy: None,
             capability_notes: vec!["attestation:untrusted".to_string()],
             events: vec![],
         };
@@ -856,6 +880,12 @@ pub async fn vm_runtime_details(
             vmi.terminated_at,
             vmi.last_error,
             vmi.attestation_evidence,
+            vmi.attestation_hint,
+            vmi.hypervisor_endpoint,
+            vmi.hypervisor_credentials,
+            vmi.hypervisor_network_template,
+            vmi.hypervisor_volume_template,
+            vmi.gpu_passthrough_policy,
             vmi.capability_notes,
             COALESCE(
                 (
@@ -905,6 +935,12 @@ pub async fn vm_runtime_details(
             terminated_at: row.get("terminated_at"),
             last_error: row.get("last_error"),
             attestation_evidence: row.get("attestation_evidence"),
+            attestation_hint: row.get("attestation_hint"),
+            hypervisor_endpoint: row.get("hypervisor_endpoint"),
+            hypervisor_credentials: row.get("hypervisor_credentials"),
+            hypervisor_network_template: row.get("hypervisor_network_template"),
+            hypervisor_volume_template: row.get("hypervisor_volume_template"),
+            gpu_passthrough_policy: row.get("gpu_passthrough_policy"),
             capability_notes: row
                 .try_get::<Vec<String>, _>("capability_notes")
                 .unwrap_or_default(),

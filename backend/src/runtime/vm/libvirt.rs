@@ -196,13 +196,15 @@ impl VmProvisioner for LibvirtVmProvisioner {
             spec.attestation_hint.clone()
         };
 
-        Ok(VmProvisioningResult::new(
+        let mut result = VmProvisioningResult::new(
             provisioned.instance_id,
             isolation_tier,
             attestation,
             spec.image,
             Some(snapshot),
-        ))
+        );
+        result.attestation_hint = spec.attestation_hint.clone();
+        Ok(result)
     }
 
     async fn start(&self, instance_id: &str) -> Result<()> {

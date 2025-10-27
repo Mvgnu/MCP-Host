@@ -1,6 +1,6 @@
-use axum::{routing::get, Router};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::{routing::get, Router};
 use axum_prometheus::PrometheusMetricLayer;
 use tower::ServiceExt;
 
@@ -11,7 +11,12 @@ async fn metrics_returns_ok() {
         .route("/metrics", get(move || async move { handle.render() }))
         .layer(layer);
     let response = app
-        .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);

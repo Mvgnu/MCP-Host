@@ -1,9 +1,9 @@
+use acme2::{gen_rsa_private_key, AccountBuilder, Csr, DirectoryBuilder, OrderBuilder};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use sqlx::{PgPool, Row};
 use std::path::PathBuf;
 use std::time::Duration;
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
-use acme2::{AccountBuilder, DirectoryBuilder, OrderBuilder, Csr, gen_rsa_private_key};
 
 pub fn conf_dir() -> PathBuf {
     std::env::var("PROXY_CONF_DIR")
@@ -27,7 +27,9 @@ pub async fn ensure_tls(domain: &str) {
 
 async fn obtain_cert(domain: String, email: String) -> Result<(), Box<dyn std::error::Error>> {
     const LETS_ENCRYPT_URL: &str = "https://acme-v02.api.letsencrypt.org/directory";
-    let dir = DirectoryBuilder::new(LETS_ENCRYPT_URL.to_string()).build().await?;
+    let dir = DirectoryBuilder::new(LETS_ENCRYPT_URL.to_string())
+        .build()
+        .await?;
     let account = AccountBuilder::new(dir.clone())
         .contact(vec![format!("mailto:{email}")])
         .terms_of_service_agreed(true)
@@ -63,10 +65,7 @@ async fn obtain_cert(domain: String, email: String) -> Result<(), Box<dyn std::e
     let pkey = gen_rsa_private_key(2048)?;
     order = order.finalize(Csr::Automatic(pkey.clone())).await?;
     order = order.wait_done(Duration::from_secs(5), 15).await?;
-    let certs = order
-        .certificate()
-        .await?
-        .ok_or("certificate missing")?;
+    let certs = order.certificate().await?.ok_or("certificate missing")?;
     let mut pem_chain = Vec::new();
     for c in &certs {
         pem_chain.extend(c.to_pem()?);
@@ -93,7 +92,7 @@ async fn write_config(server_id: i32, domains: &[String]) -> std::io::Result<()>
     let mut content = String::new();
     for d in domains {
         content.push_str(&format!(
-"server {{
+            "server {{
     listen 80;
     server_name {};
     location / {{

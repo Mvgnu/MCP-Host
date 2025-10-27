@@ -4,17 +4,23 @@ pub mod policy;
 pub mod runtime;
 pub mod telemetry;
 
+mod artifacts;
 mod build;
 mod capabilities;
 mod config;
+
+pub use config::{
+    libvirt_provisioning_config_from_env, VmProvisionerDriver, LIBVIRT_PROVISIONING_CONFIG,
+    VM_LOG_TAIL_LINES, VM_PROVISIONER_DRIVER,
+};
+
 mod docker;
 mod evaluation;
 mod evaluations;
-mod governance;
 mod extractor;
+mod governance;
+mod invocations;
 mod job_queue;
 mod marketplace;
-mod artifacts;
-mod invocations;
 mod proxy;
 mod servers;

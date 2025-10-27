@@ -9,4 +9,3 @@ fn fails_without_jwt_secret() {
         .expect("failed to run backend binary");
     assert!(!output.status.success());
 }
-

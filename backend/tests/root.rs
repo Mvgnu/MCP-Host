@@ -1,9 +1,11 @@
-use axum::{Router, routing::get};
-use axum::http::{Request, StatusCode};
 use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use axum::{routing::get, Router};
 use tower::ServiceExt; // for `oneshot`
 
-async fn root() -> &'static str { "MCP Host API" }
+async fn root() -> &'static str {
+    "MCP Host API"
+}
 
 #[tokio::test]
 async fn root_responds_ok() {

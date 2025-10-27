@@ -4,9 +4,9 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use tracing::error;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
+use tracing::error;
 
 #[derive(Serialize)]
 pub struct Service {
@@ -117,18 +117,17 @@ pub async fn update_service(
     if rec.is_none() {
         return Err((StatusCode::NOT_FOUND, "Server not found".into()));
     }
-    let result = sqlx::query(
-        "UPDATE service_integrations SET config = $1 WHERE id = $2 AND server_id = $3",
-    )
-    .bind(&payload.config)
-    .bind(service_id)
-    .bind(server_id)
-    .execute(&pool)
-    .await
-    .map_err(|e| {
-        error!(?e, "DB error updating service");
-        (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
-    })?;
+    let result =
+        sqlx::query("UPDATE service_integrations SET config = $1 WHERE id = $2 AND server_id = $3")
+            .bind(&payload.config)
+            .bind(service_id)
+            .bind(server_id)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                error!(?e, "DB error updating service");
+                (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
+            })?;
     if result.rows_affected() == 0 {
         return Err((StatusCode::NOT_FOUND, "Service not found".into()));
     }
@@ -152,17 +151,15 @@ pub async fn delete_service(
     if rec.is_none() {
         return Err((StatusCode::NOT_FOUND, "Server not found".into()));
     }
-    let result = sqlx::query(
-        "DELETE FROM service_integrations WHERE id = $1 AND server_id = $2",
-    )
-    .bind(service_id)
-    .bind(server_id)
-    .execute(&pool)
-    .await
-    .map_err(|e| {
-        error!(?e, "DB error deleting service");
-        (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
-    })?;
+    let result = sqlx::query("DELETE FROM service_integrations WHERE id = $1 AND server_id = $2")
+        .bind(service_id)
+        .bind(server_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            error!(?e, "DB error deleting service");
+            (StatusCode::INTERNAL_SERVER_ERROR, "DB error".into())
+        })?;
     if result.rows_affected() == 0 {
         return Err((StatusCode::NOT_FOUND, "Service not found".into()));
     }

@@ -2,8 +2,8 @@ use crate::extractor::AuthUser;
 use crate::servers::invoke_server_internal; // internal helper
 use axum::{
     extract::{Extension, Path},
-    routing::{get, post, delete},
     http::StatusCode,
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};

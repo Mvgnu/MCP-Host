@@ -21,7 +21,10 @@ pub use vm::libvirt::RealLibvirtDriver;
 pub use vm::libvirt::{
     LibvirtAuthConfig, LibvirtDriver, LibvirtProvisioningConfig, LibvirtVmProvisioner,
 };
-pub use vm::{AttestationVerifier, TpmAttestationVerifier, VirtualMachineExecutor, VmProvisioner};
+pub use vm::{
+    AttestationVerifier, HttpHypervisorProvisioner, TpmAttestationVerifier, VirtualMachineExecutor,
+    VmProvisioner,
+};
 
 #[async_trait]
 pub trait ContainerRuntime: Send + Sync {

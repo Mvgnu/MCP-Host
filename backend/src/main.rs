@@ -38,9 +38,11 @@ use base64::Engine;
 use ed25519_dalek::PublicKey;
 use job_queue::start_worker;
 use policy::{RuntimeBackend, RuntimePolicyEngine};
+#[cfg(feature = "libvirt-executor")]
+use runtime::RealLibvirtDriver;
 use runtime::{
     ContainerRuntime, DockerRuntime, HttpHypervisorProvisioner, KubernetesRuntime,
-    RuntimeOrchestrator, TpmAttestationVerifier, VirtualMachineExecutor,
+    LibvirtVmProvisioner, RuntimeOrchestrator, TpmAttestationVerifier, VirtualMachineExecutor,
 };
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
@@ -134,12 +136,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .register_executor(DockerRuntime::descriptor())
             .await;
         let docker_executor: Arc<dyn runtime::RuntimeExecutor> = Arc::new(DockerRuntime::new());
-        let provisioner: Arc<dyn runtime::VmProvisioner> =
-            Arc::new(HttpHypervisorProvisioner::new(
+        let provisioner: Arc<dyn runtime::VmProvisioner> = match *config::VM_PROVISIONER_DRIVER {
+            config::VmProvisionerDriver::Http => Arc::new(HttpHypervisorProvisioner::new(
                 config::VM_HYPERVISOR_ENDPOINT.clone(),
                 (*config::VM_HYPERVISOR_TOKEN).clone(),
                 *config::VM_LOG_TAIL_LINES,
-            )?);
+            )?),
+            config::VmProvisionerDriver::Libvirt => {
+                #[cfg(feature = "libvirt-executor")]
+                {
+                    let libvirt_config = config::LIBVIRT_PROVISIONING_CONFIG.clone();
+                    let driver: Arc<dyn runtime::LibvirtDriver> = Arc::new(RealLibvirtDriver::new(
+                        libvirt_config.connection_uri.clone(),
+                        libvirt_config.auth.clone(),
+                        libvirt_config.console_source.clone(),
+                    ));
+                    Arc::new(LibvirtVmProvisioner::new(driver, libvirt_config))
+                }
+                #[cfg(not(feature = "libvirt-executor"))]
+                {
+                    panic!("libvirt executor requested but backend compiled without libvirt-executor feature");
+                }
+            }
+        };
         let mut trust_roots = Vec::new();
         for encoded in config::VM_ATTESTATION_TRUST_ROOTS.iter() {
             match Base64Engine.decode(encoded) {

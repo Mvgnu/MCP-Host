@@ -187,6 +187,7 @@ async fn tpm_attestor_rejects_mismatched_measurement() {
         Some("coco".to_string()),
         Some(evidence.clone()),
         "ghcr.io/example/app:latest".to_string(),
+        None,
     );
 
     let outcome = attestor

@@ -1,5 +1,9 @@
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
+use std::fs;
+
+use crate::runtime::vm::libvirt::{LibvirtAuthConfig, LibvirtProvisioningConfig};
+use serde_json::{json, Value};
 
 /// Secret used for JWT signing. Must be set via the `JWT_SECRET` env variable.
 pub static JWT_SECRET: Lazy<String> =
@@ -153,3 +157,146 @@ pub static VM_ATTESTATION_MAX_AGE_SECONDS: Lazy<u64> = Lazy::new(|| {
         .filter(|value| *value > 0)
         .unwrap_or(300)
 });
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmProvisionerDriver {
+    Http,
+    Libvirt,
+}
+
+impl VmProvisionerDriver {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VmProvisionerDriver::Http => "http",
+            VmProvisionerDriver::Libvirt => "libvirt",
+        }
+    }
+}
+
+fn parse_vm_provisioner_driver() -> VmProvisionerDriver {
+    match std::env::var("VM_PROVISIONER_DRIVER") {
+        Ok(raw) => {
+            let normalized = raw.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "" | "http" => VmProvisionerDriver::Http,
+                "libvirt" => VmProvisionerDriver::Libvirt,
+                other => panic!(
+                    "unsupported VM_PROVISIONER_DRIVER value '{other}'; expected 'http' or 'libvirt'"
+                ),
+            }
+        }
+        Err(_) => VmProvisionerDriver::Http,
+    }
+}
+
+pub static VM_PROVISIONER_DRIVER: Lazy<VmProvisionerDriver> =
+    Lazy::new(parse_vm_provisioner_driver);
+
+fn read_optional_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn read_secret_env(value_key: &str, file_key: &str) -> Option<String> {
+    if let Some(path) = read_optional_env(file_key) {
+        match fs::read_to_string(&path) {
+            Ok(contents) => {
+                let trimmed = contents.trim().to_string();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+            Err(err) => panic!("failed to read {file_key} from {path}: {err}"),
+        }
+    }
+
+    read_optional_env(value_key)
+}
+
+fn json_from_env(var: &str, default_value: Value) -> Value {
+    match std::env::var(var) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                default_value
+            } else {
+                serde_json::from_str(trimmed)
+                    .unwrap_or_else(|err| panic!("failed to parse {var} as JSON: {err}"))
+            }
+        }
+        Err(_) => default_value,
+    }
+}
+
+pub fn libvirt_provisioning_config_from_env() -> LibvirtProvisioningConfig {
+    let connection_uri = std::env::var("LIBVIRT_CONNECTION_URI")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "qemu:///system".to_string());
+
+    let auth_username = read_optional_env("LIBVIRT_USERNAME");
+    let auth_password = read_secret_env("LIBVIRT_PASSWORD", "LIBVIRT_PASSWORD_FILE");
+    let auth = if auth_username.is_some() || auth_password.is_some() {
+        Some(LibvirtAuthConfig {
+            username: auth_username,
+            password: auth_password,
+        })
+    } else {
+        None
+    };
+
+    let default_isolation_tier = read_optional_env("LIBVIRT_DEFAULT_ISOLATION_TIER");
+    let default_memory_mib = std::env::var("LIBVIRT_DEFAULT_MEMORY_MIB")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4096);
+    let default_vcpu_count = std::env::var("LIBVIRT_DEFAULT_VCPU_COUNT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4);
+    let log_tail = std::env::var("LIBVIRT_LOG_TAIL")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| *VM_LOG_TAIL_LINES);
+
+    let network_template = json_from_env(
+        "LIBVIRT_NETWORK_TEMPLATE",
+        json!({
+            "name": "default",
+            "model": "virtio"
+        }),
+    );
+    let volume_template = json_from_env(
+        "LIBVIRT_VOLUME_TEMPLATE",
+        json!({
+            "path": "/var/lib/libvirt/images/mcp.qcow2",
+            "driver": "qcow2",
+            "target_dev": "vda",
+            "target_bus": "virtio"
+        }),
+    );
+    let gpu_passthrough_policy = json_from_env("LIBVIRT_GPU_POLICY", json!({ "enabled": false }));
+    let console_source = read_optional_env("LIBVIRT_CONSOLE_SOURCE");
+
+    LibvirtProvisioningConfig {
+        connection_uri,
+        auth,
+        default_isolation_tier,
+        default_memory_mib,
+        default_vcpu_count,
+        log_tail,
+        network_template,
+        volume_template,
+        gpu_passthrough_policy,
+        console_source,
+    }
+}
+
+pub static LIBVIRT_PROVISIONING_CONFIG: Lazy<LibvirtProvisioningConfig> =
+    Lazy::new(|| libvirt_provisioning_config_from_env());

@@ -9,6 +9,8 @@ use base64::Engine;
 use chrono::Utc;
 use chrono::{DateTime, Duration as ChronoDuration};
 use ed25519_dalek::{PublicKey, Signature};
+use futures_util::StreamExt;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -27,6 +29,8 @@ pub struct VmProvisioningResult {
     pub instance_id: String,
     pub isolation_tier: Option<String>,
     pub attestation_evidence: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_hint: Option<Value>,
     pub requested_image: String,
     pub hypervisor: Option<HypervisorSnapshot>,
 }
@@ -43,6 +47,7 @@ impl VmProvisioningResult {
             instance_id,
             isolation_tier,
             attestation_evidence,
+            attestation_hint: None,
             requested_image,
             hypervisor,
         }
@@ -202,6 +207,7 @@ impl VirtualMachineExecutor {
                 isolation_tier,
                 attestation_status,
                 attestation_evidence,
+                attestation_hint,
                 policy_version,
                 capability_notes,
                 hypervisor_endpoint,
@@ -210,7 +216,7 @@ impl VirtualMachineExecutor {
                 hypervisor_volume_template,
                 gpu_passthrough_policy
             ) VALUES (
-                $1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11
+                $1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11, $12
             )
             RETURNING id
             "#,
@@ -219,6 +225,7 @@ impl VirtualMachineExecutor {
         .bind(&provisioning.instance_id)
         .bind(provisioning.isolation_tier.as_deref())
         .bind(provisioning.attestation_evidence.clone())
+        .bind(provisioning.attestation_hint.clone())
         .bind(&decision.policy_version)
         .bind(&notes)
         .bind(snapshot.map(|s| s.endpoint.clone()))
@@ -617,6 +624,234 @@ impl crate::runtime::RuntimeExecutor for VirtualMachineExecutor {
             }
         });
         Some(rx)
+    }
+}
+
+#[derive(Clone)]
+pub struct HttpHypervisorProvisioner {
+    client: reqwest::Client,
+    base_url: String,
+    auth_token: Option<String>,
+    log_tail: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct HypervisorInstanceResponse {
+    instance_id: String,
+    #[serde(default)]
+    isolation_tier: Option<String>,
+    #[serde(default, rename = "attestation")]
+    attestation_evidence: Option<Value>,
+    #[serde(default)]
+    image: Option<String>,
+}
+
+impl HttpHypervisorProvisioner {
+    pub fn new(
+        base_url: impl Into<String>,
+        auth_token: Option<String>,
+        log_tail: usize,
+    ) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("failed to build hypervisor client")?;
+        Ok(Self {
+            client,
+            base_url: base_url.into(),
+            auth_token,
+            log_tail,
+        })
+    }
+
+    fn endpoint(&self, path: &str) -> String {
+        let path = path.trim_start_matches('/');
+        format!("{}/{}", self.base_url.trim_end_matches('/'), path)
+    }
+
+    fn auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(token) = &self.auth_token {
+            request.bearer_auth(token)
+        } else {
+            request
+        }
+    }
+
+    fn hypervisor_snapshot(&self) -> Option<HypervisorSnapshot> {
+        let credentials = self
+            .auth_token
+            .as_ref()
+            .map(|_| json!({ "method": "bearer", "configured": true }));
+        Some(HypervisorSnapshot::new(
+            self.base_url.clone(),
+            credentials,
+            None,
+            None,
+            None,
+        ))
+    }
+}
+
+#[async_trait]
+impl VmProvisioner for HttpHypervisorProvisioner {
+    async fn provision(
+        &self,
+        server_id: i32,
+        decision: &PolicyDecision,
+        config: Option<&Value>,
+    ) -> Result<VmProvisioningResult> {
+        let mut payload = json!({
+            "server_id": server_id,
+            "image": decision.image,
+            "tier": decision.tier,
+            "capabilities": decision
+                .capability_requirements
+                .iter()
+                .map(|cap| cap.as_str())
+                .collect::<Vec<_>>(),
+        });
+
+        if let Some(tier) = &decision.tier {
+            payload["tier"] = json!(tier);
+        }
+
+        if let Some(config) = config {
+            payload["config"] = config.clone();
+        }
+
+        let response = self
+            .auth(self.client.post(self.endpoint("instances")))
+            .json(&payload)
+            .send()
+            .await
+            .context("failed to contact hypervisor")?
+            .error_for_status()
+            .context("hypervisor rejected provisioning request")?;
+
+        let parsed: HypervisorInstanceResponse = response
+            .json()
+            .await
+            .context("failed to decode hypervisor response")?;
+
+        Ok(VmProvisioningResult::new(
+            parsed.instance_id,
+            parsed.isolation_tier.or_else(|| decision.tier.clone()),
+            parsed.attestation_evidence,
+            parsed.image.unwrap_or_else(|| decision.image.clone()),
+            self.hypervisor_snapshot(),
+        ))
+    }
+
+    async fn start(&self, instance_id: &str) -> Result<()> {
+        self.auth(
+            self.client
+                .post(self.endpoint(&format!("instances/{instance_id}/start"))),
+        )
+        .send()
+        .await
+        .context("failed to reach hypervisor for start")?
+        .error_for_status()
+        .context("hypervisor rejected start request")?;
+        Ok(())
+    }
+
+    async fn stop(&self, instance_id: &str) -> Result<()> {
+        self.auth(
+            self.client
+                .post(self.endpoint(&format!("instances/{instance_id}/stop"))),
+        )
+        .send()
+        .await
+        .context("failed to reach hypervisor for stop")?
+        .error_for_status()
+        .context("hypervisor rejected stop request")?;
+        Ok(())
+    }
+
+    async fn teardown(&self, instance_id: &str) -> Result<()> {
+        self.auth(
+            self.client
+                .delete(self.endpoint(&format!("instances/{instance_id}"))),
+        )
+        .send()
+        .await
+        .context("failed to reach hypervisor for teardown")?
+        .error_for_status()
+        .context("hypervisor rejected teardown request")?;
+        Ok(())
+    }
+
+    async fn fetch_logs(&self, instance_id: &str) -> Result<String> {
+        let response = self
+            .auth(
+                self.client
+                    .get(self.endpoint(&format!("instances/{instance_id}/logs")))
+                    .query(&[("tail", self.log_tail)]),
+            )
+            .send()
+            .await
+            .context("failed to reach hypervisor for logs")?
+            .error_for_status()
+            .context("hypervisor rejected log fetch")?;
+        Ok(response.text().await.context("failed to read log body")?)
+    }
+
+    async fn stream_logs(&self, instance_id: &str) -> Result<Option<Receiver<String>>> {
+        let response = self
+            .auth(
+                self.client
+                    .get(self.endpoint(&format!("instances/{instance_id}/logs/stream"))),
+            )
+            .send()
+            .await
+            .context("failed to reach hypervisor for log stream")?;
+
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+
+        let mut stream = response
+            .error_for_status()
+            .context("hypervisor rejected log stream request")?
+            .bytes_stream();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(async move {
+            let mut buffer = Vec::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(chunk) => {
+                        buffer.extend_from_slice(&chunk);
+                        while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
+                            let line = buffer.drain(..=pos).collect::<Vec<u8>>();
+                            let clean =
+                                String::from_utf8_lossy(&line[..line.len().saturating_sub(1)])
+                                    .to_string();
+                            if tx.send(clean).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(?err, "log stream chunk error");
+                        break;
+                    }
+                }
+            }
+            if !buffer.is_empty() {
+                match String::from_utf8(buffer) {
+                    Ok(tail) => {
+                        let _ = tx.send(tail).await;
+                    }
+                    Err(err) => {
+                        let recovered = String::from_utf8_lossy(&err.into_bytes()).to_string();
+                        let _ = tx.send(recovered).await;
+                    }
+                }
+            }
+        });
+
+        Ok(Some(rx))
     }
 }
 

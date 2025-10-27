@@ -1,8 +1,12 @@
 use crate::extractor::AuthUser;
-use axum::{extract::{Extension, Path}, http::StatusCode, Json};
-use tracing::error;
+use axum::{
+    extract::{Extension, Path},
+    http::StatusCode,
+    Json,
+};
 use serde::Serialize;
 use sqlx::{PgPool, Row};
+use tracing::error;
 
 #[derive(Serialize)]
 pub struct Capability {
@@ -49,11 +53,7 @@ pub async fn list_capabilities(
     Ok(Json(caps))
 }
 
-pub async fn sync_capabilities(
-    pool: &PgPool,
-    server_id: i32,
-    manifest: &serde_json::Value,
-) {
+pub async fn sync_capabilities(pool: &PgPool, server_id: i32, manifest: &serde_json::Value) {
     if let Some(caps) = manifest.get("capabilities").and_then(|v| v.as_array()) {
         if let Ok(mut tx) = pool.begin().await {
             let _ = sqlx::query("DELETE FROM server_capabilities WHERE server_id = $1")
