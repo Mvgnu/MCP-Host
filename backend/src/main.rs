@@ -16,6 +16,7 @@ mod evaluation;
 mod evaluations;
 mod file_store;
 mod ingestion;
+mod intelligence;
 mod invocations;
 mod job_queue;
 mod marketplace;

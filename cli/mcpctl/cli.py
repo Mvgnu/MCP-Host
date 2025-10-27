@@ -13,6 +13,7 @@ from .commands import (
     install_evaluations,
     install_governance,
     install_marketplace,
+    install_policy,
     install_promotions,
     install_scaffold,
 )
@@ -37,6 +38,7 @@ def build_parser() -> ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
     install_marketplace(subparsers)
+    install_policy(subparsers)
     install_promotions(subparsers)
     install_governance(subparsers)
     install_evaluations(subparsers)

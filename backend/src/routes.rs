@@ -4,8 +4,9 @@ use axum::{
 };
 
 use crate::{
-    auth, capabilities, domains, evaluation, file_store, governance, ingestion, invocations,
-    marketplace, organizations, promotions, secrets, servers, services, vector_dbs, workflows,
+    auth, capabilities, domains, evaluation, file_store, governance, ingestion, intelligence,
+    invocations, marketplace, organizations, promotions, secrets, servers, services, vector_dbs,
+    workflows,
 };
 
 pub fn api_routes() -> Router {
@@ -103,6 +104,10 @@ pub fn api_routes() -> Router {
         .route(
             "/api/servers/:id/eval/results",
             get(evaluation::list_results),
+        )
+        .route(
+            "/api/intelligence/servers/:id/scores",
+            get(intelligence::list_scores),
         )
         .route(
             "/api/artifacts/:id/evaluations",

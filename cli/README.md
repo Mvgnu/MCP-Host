@@ -38,6 +38,10 @@ Lists marketplace artifacts and their active status. Pass `--json` to receive ra
 * `mcpctl evaluations list` – list evaluation certifications across artifacts.
 * `mcpctl evaluations retry EVALUATION_ID` – schedule a certification retry.
 
+### Policy intelligence
+
+* `mcpctl policy intelligence SERVER_ID [--json]` – display capability intelligence scores, status, and recent anomaly notes for the specified server.
+
 ### Scaffolding helpers
 
 The legacy scaffolding commands remain available under the `scaffold` group:

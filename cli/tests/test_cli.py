@@ -128,3 +128,34 @@ def test_governance_start_parses_context() -> None:
     assert method == "POST"
     assert path == "/api/governance/workflows/7/runs"
     assert payload["context"] == {"initiator": "ops"}
+
+
+def test_policy_intelligence_displays_scores(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    FakeClient.responses[("GET", "/api/intelligence/servers/5/scores")] = [
+        {
+            "capability": "runtime",
+            "score": 82.5,
+            "status": "healthy",
+            "backend": "docker",
+            "tier": "silver:Router",
+            "last_observed_at": "2025-11-10T00:00:00Z",
+            "notes": ["stable"],
+        },
+        {
+            "capability": "image-build",
+            "score": 58.0,
+            "status": "warning",
+            "backend": "docker",
+            "tier": "silver:Router",
+            "last_observed_at": "2025-11-10T00:00:00Z",
+            "notes": ["credential-check"],
+        },
+    ]
+
+    cli_module.main(["policy", "intelligence", "5"])
+    captured = capsys.readouterr().out
+    assert "runtime" in captured
+    assert "image-build" in captured
+    assert "82.5" in captured

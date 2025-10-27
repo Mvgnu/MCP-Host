@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use serde::{Serialize, Deserialize};
 use tokio::time::{sleep, Duration};
+use crate::intelligence;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Job {
@@ -17,6 +18,7 @@ pub enum Job {
     },
     Stop { server_id: i32 },
     Delete { server_id: i32 },
+    IntelligenceRefresh { server_id: i32 },
 }
 
 pub async fn enqueue_job(pool: &PgPool, job: &Job) {
@@ -26,6 +28,11 @@ pub async fn enqueue_job(pool: &PgPool, job: &Job) {
             .execute(pool)
             .await;
     }
+}
+
+pub async fn enqueue_intelligence_refresh(pool: &PgPool, server_id: i32) {
+    let job = Job::IntelligenceRefresh { server_id };
+    enqueue_job(pool, &job).await;
 }
 
 pub fn start_worker(pool: PgPool, runtime: Arc<dyn ContainerRuntime>) -> Sender<Job> {
@@ -61,10 +68,6 @@ pub fn start_worker(pool: PgPool, runtime: Arc<dyn ContainerRuntime>) -> Sender<
 
     tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
-            match &job {
-                Job::Start { .. } | Job::Stop { .. } | Job::Delete { .. } => {}
-            }
-
             match job {
                 Job::Start { server_id, server_type, config, api_key, use_gpu } => {
                     let rt = runtime.clone();
@@ -77,6 +80,23 @@ pub fn start_worker(pool: PgPool, runtime: Arc<dyn ContainerRuntime>) -> Sender<
                 Job::Delete { server_id } => {
                     let rt = runtime.clone();
                     rt.delete_server_task(server_id, pool.clone());
+                }
+                Job::IntelligenceRefresh { server_id } => {
+                    let db = pool.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = intelligence::recompute_from_history(&db, server_id).await {
+                            tracing::warn!(
+                                ?err,
+                                %server_id,
+                                "intelligence recompute job failed",
+                            );
+                        } else {
+                            tracing::info!(
+                                %server_id,
+                                "intelligence recompute job completed",
+                            );
+                        }
+                    });
                 }
             }
         }
