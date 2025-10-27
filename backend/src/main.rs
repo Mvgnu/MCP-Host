@@ -33,15 +33,19 @@ mod workflows;
 
 use axum::{routing::get, Extension, Router};
 use axum_prometheus::PrometheusMetricLayer;
+use base64::engine::general_purpose::STANDARD as Base64Engine;
+use base64::Engine;
+use ed25519_dalek::PublicKey;
 use job_queue::start_worker;
 use policy::{RuntimeBackend, RuntimePolicyEngine};
 use runtime::{
-    ContainerRuntime, DockerRuntime, InlineEvidenceAttestor, KubernetesRuntime, LocalVmProvisioner,
-    RuntimeOrchestrator, VirtualMachineExecutor,
+    ContainerRuntime, DockerRuntime, HttpHypervisorProvisioner, KubernetesRuntime,
+    RuntimeOrchestrator, TpmAttestationVerifier, VirtualMachineExecutor,
 };
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing_subscriber::{fmt, EnvFilter};
 
 async fn root() -> &'static str {
@@ -130,8 +134,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .register_executor(DockerRuntime::descriptor())
             .await;
         let docker_executor: Arc<dyn runtime::RuntimeExecutor> = Arc::new(DockerRuntime::new());
-        let provisioner: Arc<dyn runtime::VmProvisioner> = Arc::new(LocalVmProvisioner);
-        let attestor: Arc<dyn runtime::AttestationVerifier> = Arc::new(InlineEvidenceAttestor);
+        let provisioner: Arc<dyn runtime::VmProvisioner> =
+            Arc::new(HttpHypervisorProvisioner::new(
+                config::VM_HYPERVISOR_ENDPOINT.clone(),
+                (*config::VM_HYPERVISOR_TOKEN).clone(),
+                *config::VM_LOG_TAIL_LINES,
+            )?);
+        let mut trust_roots = Vec::new();
+        for encoded in config::VM_ATTESTATION_TRUST_ROOTS.iter() {
+            match Base64Engine.decode(encoded) {
+                Ok(bytes) if bytes.len() == 32 => {
+                    let mut key_bytes = [0u8; 32];
+                    key_bytes.copy_from_slice(&bytes);
+                    match PublicKey::from_bytes(&key_bytes) {
+                        Ok(key) => trust_roots.push(key),
+                        Err(err) => tracing::warn!(?err, "failed to parse attestation trust root"),
+                    }
+                }
+                Ok(_) => tracing::warn!("invalid trust root length"),
+                Err(err) => tracing::warn!(?err, "failed to decode attestation trust root"),
+            }
+        }
+        if trust_roots.is_empty() {
+            tracing::warn!(
+                "no attestation trust roots configured; relying on evidence-provided keys"
+            );
+        }
+        let attestor: Arc<dyn runtime::AttestationVerifier> =
+            Arc::new(TpmAttestationVerifier::new(
+                (*config::VM_ATTESTATION_MEASUREMENTS).clone(),
+                trust_roots,
+                Duration::from_secs(*config::VM_ATTESTATION_MAX_AGE_SECONDS),
+            ));
         let vm_executor: Arc<dyn runtime::RuntimeExecutor> = Arc::new(VirtualMachineExecutor::new(
             pool.clone(),
             provisioner,

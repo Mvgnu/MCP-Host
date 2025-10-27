@@ -1,14 +1,21 @@
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as Base64Engine;
+use base64::Engine;
 use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration};
+use ed25519_dalek::{PublicKey, Signature, Verifier};
+use futures_util::StreamExt;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use sqlx::Row;
 use tokio::sync::mpsc::Receiver;
-use uuid::Uuid;
 
 use crate::policy::{PolicyDecision, RuntimeBackend};
 use crate::servers::{add_metric, set_status};
@@ -498,7 +505,7 @@ impl crate::runtime::RuntimeExecutor for VirtualMachineExecutor {
     fn stream_logs_task(&self, server_id: i32, _pool: PgPool) -> Option<Receiver<String>> {
         let provisioner = Arc::clone(&self.provisioner);
         let pool_lookup = self.pool.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
             match sqlx::query(
                 r#"SELECT instance_id FROM runtime_vm_instances WHERE server_id = $1 AND terminated_at IS NULL ORDER BY created_at DESC LIMIT 1"#,
@@ -537,85 +544,404 @@ impl crate::runtime::RuntimeExecutor for VirtualMachineExecutor {
     }
 }
 
-pub struct LocalVmProvisioner;
+#[derive(Clone)]
+pub struct HttpHypervisorProvisioner {
+    client: reqwest::Client,
+    base_url: String,
+    auth_token: Option<String>,
+    log_tail: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct HypervisorInstanceResponse {
+    instance_id: String,
+    #[serde(default)]
+    isolation_tier: Option<String>,
+    #[serde(default, rename = "attestation")]
+    attestation_evidence: Option<Value>,
+    #[serde(default)]
+    image: Option<String>,
+}
+
+impl HttpHypervisorProvisioner {
+    pub fn new(
+        base_url: impl Into<String>,
+        auth_token: Option<String>,
+        log_tail: usize,
+    ) -> Result<Self> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_static("mcp-host-runtime/1.0"),
+        );
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .context("failed to build hypervisor client")?;
+        Ok(Self {
+            client,
+            base_url: base_url.into(),
+            auth_token,
+            log_tail: log_tail.max(64),
+        })
+    }
+
+    fn auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(token) = &self.auth_token {
+            request.bearer_auth(token)
+        } else {
+            request
+        }
+    }
+
+    fn endpoint(&self, path: &str) -> String {
+        format!(
+            "{}/{}",
+            self.base_url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        )
+    }
+}
 
 #[async_trait]
-impl VmProvisioner for LocalVmProvisioner {
+impl VmProvisioner for HttpHypervisorProvisioner {
     async fn provision(
         &self,
         server_id: i32,
         decision: &PolicyDecision,
         config: Option<&Value>,
     ) -> Result<VmProvisioningResult> {
-        let instance_id = format!("vm-{}", Uuid::new_v4());
-        let evidence = config
-            .and_then(|cfg| cfg.get("attestation"))
-            .cloned()
-            .unwrap_or_else(|| {
-                json!({
-                    "issued_at": Utc::now().to_rfc3339(),
-                    "server_id": server_id,
-                    "policy_version": decision.policy_version,
-                })
-            });
+        let mut payload = json!({
+            "server_id": server_id,
+            "image": decision.image,
+            "policy_version": decision.policy_version,
+            "capabilities": decision
+                .capability_requirements
+                .iter()
+                .map(|cap| cap.as_str())
+                .collect::<Vec<_>>(),
+        });
+
+        if let Some(tier) = &decision.tier {
+            payload["tier"] = json!(tier);
+        }
+
+        if let Some(config) = config {
+            payload["config"] = config.clone();
+        }
+
+        let response = self
+            .auth(self.client.post(self.endpoint("instances")))
+            .json(&payload)
+            .send()
+            .await
+            .context("failed to contact hypervisor")?
+            .error_for_status()
+            .context("hypervisor rejected provisioning request")?;
+
+        let parsed: HypervisorInstanceResponse = response
+            .json()
+            .await
+            .context("failed to decode hypervisor response")?;
+
         Ok(VmProvisioningResult::new(
-            instance_id,
-            decision.tier.clone(),
-            Some(evidence),
-            decision.image.clone(),
+            parsed.instance_id,
+            parsed.isolation_tier.or_else(|| decision.tier.clone()),
+            parsed.attestation_evidence,
+            parsed.image.unwrap_or_else(|| decision.image.clone()),
         ))
     }
 
-    async fn start(&self, _instance_id: &str) -> Result<()> {
+    async fn start(&self, instance_id: &str) -> Result<()> {
+        self.auth(
+            self.client
+                .post(self.endpoint(&format!("instances/{instance_id}/start"))),
+        )
+        .send()
+        .await
+        .context("failed to reach hypervisor for start")?
+        .error_for_status()
+        .context("hypervisor rejected start request")?;
         Ok(())
     }
 
-    async fn stop(&self, _instance_id: &str) -> Result<()> {
+    async fn stop(&self, instance_id: &str) -> Result<()> {
+        self.auth(
+            self.client
+                .post(self.endpoint(&format!("instances/{instance_id}/stop"))),
+        )
+        .send()
+        .await
+        .context("failed to reach hypervisor for stop")?
+        .error_for_status()
+        .context("hypervisor rejected stop request")?;
         Ok(())
     }
 
-    async fn teardown(&self, _instance_id: &str) -> Result<()> {
+    async fn teardown(&self, instance_id: &str) -> Result<()> {
+        self.auth(
+            self.client
+                .delete(self.endpoint(&format!("instances/{instance_id}"))),
+        )
+        .send()
+        .await
+        .context("failed to reach hypervisor for teardown")?
+        .error_for_status()
+        .context("hypervisor rejected teardown request")?;
         Ok(())
     }
 
-    async fn fetch_logs(&self, _instance_id: &str) -> Result<String> {
-        Ok("vm log capture is not yet implemented".to_string())
+    async fn fetch_logs(&self, instance_id: &str) -> Result<String> {
+        let response = self
+            .auth(
+                self.client
+                    .get(self.endpoint(&format!("instances/{instance_id}/logs")))
+                    .query(&[("tail", self.log_tail)]),
+            )
+            .send()
+            .await
+            .context("failed to reach hypervisor for logs")?
+            .error_for_status()
+            .context("hypervisor rejected log fetch")?;
+        Ok(response.text().await.context("failed to read log body")?)
     }
 
-    async fn stream_logs(&self, _instance_id: &str) -> Result<Option<Receiver<String>>> {
-        Ok(None)
+    async fn stream_logs(&self, instance_id: &str) -> Result<Option<Receiver<String>>> {
+        let response = self
+            .auth(
+                self.client
+                    .get(self.endpoint(&format!("instances/{instance_id}/logs/stream"))),
+            )
+            .send()
+            .await
+            .context("failed to reach hypervisor for log stream")?;
+
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+
+        let mut stream = response
+            .error_for_status()
+            .context("hypervisor rejected log stream request")?
+            .bytes_stream();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(async move {
+            let mut buffer = Vec::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(chunk) => {
+                        buffer.extend_from_slice(&chunk);
+                        while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
+                            let line = buffer.drain(..=pos).collect::<Vec<u8>>();
+                            let clean =
+                                String::from_utf8_lossy(&line[..line.len().saturating_sub(1)])
+                                    .to_string();
+                            if tx.send(clean).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(?err, "log stream chunk error");
+                        break;
+                    }
+                }
+            }
+            if !buffer.is_empty() {
+                match String::from_utf8(buffer) {
+                    Ok(tail) => {
+                        let _ = tx.send(tail).await;
+                    }
+                    Err(err) => {
+                        let recovered = String::from_utf8_lossy(&err.into_bytes()).to_string();
+                        let _ = tx.send(recovered).await;
+                    }
+                }
+            }
+        });
+
+        Ok(Some(rx))
     }
 }
 
-pub struct InlineEvidenceAttestor;
+pub struct TpmAttestationVerifier {
+    trusted_measurements: HashSet<String>,
+    trust_roots: Vec<PublicKey>,
+    max_age: Duration,
+}
+
+impl TpmAttestationVerifier {
+    pub fn new(
+        trusted_measurements: HashSet<String>,
+        trust_roots: Vec<PublicKey>,
+        max_age: Duration,
+    ) -> Self {
+        Self {
+            trusted_measurements,
+            trust_roots,
+            max_age,
+        }
+    }
+
+    fn normalize_measurement(value: &str) -> String {
+        value.trim().to_ascii_lowercase()
+    }
+
+    fn parse_signature(value: &Value) -> Result<Signature> {
+        let signature_b64 = value
+            .as_str()
+            .context("attestation signature must be string")?;
+        let decoded = Base64Engine
+            .decode(signature_b64)
+            .context("invalid attestation signature encoding")?;
+        let bytes: [u8; 64] = decoded
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid signature length"))?;
+        let signature =
+            Signature::from_bytes(&bytes).context("failed to parse attestation signature")?;
+        Ok(signature)
+    }
+
+    fn extract_quote<'a>(evidence: &'a Value) -> Result<(&'a Value, &'a Value, &'a Value)> {
+        let quote = evidence.get("quote").context("missing attestation quote")?;
+        let report = quote.get("report").context("missing attestation report")?;
+        let signature = quote
+            .get("signature")
+            .context("missing attestation signature")?;
+        Ok((quote, report, signature))
+    }
+
+    fn extract_public_keys<'a>(
+        &self,
+        quote: &'a Value,
+        evidence: &'a Value,
+    ) -> Result<Vec<PublicKey>> {
+        let mut keys = Vec::new();
+        if let Some(key_value) = quote
+            .get("public_key")
+            .or_else(|| evidence.get("public_key"))
+        {
+            if let Some(key_str) = key_value.as_str() {
+                let decoded = Base64Engine
+                    .decode(key_str)
+                    .context("invalid attestation public key encoding")?;
+                if decoded.len() == 32 {
+                    let mut bytes = [0u8; 32];
+                    bytes.copy_from_slice(&decoded);
+                    if let Ok(verifying) = PublicKey::from_bytes(&bytes) {
+                        keys.push(verifying);
+                    }
+                }
+            }
+        }
+
+        if keys.is_empty() {
+            keys.extend(self.trust_roots.iter().cloned());
+        }
+
+        if keys.is_empty() {
+            anyhow::bail!("no attestation trust roots configured");
+        }
+
+        Ok(keys)
+    }
+
+    fn parse_timestamp(report: &Value) -> Result<DateTime<Utc>> {
+        let ts = report
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .context("missing attestation timestamp")?;
+        let parsed = DateTime::parse_from_rfc3339(ts).context("invalid attestation timestamp")?;
+        Ok(parsed.with_timezone(&Utc))
+    }
+}
 
 #[async_trait]
-impl AttestationVerifier for InlineEvidenceAttestor {
+impl AttestationVerifier for TpmAttestationVerifier {
     async fn verify(
         &self,
         _server_id: i32,
-        _decision: &PolicyDecision,
+        decision: &PolicyDecision,
         provisioning: &VmProvisioningResult,
-        _config: Option<&Value>,
+        config: Option<&Value>,
     ) -> Result<AttestationOutcome> {
-        let evidence = provisioning.attestation_evidence.clone();
-        let trusted = evidence
-            .as_ref()
-            .and_then(|value| value.get("trusted"))
-            .and_then(|value| value.as_bool())
-            .unwrap_or(true);
+        let evidence = match provisioning.attestation_evidence.as_ref() {
+            Some(evidence) => evidence,
+            None => {
+                return Ok(AttestationOutcome::untrusted(
+                    None,
+                    vec!["attestation:missing-evidence".to_string()],
+                ))
+            }
+        };
 
-        if trusted {
-            Ok(AttestationOutcome::trusted(
-                evidence,
-                vec!["attestation:trusted".to_string()],
-            ))
-        } else {
-            Ok(AttestationOutcome::untrusted(
-                provisioning.attestation_evidence.clone(),
-                vec!["attestation:rejected".to_string()],
-            ))
+        let (quote, report, signature_value) = Self::extract_quote(evidence)?;
+        let measurement = report
+            .get("measurement")
+            .and_then(|v| v.as_str())
+            .map(Self::normalize_measurement)
+            .context("missing attestation measurement")?;
+
+        let timestamp = Self::parse_timestamp(report)?;
+        if Utc::now() - timestamp
+            > ChronoDuration::from_std(self.max_age).unwrap_or_else(|_| ChronoDuration::minutes(5))
+        {
+            return Ok(AttestationOutcome::untrusted(
+                Some(evidence.clone()),
+                vec!["attestation:stale".to_string()],
+            ));
         }
+
+        if !self.trusted_measurements.contains(&measurement) {
+            return Ok(AttestationOutcome::untrusted(
+                Some(evidence.clone()),
+                vec![format!("attestation:measurement:untrusted:{measurement}")],
+            ));
+        }
+
+        if let Some(required_nonce) = config
+            .and_then(|cfg| cfg.get("attestation"))
+            .and_then(|cfg| cfg.get("nonce"))
+            .and_then(|value| value.as_str())
+        {
+            let observed_nonce = report
+                .get("nonce")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if observed_nonce != required_nonce {
+                return Ok(AttestationOutcome::untrusted(
+                    Some(evidence.clone()),
+                    vec![format!(
+                        "attestation:nonce-mismatch:expected:{required_nonce}:actual:{observed_nonce}"
+                    )],
+                ));
+            }
+        }
+
+        let signature = Self::parse_signature(signature_value)?;
+        let message = serde_json::to_vec(report).context("failed to canonicalize report")?;
+        let keys = self.extract_public_keys(quote, evidence)?;
+
+        for key in keys {
+            if key.verify_strict(&message, &signature).is_ok() {
+                let mut notes = vec![
+                    format!("attestation:measurement:{measurement}"),
+                    format!("attestation:timestamp:{}", timestamp.to_rfc3339()),
+                ];
+                if let Some(nonce_value) = report.get("nonce").and_then(|v| v.as_str()) {
+                    notes.push(format!("attestation:nonce:{nonce_value}"));
+                }
+                notes.push(format!("attestation:policy:{}", decision.policy_version));
+                return Ok(AttestationOutcome::trusted(Some(evidence.clone()), notes));
+            }
+        }
+
+        Ok(AttestationOutcome::untrusted(
+            Some(evidence.clone()),
+            vec!["attestation:signature-invalid".to_string()],
+        ))
     }
 }
 

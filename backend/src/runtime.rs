@@ -16,7 +16,7 @@ use crate::policy::{
     RuntimePolicyEngine,
 };
 pub use vm::{
-    AttestationVerifier, InlineEvidenceAttestor, LocalVmProvisioner, VirtualMachineExecutor,
+    AttestationVerifier, HttpHypervisorProvisioner, TpmAttestationVerifier, VirtualMachineExecutor,
     VmProvisioner,
 };
 
