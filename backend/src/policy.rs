@@ -489,12 +489,38 @@ impl RuntimePolicyEngine {
                     let now = Utc::now();
                     for (requirement, certification) in entries {
                         let active = certification.is_active(now);
+                        let mut stale_detail: Option<String> = None;
+                        if let Some(next_refresh) = certification.next_refresh_at {
+                            if next_refresh <= now {
+                                stale_detail = Some(format!("due@{}", next_refresh.to_rfc3339()));
+                            }
+                        } else if certification.refresh_cadence_seconds.is_some() {
+                            stale_detail = Some("missing-next-refresh".to_string());
+                        }
+                        if let Some(detail) = stale_detail.as_ref() {
+                            certification_blocked = true;
+                            notes.push(format!(
+                                "evaluation:stale:{}:{}:{}",
+                                tier_value, requirement, detail
+                            ));
+                        }
+                        if let Some(source) = &certification.evidence_source {
+                            if let Ok(serialized) = serde_json::to_string(source) {
+                                notes.push(format!(
+                                    "evaluation:provenance:{}:{}:{}",
+                                    tier_value, requirement, serialized
+                                ));
+                            }
+                        }
                         match certification.status {
-                            CertificationStatus::Pass if active => {
+                            CertificationStatus::Pass if active && stale_detail.is_none() => {
                                 notes.push(format!(
                                     "evaluation:certified:{}:{}",
                                     tier_value, requirement
                                 ));
+                            }
+                            CertificationStatus::Pass if active => {
+                                certification_blocked = true;
                             }
                             CertificationStatus::Pass => {
                                 certification_blocked = true;
@@ -940,8 +966,13 @@ mod tests {
                 policy_requirement: "baseline".to_string(),
                 status: CertificationStatus::Pass,
                 evidence: None,
+                evidence_source: None,
+                evidence_lineage: None,
                 valid_from: Utc::now() - Duration::minutes(1),
                 valid_until: Some(Utc::now() + Duration::minutes(30)),
+                refresh_cadence_seconds: Some(1_800),
+                next_refresh_at: Some(Utc::now() + Duration::minutes(15)),
+                governance_notes: None,
             },
         )
         .await?;

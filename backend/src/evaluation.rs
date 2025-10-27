@@ -1,5 +1,7 @@
 use crate::error::{AppError, AppResult};
-use crate::evaluations::{CertificationStatus, CertificationUpsert, EvaluationCertification};
+use crate::evaluations::{
+    CertificationPlanDelta, CertificationStatus, CertificationUpsert, EvaluationCertification,
+};
 use crate::extractor::AuthUser;
 use axum::{
     extract::{Extension, Path},
@@ -43,9 +45,40 @@ pub struct SubmitCertification {
     #[serde(default)]
     pub evidence: Option<Value>,
     #[serde(default)]
+    pub evidence_source: Option<Value>,
+    #[serde(default)]
+    pub evidence_lineage: Option<Value>,
+    #[serde(default)]
     pub valid_from: Option<DateTime<Utc>>,
     #[serde(default)]
     pub valid_until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub refresh_cadence_seconds: Option<i64>,
+    #[serde(default)]
+    pub next_refresh_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub governance_notes: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct CertificationLineage {
+    pub valid_from: DateTime<Utc>,
+    pub valid_until: Option<DateTime<Utc>>,
+    pub evidence_lineage: Option<Value>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct OverridePlan {
+    #[serde(default)]
+    pub refresh_cadence_seconds: Option<Option<i64>>,
+    #[serde(default)]
+    pub next_refresh_at: Option<Option<DateTime<Utc>>>,
+    #[serde(default)]
+    pub governance_notes: Option<Option<String>>,
+    #[serde(default)]
+    pub evidence_source: Option<Option<Value>>,
+    #[serde(default)]
+    pub evidence_lineage: Option<Option<Value>>,
 }
 
 pub async fn list_tests(
@@ -252,8 +285,13 @@ pub async fn submit_certification(
         policy_requirement,
         status,
         evidence,
+        evidence_source,
+        evidence_lineage,
         valid_from,
         valid_until,
+        refresh_cadence_seconds,
+        next_refresh_at,
+        governance_notes,
     } = payload;
 
     if tier.trim().is_empty() {
@@ -280,6 +318,22 @@ pub async fn submit_certification(
         }
     }
 
+    if let Some(cadence) = refresh_cadence_seconds.as_ref() {
+        if *cadence <= 0 {
+            return Err(AppError::BadRequest(
+                "refresh_cadence_seconds must be a positive integer".to_string(),
+            ));
+        }
+    }
+
+    if let Some(refresh_at) = next_refresh_at.as_ref() {
+        if *refresh_at <= effective_from {
+            return Err(AppError::BadRequest(
+                "next_refresh_at must be later than valid_from".to_string(),
+            ));
+        }
+    }
+
     let certification = crate::evaluations::upsert_certification(
         &pool,
         CertificationUpsert {
@@ -289,8 +343,13 @@ pub async fn submit_certification(
             policy_requirement,
             status,
             evidence,
+            evidence_source,
+            evidence_lineage,
             valid_from: effective_from,
             valid_until,
+            refresh_cadence_seconds,
+            next_refresh_at,
+            governance_notes,
         },
     )
     .await?;
@@ -303,29 +362,85 @@ pub async fn retry_certification(
     AuthUser { user_id, .. }: AuthUser,
     Path(certification_id): Path<i32>,
 ) -> AppResult<Json<EvaluationCertification>> {
-    let row = sqlx::query(
-        r#"
-        SELECT runs.id
-        FROM evaluation_certifications cert
-        JOIN build_artifact_runs runs ON cert.build_artifact_run_id = runs.id
-        JOIN mcp_servers servers ON runs.server_id = servers.id
-        WHERE cert.id = $1 AND servers.owner_id = $2
-        "#,
-    )
-    .bind(certification_id)
-    .bind(user_id)
-    .fetch_optional(&pool)
-    .await?;
-
-    if row.is_none() {
-        return Err(AppError::NotFound);
-    }
+    ensure_certification_access(&pool, certification_id, user_id).await?;
 
     let certification = crate::evaluations::retry_certification(&pool, certification_id)
         .await?
         .ok_or(AppError::NotFound)?;
 
     Ok(Json(certification))
+}
+
+pub async fn certification_status(
+    Extension(pool): Extension<PgPool>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(certification_id): Path<i32>,
+) -> AppResult<Json<EvaluationCertification>> {
+    ensure_certification_access(&pool, certification_id, user_id).await?;
+    let certification = crate::evaluations::get_certification(&pool, certification_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(certification))
+}
+
+pub async fn certification_lineage(
+    Extension(pool): Extension<PgPool>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(certification_id): Path<i32>,
+) -> AppResult<Json<CertificationLineage>> {
+    ensure_certification_access(&pool, certification_id, user_id).await?;
+    let certification = crate::evaluations::get_certification(&pool, certification_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(CertificationLineage {
+        valid_from: certification.valid_from,
+        valid_until: certification.valid_until,
+        evidence_lineage: certification.evidence_lineage,
+    }))
+}
+
+pub async fn override_certification_plan(
+    Extension(pool): Extension<PgPool>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(certification_id): Path<i32>,
+    Json(payload): Json<OverridePlan>,
+) -> AppResult<Json<EvaluationCertification>> {
+    ensure_certification_access(&pool, certification_id, user_id).await?;
+    let existing = crate::evaluations::get_certification(&pool, certification_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    if let Some(Some(cadence)) = payload.refresh_cadence_seconds.as_ref() {
+        if *cadence <= 0 {
+            return Err(AppError::BadRequest(
+                "refresh_cadence_seconds must be positive".to_string(),
+            ));
+        }
+    }
+
+    if let Some(Some(timestamp)) = payload.next_refresh_at.as_ref() {
+        if *timestamp <= existing.valid_from {
+            return Err(AppError::BadRequest(
+                "next_refresh_at must be later than valid_from".to_string(),
+            ));
+        }
+    }
+
+    let updated = crate::evaluations::update_plan(
+        &pool,
+        certification_id,
+        CertificationPlanDelta {
+            refresh_cadence_seconds: payload.refresh_cadence_seconds,
+            next_refresh_at: payload.next_refresh_at,
+            governance_notes: payload.governance_notes,
+            evidence_source: payload.evidence_source,
+            evidence_lineage: payload.evidence_lineage,
+        },
+    )
+    .await?
+    .ok_or(AppError::NotFound)?;
+
+    Ok(Json(updated))
 }
 
 struct RunAccess {
@@ -352,6 +467,32 @@ async fn ensure_run_access(pool: &PgPool, run_id: i32, user_id: i32) -> AppResul
     Ok(RunAccess {
         manifest_digest: row.get("manifest_digest"),
     })
+}
+
+async fn ensure_certification_access(
+    pool: &PgPool,
+    certification_id: i32,
+    user_id: i32,
+) -> AppResult<i32> {
+    let row = sqlx::query(
+        r#"
+        SELECT runs.id
+        FROM evaluation_certifications cert
+        JOIN build_artifact_runs runs ON cert.build_artifact_run_id = runs.id
+        JOIN mcp_servers servers ON runs.server_id = servers.id
+        WHERE cert.id = $1 AND servers.owner_id = $2
+        "#,
+    )
+    .bind(certification_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Err(AppError::NotFound);
+    };
+
+    Ok(row.get("id"))
 }
 
 #[derive(Serialize)]

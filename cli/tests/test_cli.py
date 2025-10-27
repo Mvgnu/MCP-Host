@@ -58,6 +58,16 @@ class FakeClient:
         FakeClient.calls.append(("POST", path, json_body or {}))
         return FakeClient.responses.get(("POST", path), {})
 
+    def patch(
+        self,
+        path: str,
+        *,
+        json: Dict[str, Any] | None = None,
+        params: Dict[str, Any] | None = None,
+    ) -> Any:
+        FakeClient.calls.append(("PATCH", path, json or {}))
+        return FakeClient.responses.get(("PATCH", path), {})
+
 
 @pytest.fixture(autouse=True)
 def _reset_fake_client(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -159,3 +169,33 @@ def test_policy_intelligence_displays_scores(
     assert "runtime" in captured
     assert "image-build" in captured
     assert "82.5" in captured
+
+
+def test_evaluations_plan_overrides_payload() -> None:
+    FakeClient.responses[("PATCH", "/api/evaluations/42/status")] = {
+        "id": 42,
+        "status": "pending",
+        "next_refresh_at": "2024-01-01T00:00:00+00:00",
+    }
+
+    exit_code = cli_module.main(
+        [
+            "evaluations",
+            "plan",
+            "42",
+            "--cadence-seconds",
+            "3600",
+            "--next-refresh",
+            "2024-01-01T00:00:00Z",
+            "--note",
+            "review",
+        ]
+    )
+
+    assert exit_code == 0
+    method, path, payload = FakeClient.calls[-1]
+    assert method == "PATCH"
+    assert path == "/api/evaluations/42/status"
+    assert payload["refresh_cadence_seconds"] == 3600
+    assert payload["governance_notes"] == "review"
+    assert payload["next_refresh_at"] == "2024-01-01T00:00:00+00:00"
