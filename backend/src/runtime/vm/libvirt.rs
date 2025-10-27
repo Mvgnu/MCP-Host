@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+#[cfg(feature = "libvirt-executor")]
+use anyhow::Context;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -110,6 +112,7 @@ pub struct LibvirtVmProvisioner {
 }
 
 impl LibvirtVmProvisioner {
+    #[cfg_attr(not(feature = "libvirt-executor"), allow(dead_code))]
     pub fn new(driver: Arc<dyn LibvirtDriver>, config: LibvirtProvisioningConfig) -> Self {
         Self { driver, config }
     }
@@ -548,14 +551,6 @@ pub mod testing {
     #[derive(Default)]
     pub struct InMemoryLibvirtDriver {
         domains: Mutex<HashMap<String, DomainState>>,
-    }
-
-    impl InMemoryLibvirtDriver {
-        pub fn new() -> Self {
-            Self {
-                domains: Mutex::new(HashMap::new()),
-            }
-        }
     }
 
     #[async_trait]

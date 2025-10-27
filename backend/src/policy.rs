@@ -1,3 +1,5 @@
+pub mod trust;
+
 use std::collections::{HashMap, HashSet};
 use std::convert::{Infallible, TryFrom};
 use std::fmt;

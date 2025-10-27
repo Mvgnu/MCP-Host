@@ -173,3 +173,12 @@
     - 2025-11-18 09:00:00 UTC: Initiated integration work after confirming runtime main.rs still instantiates the HTTP hypervisor provisioner and config lacks libvirt plumbing.
     - 2025-11-18 12:40:00 UTC: Wired libvirt provisioner selection, configuration loader, DB persistence, and tests; documented deployment runbook and console troubleshooting.
     - 2025-11-18 15:45:00 UTC: Restored the HTTP executor implementation, captured hypervisor snapshots for the legacy driver, resolved runtime VM test failures, and validated the stack with `cargo test`.
+
+- ID: BE-TRUST-001
+  Status: IN_PROGRESS
+  Task: Implement persistent VM attestation registry with trust posture transitions.
+  Hypothesis: Creating dedicated runtime_vm_attestations storage, extracting verifier logic into shared modules, and persisting trust transitions with policy hooks will enable schedulers, operators, and intelligence scoring to react to attestation posture changes.
+  Log:
+    - 2025-11-19 09:15:00 UTC: Began work on trust registry foundation by auditing existing VM instance persistence and attestation verifier logic.
+    - 2025-11-19 14:20:00 UTC: Routed TPM verifier through shared normalization helpers, surfaced SEV/TDX trust outcomes, and persisted raw attestation quotes for policy consumers.
+    - 2025-11-19 15:00:00 UTC: Aligned runtime/libvirt test imports with new re-exports, expanded attestation fixture coverage, and reran `cargo test --no-run` for regression confidence.

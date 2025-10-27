@@ -2,7 +2,7 @@ use once_cell::sync::Lazy;
 use std::collections::HashSet;
 use std::fs;
 
-use crate::runtime::vm::libvirt::{LibvirtAuthConfig, LibvirtProvisioningConfig};
+use crate::runtime::{LibvirtAuthConfig, LibvirtProvisioningConfig};
 use serde_json::{json, Value};
 
 /// Secret used for JWT signing. Must be set via the `JWT_SECRET` env variable.
