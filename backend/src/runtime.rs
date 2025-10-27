@@ -15,10 +15,13 @@ use crate::policy::{
     PolicyDecision, RuntimeBackend, RuntimeCapability, RuntimeExecutorDescriptor,
     RuntimePolicyEngine,
 };
-pub use vm::{
-    AttestationVerifier, HttpHypervisorProvisioner, TpmAttestationVerifier, VirtualMachineExecutor,
-    VmProvisioner,
+pub use vm::libvirt::testing::InMemoryLibvirtDriver;
+#[cfg(feature = "libvirt-executor")]
+pub use vm::libvirt::RealLibvirtDriver;
+pub use vm::libvirt::{
+    LibvirtAuthConfig, LibvirtDriver, LibvirtProvisioningConfig, LibvirtVmProvisioner,
 };
+pub use vm::{AttestationVerifier, TpmAttestationVerifier, VirtualMachineExecutor, VmProvisioner};
 
 #[async_trait]
 pub trait ContainerRuntime: Send + Sync {
