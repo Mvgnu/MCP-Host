@@ -1,17 +1,26 @@
 use std::collections::{HashMap, HashSet};
-use std::convert::TryFrom;
+use std::convert::{Infallible, TryFrom};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use axum::{
+    extract::Query,
+    response::sse::{Event, Sse},
+};
 use chrono::{DateTime, Duration, Utc};
+use futures_util::StreamExt;
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
+use tokio_stream::wrappers::BroadcastStream;
 
 use crate::config;
 use crate::evaluations::{self, CertificationStatus};
+use crate::extractor::AuthUser;
 use crate::governance::GovernanceEngine;
 use crate::intelligence::{self, IntelligenceError, IntelligenceStatus, RecomputeContext};
 use crate::job_queue;
@@ -20,6 +29,158 @@ use crate::marketplace::{classify_tier, derive_health, MarketplacePlatform};
 // key: runtime-policy -> placement-decisions,marketplace-health
 
 const POLICY_VERSION: &str = "runtime-policy-v0.1";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PolicyEventType {
+    Decision,
+    Attestation,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PolicyEvent {
+    #[serde(skip_serializing)]
+    pub owner_id: i32,
+    pub server_id: i32,
+    pub timestamp: DateTime<Utc>,
+    #[serde(rename = "type")]
+    pub event_type: PolicyEventType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluation_required: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub governance_required: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+static POLICY_EVENT_CHANNEL: Lazy<broadcast::Sender<PolicyEvent>> = Lazy::new(|| {
+    let (tx, _rx) = broadcast::channel(64);
+    tx
+});
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PolicyWatchParams {
+    #[serde(default)]
+    pub server_id: Option<i32>,
+}
+
+pub fn publish_policy_event(event: PolicyEvent) {
+    let _ = POLICY_EVENT_CHANNEL.send(event);
+}
+
+fn subscribe_policy_events() -> broadcast::Receiver<PolicyEvent> {
+    POLICY_EVENT_CHANNEL.subscribe()
+}
+
+pub async fn stream_policy_events(
+    AuthUser { user_id, .. }: AuthUser,
+    Query(params): Query<PolicyWatchParams>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>> + Send> {
+    let target_server = params.server_id;
+    let receiver = subscribe_policy_events();
+    let stream = BroadcastStream::new(receiver).filter_map(move |item| {
+        let filter_user = user_id;
+        let target = target_server;
+        async move {
+            match item {
+                Ok(event) if event.owner_id == filter_user => {
+                    if let Some(server) = target {
+                        if server != event.server_id {
+                            return None;
+                        }
+                    }
+                    match serde_json::to_string(&event) {
+                        Ok(payload) => Some(Ok(Event::default().data(payload))),
+                        Err(err) => {
+                            tracing::error!(?err, "failed to serialize policy event");
+                            None
+                        }
+                    }
+                }
+                Ok(_) => None,
+                Err(err) => {
+                    tracing::debug!(?err, "dropped policy event subscriber update");
+                    None
+                }
+            }
+        }
+    });
+    Sse::new(stream)
+}
+
+impl PolicyEvent {
+    pub fn decision(
+        owner_id: i32,
+        server_id: i32,
+        decision: &PolicyDecision,
+        posture: Option<&VmAttestationPolicyOutcome>,
+    ) -> Self {
+        let fallback_backend = posture
+            .and_then(|outcome| outcome.backend_override)
+            .map(|backend| backend.as_str().to_string());
+        let attestation_status = posture.and_then(|outcome| outcome.attestation_status.clone());
+        let stale_flag =
+            posture.and_then(|outcome| outcome.attestation_status.as_ref().map(|_| outcome.stale));
+        let mut notes = decision.notes.clone();
+        if !decision.promotion_notes.is_empty() {
+            notes.extend(decision.promotion_notes.clone());
+        }
+        Self {
+            owner_id,
+            server_id,
+            timestamp: Utc::now(),
+            event_type: PolicyEventType::Decision,
+            backend: Some(decision.backend.as_str().to_string()),
+            candidate_backend: Some(decision.candidate_backend.as_str().to_string()),
+            fallback_backend,
+            attestation_status,
+            evaluation_required: Some(decision.evaluation_required),
+            governance_required: Some(decision.governance_required),
+            instance_id: None,
+            stale: stale_flag,
+            notes,
+        }
+    }
+
+    pub fn attestation(
+        owner_id: i32,
+        server_id: i32,
+        backend: &RuntimeBackend,
+        instance_id: Option<String>,
+        status: String,
+        notes: Vec<String>,
+        fallback_backend: Option<RuntimeBackend>,
+    ) -> Self {
+        let stale = notes.iter().any(|note| note == "attestation:stale");
+        Self {
+            owner_id,
+            server_id,
+            timestamp: Utc::now(),
+            event_type: PolicyEventType::Attestation,
+            backend: Some(backend.as_str().to_string()),
+            candidate_backend: None,
+            fallback_backend: fallback_backend.map(|backend| backend.as_str().to_string()),
+            attestation_status: Some(status),
+            evaluation_required: None,
+            governance_required: None,
+            instance_id,
+            stale: Some(stale),
+            notes,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeBackend {
@@ -185,7 +346,7 @@ impl RuntimePolicyEngine {
         config: Option<&Value>,
         use_gpu: bool,
     ) -> Result<PolicyDecision, PolicyError> {
-        let decision = self
+        let (decision, vm_posture) = self
             .evaluate(pool, server_id, server_type, config, use_gpu)
             .await?;
         let decision_id = self.record_decision(pool, server_id, &decision).await?;
@@ -208,6 +369,31 @@ impl RuntimePolicyEngine {
                 }
             }
         }
+
+        match sqlx::query("SELECT owner_id FROM mcp_servers WHERE id = $1")
+            .bind(server_id)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(Some(row)) => {
+                let owner_id: i32 = row.get("owner_id");
+                publish_policy_event(PolicyEvent::decision(
+                    owner_id,
+                    server_id,
+                    &decision,
+                    vm_posture.as_ref(),
+                ));
+            }
+            Ok(None) => tracing::warn!(
+                %server_id,
+                "policy decision recorded for missing server",
+            ),
+            Err(err) => tracing::warn!(
+                ?err,
+                %server_id,
+                "failed to publish policy decision event due to owner lookup error",
+            ),
+        }
         Ok(decision)
     }
 
@@ -218,7 +404,7 @@ impl RuntimePolicyEngine {
         server_type: &str,
         config: Option<&Value>,
         use_gpu: bool,
-    ) -> Result<PolicyDecision, PolicyError> {
+    ) -> Result<(PolicyDecision, Option<VmAttestationPolicyOutcome>), PolicyError> {
         let mut notes = Vec::new();
         let mut backend = self.default_backend;
         let mut capability_requirements = Vec::new();
@@ -230,6 +416,7 @@ impl RuntimePolicyEngine {
         let mut promotion_status = None;
         let mut promotion_notes = Vec::new();
         let mut evaluation_required = false;
+        let mut vm_posture: Option<VmAttestationPolicyOutcome> = None;
 
         if use_gpu && !matches!(backend, RuntimeBackend::Kubernetes) {
             backend = RuntimeBackend::Kubernetes;
@@ -408,13 +595,14 @@ impl RuntimePolicyEngine {
 
             let posture =
                 evaluate_vm_attestation_posture(record, Utc::now(), stale_limit, fallback_backend);
-            notes.extend(posture.notes.into_iter());
+            notes.extend(posture.notes.clone().into_iter());
             if let Some(override_backend) = posture.backend_override {
                 backend = override_backend;
             }
             if posture.evaluation_required {
                 evaluation_required = true;
             }
+            vm_posture = Some(posture);
         }
 
         if !capability_requirements.is_empty() {
@@ -631,29 +819,32 @@ impl RuntimePolicyEngine {
             }
         }
 
-        Ok(PolicyDecision {
-            backend,
-            candidate_backend,
-            image,
-            requires_build,
-            artifact_run_id,
-            manifest_digest,
-            policy_version: POLICY_VERSION.to_string(),
-            evaluation_required,
-            governance_required,
-            governance_run_id,
-            tier,
-            health_overall,
-            capability_requirements,
-            capabilities_satisfied,
-            executor_name,
-            notes,
-            promotion_track_id,
-            promotion_track_name,
-            promotion_stage,
-            promotion_status,
-            promotion_notes,
-        })
+        Ok((
+            PolicyDecision {
+                backend,
+                candidate_backend,
+                image,
+                requires_build,
+                artifact_run_id,
+                manifest_digest,
+                policy_version: POLICY_VERSION.to_string(),
+                evaluation_required,
+                governance_required,
+                governance_run_id,
+                tier,
+                health_overall,
+                capability_requirements,
+                capabilities_satisfied,
+                executor_name,
+                notes,
+                promotion_track_id,
+                promotion_track_name,
+                promotion_stage,
+                promotion_status,
+                promotion_notes,
+            },
+            vm_posture,
+        ))
     }
 
     async fn record_decision(
@@ -863,6 +1054,8 @@ pub struct VmAttestationPolicyOutcome {
     pub notes: Vec<String>,
     pub backend_override: Option<RuntimeBackend>,
     pub evaluation_required: bool,
+    pub attestation_status: Option<String>,
+    pub stale: bool,
 }
 
 pub fn evaluate_vm_attestation_posture(
@@ -874,6 +1067,7 @@ pub fn evaluate_vm_attestation_posture(
     let mut outcome = VmAttestationPolicyOutcome::default();
     match record {
         Some(record) => {
+            outcome.attestation_status = Some(record.status.clone());
             outcome
                 .notes
                 .push(format!("vm:last-status:{}", record.status));
@@ -907,6 +1101,7 @@ pub fn evaluate_vm_attestation_posture(
                         .push(format!("vm:attestation:pending:{}s", age_seconds));
                     outcome.evaluation_required = true;
                     if age > stale_limit {
+                        outcome.stale = true;
                         outcome.notes.push("vm:attestation:stale".to_string());
                         outcome.notes.push(format!(
                             "vm:attestation:fallback:{}",
@@ -919,6 +1114,7 @@ pub fn evaluate_vm_attestation_posture(
             }
         }
         None => {
+            outcome.attestation_status = Some("none".to_string());
             outcome.notes.push("vm:attestation:none".to_string());
             outcome.notes.push(format!(
                 "vm:attestation:fallback:{}",

@@ -8,7 +8,7 @@ use base64::engine::general_purpose::STANDARD as Base64Engine;
 use base64::Engine;
 use chrono::Utc;
 use chrono::{DateTime, Duration as ChronoDuration};
-use ed25519_dalek::{PublicKey, Signature, Verifier};
+use ed25519_dalek::{PublicKey, Signature};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use sqlx::PgPool;
 use sqlx::Row;
 use tokio::sync::mpsc::Receiver;
 
-use crate::policy::{PolicyDecision, RuntimeBackend};
+use crate::policy::{publish_policy_event, PolicyDecision, PolicyEvent, RuntimeBackend};
 use crate::servers::{add_metric, set_status};
 
 // key: runtime-vm-executor -> attestation,policy-hooks
@@ -321,6 +321,7 @@ impl crate::runtime::RuntimeExecutor for VirtualMachineExecutor {
                     .await
                     .context("attestation verification failed")?;
 
+                let attestation_notes = attestation.notes.clone();
                 if let Some(record_id) = vm_id {
                     VirtualMachineExecutor::record_event(
                         &pool,
@@ -328,7 +329,7 @@ impl crate::runtime::RuntimeExecutor for VirtualMachineExecutor {
                         "attestation",
                         json!({
                             "status": attestation.status.as_str(),
-                            "notes": attestation.notes,
+                            "notes": attestation_notes.clone(),
                         }),
                     )
                     .await
@@ -343,6 +344,34 @@ impl crate::runtime::RuntimeExecutor for VirtualMachineExecutor {
                     .execute(&pool)
                     .await
                     .ok();
+                }
+
+                match sqlx::query("SELECT owner_id FROM mcp_servers WHERE id = $1")
+                    .bind(server_id)
+                    .fetch_optional(&pool)
+                    .await
+                {
+                    Ok(Some(row)) => {
+                        let owner_id: i32 = row.get("owner_id");
+                        publish_policy_event(PolicyEvent::attestation(
+                            owner_id,
+                            server_id,
+                            &decision.backend,
+                            Some(provisioning.instance_id.clone()),
+                            attestation.status.as_str().to_string(),
+                            attestation_notes.clone(),
+                            None,
+                        ));
+                    }
+                    Ok(None) => tracing::warn!(
+                        %server_id,
+                        "attestation completed for missing server owner",
+                    ),
+                    Err(err) => tracing::warn!(
+                        ?err,
+                        %server_id,
+                        "failed to publish attestation event due to owner lookup error",
+                    ),
                 }
 
                 match attestation.status {

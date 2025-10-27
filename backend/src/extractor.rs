@@ -1,8 +1,10 @@
+// key: auth-extractor -> jwt-expiry-enforcement
 use axum::async_trait;
 use axum::{
     extract::FromRequestParts,
     http::{request::Parts, StatusCode},
 };
+use chrono::Utc;
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use serde::Deserialize;
 
@@ -10,8 +12,7 @@ use serde::Deserialize;
 struct Claims {
     sub: i32,
     role: String,
-    #[allow(dead_code)]
-    exp: usize,
+    exp: i64,
 }
 
 pub struct AuthUser {
@@ -49,6 +50,10 @@ where
             &Validation::default(),
         )
         .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid token".into()))?;
+        let now = Utc::now().timestamp().max(0);
+        if decoded.claims.exp <= now {
+            return Err((StatusCode::UNAUTHORIZED, "Expired token".into()));
+        }
         Ok(AuthUser {
             user_id: decoded.claims.sub,
             role: decoded.claims.role,
@@ -59,12 +64,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{http::Request, RequestPartsExt};
+    use axum::http::Request;
+    use chrono::{Duration, Utc};
     use jsonwebtoken::{encode, EncodingKey, Header};
 
     #[tokio::test]
     async fn token_parsed_from_header() {
-        let claims = serde_json::json!({"sub": 7, "role": "user", "exp": 9999999999u64});
+        let exp = (Utc::now() + Duration::hours(1)).timestamp();
+        let claims = serde_json::json!({"sub": 7, "role": "user", "exp": exp});
         let token = encode(
             &Header::default(),
             &claims,
@@ -87,6 +94,26 @@ mod tests {
         std::env::set_var("JWT_SECRET", "secret");
         let request = Request::builder()
             .header("Authorization", "Bearer invalid")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let mut parts = request.into_parts().0;
+        let res = AuthUser::from_request_parts(&mut parts, &()).await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn expired_token_rejected() {
+        let past_exp = (Utc::now() - Duration::hours(1)).timestamp();
+        let claims = serde_json::json!({"sub": 42, "role": "user", "exp": past_exp});
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .unwrap();
+        std::env::set_var("JWT_SECRET", "secret");
+        let request = Request::builder()
+            .header("Authorization", format!("Bearer {}", token))
             .body(axum::body::Body::empty())
             .unwrap();
         let mut parts = request.into_parts().0;
