@@ -31,14 +31,15 @@ If log retrieval returns empty output, verify `LIBVIRT_CONSOLE_SOURCE` matches t
 
 ## Attestation Trust Fabric
 
-The VM runtime now persists posture transitions in a dedicated `runtime_vm_trust_history` table. Each attestation outcome recorded through `policy::trust::persist_vm_attestation_outcome` emits a `pg_notify` event, appends history rows, and updates derived lineage columns on `evaluation_certifications` (`last_attestation_status`, `fallback_launched_at`, `remediation_attempts`). These updates keep evaluation refresh scheduling and intelligence scoring aligned with the active trust posture.
+The VM runtime now persists posture transitions in a dedicated `runtime_vm_trust_history` table and mirrors the latest lifecycle snapshot in `runtime_vm_trust_registry`. Each attestation outcome recorded through `policy::trust::persist_vm_attestation_outcome` emits a `pg_notify` event, advances the lifecycle state machine (`suspect → quarantined → remediating → restored`), stamps remediation attempt counters, and records attestation provenance. Registry writes use optimistic locking so scheduler/policy/operator actions can coordinate without clobbering state.
 
 Key integration points:
 
-- **Scheduler:** `evaluations::scheduler` skips refreshes when the latest attestation status is `untrusted`, appends governance notes, and preserves fallback timestamps so operators can audit paused evidence. Trusted states resume the cadence automatically.
-- **Trust notifications:** `trust::spawn_trust_listener` subscribes to the `runtime_vm_trust_transition` channel, recalculates evaluation plans in real time, and triggers intelligence recomputes whenever posture changes arrive from Postgres.
-- **Policy engine:** placement decisions hydrate the latest trust event via `runtime_vm_trust_history` and emit `vm:trust-event` notes, enabling downstream scoring and telemetry to reason about posture transitions and remediation state.
-- **Operator tooling:** `/api/evaluations` and the CLI surface lineage fields for trust, fallback attempts, and remediation counts so consoles can highlight blocked evidence and remediation activity.
-- **Intelligence scoring:** scoring logic folds trust transitions, remediation attempts, and transition reasons into capability notes and evidence payloads. Servers with degraded posture incur score penalties proportional to remediation churn.
+- **Scheduler:** `evaluations::scheduler` now promotes distrusted instances into the `remediating` lifecycle state while cancelling refresh jobs, preserving fallback timestamps, and keeping optimistic registry versions in sync. Trusted states resume the cadence automatically when restored.
+- **Trust notifications:** `trust::spawn_trust_listener` subscribes to the `runtime_vm_trust_transition` channel, recalculates evaluation plans in real time, forwards lifecycle/provenance metadata to SSE clients, and triggers intelligence recomputes whenever posture changes arrive from Postgres.
+- **Policy engine:** placement decisions hydrate the latest trust event via `runtime_vm_trust_history`, emit `vm:trust-*` notes for lifecycle, remediation counts, and provenance, and rely on registry snapshots when determining backend overrides.
+- **Runtime orchestrator:** placement launches now consult `runtime_vm_trust_registry` and block deployments when lifecycles are `quarantined` or remediation windows are stale, flipping servers into `pending-remediation`/`pending-attestation` until evidence is refreshed.
+- **Operator tooling:** `/api/servers/:id/vm`, `/api/evaluations`, and the CLI now expose lifecycle badges, remediation attempt counts, freshness deadlines, and provenance references so consoles can highlight blocked evidence and remediation activity without manual SQL queries.
+- **Intelligence scoring:** scoring logic folds lifecycle state, remediation attempts, freshness deadlines, and provenance hints into capability notes and evidence payloads. Servers with degraded posture incur score penalties proportional to remediation churn and stale evidence windows.
 
 Refer to `progress.md` for the operational rollout plan covering notification listeners, CLI affordances, and intelligence feedback loops built on top of the trust registry.

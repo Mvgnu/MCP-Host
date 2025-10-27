@@ -1103,6 +1103,32 @@ pub fn evaluate_vm_attestation_posture(
                 if let Some(reason) = &trust_event.transition_reason {
                     outcome.notes.push(format!("vm:trust-reason:{}", reason));
                 }
+                outcome.notes.push(format!(
+                    "vm:trust-lifecycle:{}",
+                    trust_event.current_lifecycle_state
+                ));
+                if let Some(previous) = &trust_event.previous_lifecycle_state {
+                    outcome
+                        .notes
+                        .push(format!("vm:trust-previous-lifecycle:{}", previous));
+                }
+                if trust_event.remediation_attempts > 0 {
+                    outcome.notes.push(format!(
+                        "vm:trust-remediation-attempts:{}",
+                        trust_event.remediation_attempts
+                    ));
+                }
+                if let Some(deadline) = trust_event.freshness_deadline {
+                    outcome.notes.push(format!(
+                        "vm:trust-freshness-deadline:{}",
+                        deadline.to_rfc3339()
+                    ));
+                }
+                if let Some(provenance_ref) = &trust_event.provenance_ref {
+                    outcome
+                        .notes
+                        .push(format!("vm:trust-provenance:{}", provenance_ref));
+                }
             }
 
             match record.status.as_str() {

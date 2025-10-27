@@ -522,6 +522,40 @@ def _render_policy_event(
     if trust_event_id is not None:
         summary["trust_event_id"] = trust_event_id
 
+    lifecycle_state = event.get("trust_lifecycle_state")
+    if isinstance(lifecycle_state, str):
+        previous = summary.get("trust_lifecycle_state")
+        summary["trust_lifecycle_state"] = lifecycle_state
+        if previous is None:
+            changes.append(f"trust lifecycle {lifecycle_state}")
+        elif previous != lifecycle_state:
+            changes.append(f"trust lifecycle {previous} -> {lifecycle_state}")
+
+    prev_lifecycle = event.get("trust_previous_lifecycle_state")
+    if isinstance(prev_lifecycle, str):
+        summary["trust_previous_lifecycle_state"] = prev_lifecycle
+
+    remediation_attempts = event.get("trust_remediation_attempts")
+    if isinstance(remediation_attempts, int):
+        previous = summary.get("trust_remediation_attempts")
+        summary["trust_remediation_attempts"] = remediation_attempts
+        if previous is None or previous != remediation_attempts:
+            changes.append(f"trust remediation {remediation_attempts}")
+
+    freshness_deadline = event.get("freshness_expires_at") or event.get(
+        "trust_freshness_deadline"
+    )
+    if isinstance(freshness_deadline, str):
+        summary["trust_freshness_deadline"] = freshness_deadline
+
+    provenance_ref = event.get("trust_provenance_ref")
+    if isinstance(provenance_ref, str):
+        summary["trust_provenance_ref"] = provenance_ref
+
+    provenance = event.get("trust_provenance")
+    if provenance is not None:
+        summary["trust_provenance"] = provenance
+
     stale_flag = event.get("stale")
     if isinstance(stale_flag, bool):
         previous = summary.get("stale")

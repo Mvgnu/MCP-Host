@@ -1,5 +1,6 @@
 use chrono::Utc;
 use serde::Deserialize;
+use serde_json::Value;
 use sqlx::{postgres::PgListener, PgPool, Row};
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, warn};
@@ -17,8 +18,14 @@ struct TrustNotification {
     attestation_id: Option<i64>,
     previous_status: Option<String>,
     current_status: String,
+    previous_lifecycle_state: Option<String>,
+    current_lifecycle_state: String,
     transition_reason: Option<String>,
     remediation_state: Option<String>,
+    remediation_attempts: Option<i32>,
+    freshness_deadline: Option<chrono::DateTime<Utc>>,
+    provenance_ref: Option<String>,
+    provenance: Option<Value>,
     triggered_at: chrono::DateTime<Utc>,
 }
 
@@ -60,10 +67,15 @@ async fn listen(pool: PgPool, job_tx: Sender<Job>) -> Result<(), sqlx::Error> {
                     vm_instance_id: message.runtime_vm_instance_id,
                     current_status: message.current_status.clone(),
                     previous_status: message.previous_status.clone(),
+                    lifecycle_state: message.current_lifecycle_state.clone(),
+                    previous_lifecycle_state: message.previous_lifecycle_state.clone(),
                     transition_reason: message.transition_reason.clone(),
                     remediation_state: message.remediation_state.clone(),
                     triggered_at: message.triggered_at,
-                    freshness_expires_at: None,
+                    freshness_expires_at: message.freshness_deadline,
+                    remediation_attempts: message.remediation_attempts.unwrap_or_default(),
+                    provenance_ref: message.provenance_ref.clone(),
+                    provenance: message.provenance.clone(),
                     posture_changed: message
                         .previous_status
                         .as_deref()

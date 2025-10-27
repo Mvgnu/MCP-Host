@@ -105,6 +105,18 @@ pub struct VmInstanceView {
     pub capability_notes: Vec<String>,
     #[serde(default)]
     pub events: Vec<VmEventView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_lifecycle_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_previous_lifecycle_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_freshness_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_remediation_attempts: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_provenance_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_provenance: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -344,6 +356,12 @@ mod tests {
             gpu_passthrough_policy: None,
             capability_notes: vec!["attestation:ok".to_string()],
             events: vec![],
+            trust_lifecycle_state: None,
+            trust_previous_lifecycle_state: None,
+            trust_freshness_deadline: None,
+            trust_remediation_attempts: None,
+            trust_provenance_ref: None,
+            trust_provenance: None,
         };
         let stale = VmInstanceView {
             id: 2,
@@ -364,6 +382,12 @@ mod tests {
             gpu_passthrough_policy: None,
             capability_notes: vec!["attestation:untrusted".to_string()],
             events: vec![],
+            trust_lifecycle_state: None,
+            trust_previous_lifecycle_state: None,
+            trust_freshness_deadline: None,
+            trust_remediation_attempts: None,
+            trust_provenance_ref: None,
+            trust_provenance: None,
         };
 
         let summary = VmRuntimeSummary::from_instances(99, vec![active.clone(), stale]);
@@ -887,6 +911,12 @@ pub async fn vm_runtime_details(
             vmi.hypervisor_volume_template,
             vmi.gpu_passthrough_policy,
             vmi.capability_notes,
+            COALESCE(latest.current_lifecycle_state, registry.lifecycle_state) AS trust_lifecycle_state,
+            latest.previous_lifecycle_state AS trust_previous_lifecycle_state,
+            COALESCE(latest.freshness_deadline, registry.freshness_deadline) AS trust_freshness_deadline,
+            COALESCE(registry.remediation_attempts, latest.remediation_attempts) AS trust_remediation_attempts,
+            COALESCE(latest.provenance_ref, registry.provenance_ref) AS trust_provenance_ref,
+            COALESCE(latest.provenance, registry.provenance) AS trust_provenance,
             COALESCE(
                 (
                     SELECT json_agg(
@@ -903,6 +933,21 @@ pub async fn vm_runtime_details(
                 '[]'::json
             ) AS events
         FROM runtime_vm_instances vmi
+        LEFT JOIN runtime_vm_trust_registry registry
+            ON registry.runtime_vm_instance_id = vmi.id
+        LEFT JOIN LATERAL (
+            SELECT
+                h.previous_lifecycle_state,
+                h.current_lifecycle_state,
+                h.freshness_deadline,
+                h.remediation_attempts,
+                h.provenance_ref,
+                h.provenance
+            FROM runtime_vm_trust_history h
+            WHERE h.runtime_vm_instance_id = vmi.id
+            ORDER BY h.triggered_at DESC
+            LIMIT 1
+        ) latest ON TRUE
         WHERE vmi.server_id = $1
         ORDER BY vmi.created_at DESC
         LIMIT 10
@@ -945,6 +990,15 @@ pub async fn vm_runtime_details(
                 .try_get::<Vec<String>, _>("capability_notes")
                 .unwrap_or_default(),
             events,
+            trust_lifecycle_state: row.try_get("trust_lifecycle_state").ok(),
+            trust_previous_lifecycle_state: row
+                .try_get("trust_previous_lifecycle_state")
+                .ok()
+                .flatten(),
+            trust_freshness_deadline: row.try_get("trust_freshness_deadline").ok().flatten(),
+            trust_remediation_attempts: row.try_get("trust_remediation_attempts").ok().flatten(),
+            trust_provenance_ref: row.try_get("trust_provenance_ref").ok().flatten(),
+            trust_provenance: row.try_get("trust_provenance").ok().flatten(),
         };
         instances.push(instance);
     }

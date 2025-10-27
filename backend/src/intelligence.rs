@@ -93,6 +93,11 @@ pub struct ScoreSignals {
     pub trust_transition_reason: Option<String>,
     pub trust_triggered_at: Option<DateTime<Utc>>,
     pub trust_remediation_attempts: Option<i32>,
+    pub trust_lifecycle_state: Option<String>,
+    pub trust_previous_lifecycle_state: Option<String>,
+    pub trust_freshness_deadline: Option<DateTime<Utc>>,
+    pub trust_provenance_ref: Option<String>,
+    pub trust_provenance: Option<Value>,
 }
 
 impl Default for ScoreSignals {
@@ -114,6 +119,11 @@ impl Default for ScoreSignals {
             trust_transition_reason: None,
             trust_triggered_at: None,
             trust_remediation_attempts: None,
+            trust_lifecycle_state: None,
+            trust_previous_lifecycle_state: None,
+            trust_freshness_deadline: None,
+            trust_provenance_ref: None,
+            trust_provenance: None,
         }
     }
 }
@@ -261,6 +271,11 @@ fn compute_capability_score(
             "trust_transition_reason": signals.trust_transition_reason,
             "trust_triggered_at": signals.trust_triggered_at,
             "trust_remediation_attempts": signals.trust_remediation_attempts,
+            "trust_lifecycle_state": signals.trust_lifecycle_state,
+            "trust_previous_lifecycle_state": signals.trust_previous_lifecycle_state,
+            "trust_freshness_deadline": signals.trust_freshness_deadline,
+            "trust_provenance_ref": signals.trust_provenance_ref,
+            "trust_provenance": signals.trust_provenance,
         }));
         match trust_status {
             "untrusted" => {
@@ -275,6 +290,22 @@ fn compute_capability_score(
                 notes.push(format!("trust:{}", trust_status));
             }
         }
+    }
+
+    if let Some(lifecycle_state) = signals.trust_lifecycle_state.as_deref() {
+        notes.push(format!("trust:lifecycle:{lifecycle_state}"));
+    }
+    if let Some(previous_lifecycle) = signals.trust_previous_lifecycle_state.as_deref() {
+        notes.push(format!("trust:previous-lifecycle:{previous_lifecycle}"));
+    }
+    if let Some(deadline) = signals.trust_freshness_deadline {
+        notes.push(format!(
+            "trust:freshness-deadline:{}",
+            deadline.to_rfc3339()
+        ));
+    }
+    if let Some(provenance_ref) = signals.trust_provenance_ref.as_deref() {
+        notes.push(format!("trust:provenance:{provenance_ref}"));
     }
 
     if let Some(attempts) = signals.trust_remediation_attempts {
@@ -703,7 +734,13 @@ async fn load_signals(pool: &PgPool, server_id: i32) -> Result<ScoreSignals, Int
         SELECT
             h.current_status,
             h.transition_reason,
-            h.triggered_at
+            h.triggered_at,
+            h.current_lifecycle_state,
+            h.previous_lifecycle_state,
+            h.freshness_deadline,
+            h.remediation_attempts,
+            h.provenance_ref,
+            h.provenance
         FROM runtime_vm_instances i
         JOIN runtime_vm_trust_history h ON h.runtime_vm_instance_id = i.id
         WHERE i.server_id = $1
@@ -718,6 +755,21 @@ async fn load_signals(pool: &PgPool, server_id: i32) -> Result<ScoreSignals, Int
         signals.trust_status = row.get("current_status");
         signals.trust_transition_reason = row.get("transition_reason");
         signals.trust_triggered_at = Some(row.get("triggered_at"));
+        signals.trust_lifecycle_state = Some(row.get("current_lifecycle_state"));
+        signals.trust_previous_lifecycle_state = row
+            .try_get::<Option<String>, _>("previous_lifecycle_state")
+            .ok()
+            .flatten();
+        signals.trust_freshness_deadline = row
+            .try_get::<Option<DateTime<Utc>>, _>("freshness_deadline")
+            .ok()
+            .flatten();
+        signals.trust_remediation_attempts = Some(row.get("remediation_attempts"));
+        signals.trust_provenance_ref = row
+            .try_get::<Option<String>, _>("provenance_ref")
+            .ok()
+            .flatten();
+        signals.trust_provenance = row.try_get::<Option<Value>, _>("provenance").ok().flatten();
     }
 
     if signals.trust_remediation_attempts.is_none() {
