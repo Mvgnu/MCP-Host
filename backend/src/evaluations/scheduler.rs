@@ -4,8 +4,12 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use tokio::{sync::mpsc::Sender, time};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
+use crate::db::runtime_vm_trust_registry::{
+    get_state as get_registry_state, upsert_state as upsert_registry_state,
+    UpsertRuntimeVmTrustRegistryState,
+};
 use crate::job_queue::{enqueue_job, Job};
 
 const SCAN_INTERVAL_SECS: u64 = 60;
@@ -13,16 +17,22 @@ const LOOKAHEAD_MINUTES: i64 = 60;
 const FALLBACK_MINUTES: i64 = 30;
 const MAX_BATCH: i64 = 50;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TrustTransitionSignal {
     pub server_id: i32,
     pub vm_instance_id: i64,
     pub current_status: String,
     pub previous_status: Option<String>,
+    pub lifecycle_state: String,
+    pub previous_lifecycle_state: Option<String>,
     pub transition_reason: Option<String>,
     pub remediation_state: Option<String>,
     pub triggered_at: DateTime<Utc>,
     pub freshness_expires_at: Option<DateTime<Utc>>,
+    pub remediation_attempts: i32,
+    pub provenance_ref: Option<String>,
+    pub provenance: Option<Value>,
     pub posture_changed: bool,
 }
 
@@ -87,11 +97,66 @@ pub async fn handle_trust_transition(
             }
 
             clear_pending_refresh_jobs(pool, &certification_ids).await?;
+            ensure_remediation_lifecycle(pool, signal).await?;
         }
         _ => {}
     }
 
     Ok(())
+}
+
+async fn ensure_remediation_lifecycle(
+    pool: &PgPool,
+    signal: &TrustTransitionSignal,
+) -> Result<(), sqlx::Error> {
+    debug!(
+        vm_instance_id = signal.vm_instance_id,
+        current_status = %signal.current_status,
+        lifecycle = %signal.lifecycle_state,
+        previous_lifecycle = ?signal.previous_lifecycle_state,
+        transition_reason = ?signal.transition_reason,
+        triggered_at = ?signal.triggered_at,
+        "evaluating remediation lifecycle state"
+    );
+
+    if signal.lifecycle_state == "remediating" {
+        return Ok(());
+    }
+
+    let registry_state = get_registry_state(pool, signal.vm_instance_id).await?;
+    if let Some(state) = &registry_state {
+        if state.lifecycle_state == "remediating" {
+            return Ok(());
+        }
+    }
+
+    let lifecycle_state = "remediating";
+    let expected_version = registry_state.as_ref().map(|state| state.version);
+    let remediation_attempts = registry_state
+        .as_ref()
+        .map(|state| state.remediation_attempts)
+        .unwrap_or(signal.remediation_attempts);
+    let result = upsert_registry_state(
+        pool,
+        UpsertRuntimeVmTrustRegistryState {
+            runtime_vm_instance_id: signal.vm_instance_id,
+            attestation_status: signal.current_status.as_str(),
+            lifecycle_state,
+            remediation_state: signal.remediation_state.as_deref(),
+            remediation_attempts,
+            freshness_deadline: signal.freshness_expires_at,
+            provenance_ref: signal.provenance_ref.as_deref(),
+            provenance: signal.provenance.as_ref(),
+            expected_version,
+        },
+    )
+    .await;
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(sqlx::Error::RowNotFound) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 async fn scan_and_schedule(pool: &PgPool, job_tx: &Sender<Job>) -> Result<(), sqlx::Error> {
@@ -349,10 +414,15 @@ mod tests {
             vm_instance_id: 42,
             current_status: "untrusted".to_string(),
             previous_status: Some("trusted".to_string()),
+            lifecycle_state: "quarantined".to_string(),
+            previous_lifecycle_state: Some("restored".to_string()),
             transition_reason: Some("attestation".to_string()),
             remediation_state: Some("remediation:investigate".to_string()),
             triggered_at: Utc::now(),
             freshness_expires_at: None,
+            remediation_attempts: 1,
+            provenance_ref: None,
+            provenance: None,
             posture_changed: true,
         };
 
@@ -397,10 +467,15 @@ mod tests {
             vm_instance_id: 42,
             current_status: "trusted".to_string(),
             previous_status: Some("untrusted".to_string()),
+            lifecycle_state: "restored".to_string(),
+            previous_lifecycle_state: Some("quarantined".to_string()),
             transition_reason: Some("attestation".to_string()),
             remediation_state: Some("remediation:none".to_string()),
             triggered_at: Utc::now(),
             freshness_expires_at: None,
+            remediation_attempts: 0,
+            provenance_ref: None,
+            provenance: None,
             posture_changed: true,
         };
 

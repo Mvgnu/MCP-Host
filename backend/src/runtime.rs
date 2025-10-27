@@ -12,8 +12,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 
 use crate::policy::{
-    PolicyDecision, RuntimeBackend, RuntimeCapability, RuntimeExecutorDescriptor,
-    RuntimePolicyEngine,
+    trust::evaluate_placement_gate, PolicyDecision, RuntimeBackend, RuntimeCapability,
+    RuntimeExecutorDescriptor, RuntimePolicyEngine,
 };
 #[cfg(feature = "libvirt-executor")]
 pub use vm::libvirt::RealLibvirtDriver;
@@ -154,6 +154,47 @@ impl ContainerRuntime for RuntimeOrchestrator {
                     return;
                 }
             };
+
+            let gate = if matches!(decision.backend, RuntimeBackend::VirtualMachine) {
+                match evaluate_placement_gate(&pool, server_id).await {
+                    Ok(gate) => gate,
+                    Err(err) => {
+                        tracing::error!(
+                            ?err,
+                            %server_id,
+                            "failed to evaluate trust placement gate"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            if let Some(gate) = gate {
+                if gate.blocked {
+                    let status = gate.blocked_status();
+                    tracing::warn!(
+                        %server_id,
+                        vm_instance_id = gate.vm_instance_id,
+                        ?gate.lifecycle_state,
+                        stale = gate.stale,
+                        notes = %gate.notes.join(","),
+                        "blocking runtime placement due to trust registry gate",
+                    );
+                    if let Err(set_err) = crate::servers::set_status(&pool, server_id, status).await
+                    {
+                        tracing::error!(
+                            ?set_err,
+                            %server_id,
+                            status,
+                            "failed to set server status after trust gate"
+                        );
+                    }
+                    assignments.remove(&server_id);
+                    return;
+                }
+            }
 
             if decision.governance_required {
                 tracing::info!(

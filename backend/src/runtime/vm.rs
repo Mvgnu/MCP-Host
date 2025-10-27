@@ -349,6 +349,16 @@ impl crate::runtime::RuntimeExecutor for VirtualMachineExecutor {
                             if transition.should_invalidate_cache() {
                                 attestation_notes.push("attestation:cache:invalidate".to_string());
                             }
+                            attestation_notes
+                                .push(format!("trust:lifecycle:{}", transition.lifecycle_state));
+                            attestation_notes.push(format!(
+                                "trust:remediation-attempts:{}",
+                                transition.remediation_attempts
+                            ));
+                            if let Some(provenance_ref) = transition.provenance_ref.as_deref() {
+                                attestation_notes
+                                    .push(format!("trust:provenance:{}", provenance_ref));
+                            }
                             let mut payload = transition.broadcast_payload();
                             if let Value::Object(ref mut map) = payload {
                                 map.insert(
@@ -364,6 +374,31 @@ impl crate::runtime::RuntimeExecutor for VirtualMachineExecutor {
                                         .map(Value::from)
                                         .unwrap_or(Value::Null),
                                 );
+                                map.insert(
+                                    "trust_lifecycle_state".to_string(),
+                                    Value::from(transition.lifecycle_state.clone()),
+                                );
+                                map.insert(
+                                    "trust_previous_lifecycle_state".to_string(),
+                                    transition
+                                        .previous_lifecycle_state
+                                        .clone()
+                                        .map(Value::from)
+                                        .unwrap_or(Value::Null),
+                                );
+                                map.insert(
+                                    "trust_remediation_attempts".to_string(),
+                                    transition.remediation_attempts.into(),
+                                );
+                                if let Some(provenance_ref) = &transition.provenance_ref {
+                                    map.insert(
+                                        "trust_provenance_ref".to_string(),
+                                        Value::from(provenance_ref.clone()),
+                                    );
+                                }
+                                if let Some(provenance) = transition.provenance.clone() {
+                                    map.insert("trust_provenance".to_string(), provenance);
+                                }
                             }
                             transition_payload = Some(payload);
                         }
