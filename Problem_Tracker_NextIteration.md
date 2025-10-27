@@ -155,3 +155,12 @@
   Log:
     - 2025-11-16 13:10:00 UTC: Initiated task after confirming absence of VM telemetry routes and CLI coverage despite persisted runtime_vm_instances data.
     - 2025-11-16 14:05:00 UTC: Added `/api/servers/:id/vm`, CLI summaries, docs, and unit coverage to expose attestation posture and active instance insights.
+
+- ID: OPS-CLI-002
+  Status: DONE
+  Task: Deliver streaming `mcpctl policy watch` with attestation-aware SSE rendering.
+  Hypothesis: Broadcasting runtime policy and attestation deltas over SSE, then highlighting them in the CLI, will shrink operator reaction time for trust regressions without flooding consoles with low-signal noise.
+  Log:
+    - 2025-11-17 12:00:00 UTC: Planned SSE channel + CLI renderer after reviewing runtime policy evaluation and VM executor attestation hooks.
+    - 2025-11-17 14:45:00 UTC: Shipped `/api/policy/stream`, colored CLI diff rendering, regression tests, and README updates so operators can monitor trust posture live.
+    - 2025-11-17 16:20:00 UTC: Repaired backend compile errors from async SSE filter usage, restored Axum handler compatibility, and tightened CLI streaming output/tests to cover attestation summaries.

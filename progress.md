@@ -725,3 +725,9 @@ This document tracks development progress and high level notes from the planning
 ## 2025-11-07
 - Expanded `backend/tests/runtime_vm.rs` with a hypervisor error-path regression that confirms HTTP 503 responses surface actionable provisioning errors to operators.
 - Re-ran `RUSTFLAGS="-Awarnings" cargo test --test runtime_vm` to exercise the new coverage alongside the attestation and lifecycle scenarios.
+
+## 2025-11-17
+- Hardened `AuthUser` extraction by enforcing JWT expiration timestamps and surfacing an `Expired token` rejection path instead of suppressing the unused claim warning.
+- Added chrono-backed tests covering fresh, invalid, and expired bearer tokens so CLI and REST consumers inherit the stricter authentication posture without regressions.
+- Wired runtime policy decisions and VM attestation outcomes into a `/api/policy/stream` SSE feed and delivered `mcpctl policy watch` to colorize backend shifts, fallback triggers, and stale evidence from the terminal.
+- Followed up by fixing the SSE stream filter to return awaited futures, restored the Axum handler signature, and expanded CLI rendering/tests so attestation posture and active-instance summaries stream without breaking the build.

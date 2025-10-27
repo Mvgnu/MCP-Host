@@ -5,11 +5,19 @@ from __future__ import annotations
 
 import json
 from argparse import ArgumentParser, _SubParsersAction
-from typing import Callable, Dict
+from typing import Any, Callable, Dict
+
+import sys
 
 from ..client import APIClient
 from ..renderers import dumps_json, render_table
 from . import evaluations as evaluations_commands
+
+_RESET = "\033[0m"
+_GREEN = "\033[32m"
+_YELLOW = "\033[33m"
+_RED = "\033[31m"
+_CYAN = "\033[36m"
 
 CommandFn = Callable[[APIClient, bool, Dict[str, object]], None]
 
@@ -45,6 +53,19 @@ def install_policy(subparsers: _SubParsersAction[ArgumentParser]) -> None:
     vm_parser.add_argument("server_id", type=int)
     vm_parser.set_defaults(handler=_policy_vm_runtime)
     _add_common_arguments(vm_parser)
+
+    watch_parser = policy_sub.add_parser(
+        "watch",
+        help="Stream runtime policy and attestation updates in real time",
+    )
+    watch_parser.add_argument(
+        "--server-id",
+        dest="server_id",
+        type=int,
+        help="Restrict the stream to a specific server identifier",
+    )
+    watch_parser.set_defaults(handler=_policy_watch)
+    _add_common_arguments(watch_parser)
 
 
 def install_promotions(subparsers: _SubParsersAction[ArgumentParser]) -> None:
@@ -404,5 +425,165 @@ def _policy_vm_runtime(client: APIClient, as_json: bool, args: Dict[str, object]
     print(f"Latest posture: {latest} (updated {updated})")
     if active:
         print(f"Active instance: {active}")
+
+
+def _policy_watch(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
+    params: Dict[str, Any] = {}
+    server_id = args.get("server_id")
+    if server_id is not None:
+        params["server_id"] = server_id
+
+    state: Dict[int, Dict[str, Any]] = {}
+    use_color = sys.stdout.isatty() and not as_json
+
+    try:
+        for payload in client.stream_sse("/api/policy/stream", params=params or None):
+            if not payload:
+                continue
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError:
+                if as_json:
+                    print(payload)
+                continue
+
+            if as_json:
+                print(dumps_json(event))
+                continue
+
+            rendered = _render_policy_event(event, state, use_color)
+            if rendered:
+                print(rendered)
+    except KeyboardInterrupt:  # pragma: no cover - user initiated
+        pass
+
+
+def _render_policy_event(
+    event: Dict[str, Any],
+    state: Dict[int, Dict[str, Any]],
+    use_color: bool,
+) -> str | None:
+    server_id = event.get("server_id")
+    if not isinstance(server_id, int):
+        return None
+
+    timestamp = event.get("timestamp", "")
+    event_type = str(event.get("type", "unknown"))
+    summary = state.setdefault(server_id, {})
+    header = f"[{timestamp}] server {server_id} {event_type.upper()}"
+
+    changes: list[str] = []
+
+    backend = event.get("backend")
+    if isinstance(backend, str):
+        previous = summary.get("backend")
+        summary["backend"] = backend
+        if previous is None:
+            changes.append(f"backend {backend}")
+        elif previous != backend:
+            changes.append(f"backend {previous} -> {backend}")
+
+    candidate = event.get("candidate_backend")
+    if isinstance(candidate, str):
+        summary["candidate_backend"] = candidate
+
+    fallback_backend = event.get("fallback_backend")
+    if isinstance(fallback_backend, str):
+        summary["fallback_backend"] = fallback_backend
+        changes.append(f"fallback -> {fallback_backend}")
+
+    instance_id = event.get("instance_id")
+    if isinstance(instance_id, str):
+        summary["active_instance"] = instance_id
+
+    att_status = event.get("attestation_status")
+    if isinstance(att_status, str):
+        previous = summary.get("attestation_status")
+        summary["attestation_status"] = att_status
+        current = _colorize_status(att_status, use_color)
+        if previous is None:
+            changes.append(f"attestation {current}")
+        elif previous != att_status:
+            changes.append(
+                f"attestation {current} (was {_colorize_status(str(previous), use_color)})"
+            )
+
+    stale_flag = event.get("stale")
+    if isinstance(stale_flag, bool):
+        previous = summary.get("stale")
+        summary["stale"] = stale_flag
+        if previous is None or previous != stale_flag:
+            label = "stale" if stale_flag else "fresh"
+            changes.append(f"evidence {label}")
+
+    for field, label in ("evaluation_required", "evaluation"), ("governance_required", "governance"):
+        value = event.get(field)
+        if isinstance(value, bool):
+            previous = summary.get(field)
+            summary[field] = value
+            if previous is None or previous != value:
+                current = "required" if value else "clear"
+                if previous is None:
+                    changes.append(f"{label} {current}")
+                else:
+                    prev_label = "required" if previous else "clear"
+                    changes.append(f"{label} {prev_label} -> {current}")
+
+    instance_id = event.get("instance_id")
+    if isinstance(instance_id, str):
+        previous = summary.get("instance_id")
+        summary["instance_id"] = instance_id
+        if previous is None:
+            changes.append(f"instance {instance_id}")
+        elif previous != instance_id:
+            changes.append(f"instance {previous} -> {instance_id}")
+
+    signal_notes = _filter_signal_notes(event.get("notes"))
+    if not changes and not signal_notes:
+        return None
+
+    parts: list[str] = []
+    if changes:
+        parts.append("; ".join(changes))
+    active_instance = summary.get("active_instance")
+    if isinstance(active_instance, str):
+        parts.append(f"Active instance: {active_instance}")
+    latest_posture = summary.get("attestation_status")
+    if isinstance(latest_posture, str):
+        parts.append(f"Latest posture: {latest_posture}")
+    if signal_notes:
+        parts.append(", ".join(signal_notes))
+
+    return f"{header} {' | '.join(parts)}"
+
+
+def _filter_signal_notes(notes: Any) -> list[str]:
+    if not isinstance(notes, list):
+        return []
+    signals: list[str] = []
+    for note in notes:
+        if isinstance(note, str) and (
+            note.startswith("vm:attestation")
+            or note.startswith("attestation:")
+            or "fallback" in note
+        ):
+            signals.append(note)
+    return signals
+
+
+def _colorize_status(status: str, use_color: bool) -> str:
+    normalized = status.replace("_", "-").lower()
+    if not use_color:
+        return normalized
+
+    mapping = {
+        "trusted": _GREEN,
+        "untrusted": _RED,
+        "unknown": _YELLOW,
+        "pending": _YELLOW,
+        "stale": _YELLOW,
+    }
+    color = mapping.get(normalized, _CYAN)
+    return f"{color}{normalized}{_RESET}"
 
 

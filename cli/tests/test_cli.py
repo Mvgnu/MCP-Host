@@ -37,6 +37,7 @@ class FakeClient:
     """Test double for :class:`mcpctl.client.APIClient`."""
 
     responses: Dict[Tuple[str, str], Any] = {}
+    streams: Dict[str, list[str]] = {}
     calls: list[Tuple[str, str, Dict[str, Any]]] = []
 
     def __init__(self, base_url: str, token: str | None, timeout: int) -> None:  # pragma: no cover - args validated by CLI
@@ -68,10 +69,19 @@ class FakeClient:
         FakeClient.calls.append(("PATCH", path, json or {}))
         return FakeClient.responses.get(("PATCH", path), {})
 
+    def stream_sse(
+        self,
+        path: str,
+        params: Dict[str, Any] | None = None,
+    ) -> list[str]:
+        FakeClient.calls.append(("STREAM", path, params or {}))
+        return list(FakeClient.streams.get(path, []))
+
 
 @pytest.fixture(autouse=True)
 def _reset_fake_client(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeClient.responses = {}
+    FakeClient.streams = {}
     FakeClient.calls = []
     monkeypatch.setattr(cli_module, "APIClient", FakeClient)
 
@@ -198,8 +208,42 @@ def test_policy_vm_runtime_outputs_summary(
     captured = capsys.readouterr().out
     assert "vm-alpha" in captured
     assert "trusted" in captured
-    assert "Latest posture: trusted" in captured
-    assert "Active instance: vm-alpha" in captured
+
+
+def test_policy_watch_renders_stream(capsys: pytest.CaptureFixture[str]) -> None:
+    FakeClient.streams["/api/policy/stream"] = [
+        json.dumps(
+            {
+                "server_id": 9,
+                "timestamp": "2025-11-17T12:34:56Z",
+                "type": "decision",
+                "backend": "virtual-machine",
+                "candidate_backend": "virtual-machine",
+                "attestation_status": "trusted",
+                "evaluation_required": True,
+                "notes": ["vm:attestation:trusted"],
+            }
+        ),
+        json.dumps(
+            {
+                "server_id": 9,
+                "timestamp": "2025-11-17T12:36:00Z",
+                "type": "attestation",
+                "attestation_status": "untrusted",
+                "instance_id": "vm-alpha",
+                "notes": ["attestation:stale", "attestation:measurement:bad"],
+            }
+        ),
+    ]
+
+    cli_module.main(["policy", "watch"])
+    output = capsys.readouterr().out
+    assert "server 9 DECISION" in output
+    assert "attestation trusted" in output
+    assert "attestation untrusted" in output
+    assert FakeClient.calls[-1][0] == "STREAM"
+    assert "Latest posture: trusted" in output
+    assert "Active instance: vm-alpha" in output
 
 
 def test_evaluations_plan_overrides_payload() -> None:
