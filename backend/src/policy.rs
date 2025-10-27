@@ -1,14 +1,16 @@
 use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+use crate::config;
 use crate::evaluations::{self, CertificationStatus};
 use crate::governance::GovernanceEngine;
 use crate::intelligence::{self, IntelligenceError, IntelligenceStatus, RecomputeContext};
@@ -227,6 +229,7 @@ impl RuntimePolicyEngine {
         let mut promotion_stage = None;
         let mut promotion_status = None;
         let mut promotion_notes = Vec::new();
+        let mut evaluation_required = false;
 
         if use_gpu && !matches!(backend, RuntimeBackend::Kubernetes) {
             backend = RuntimeBackend::Kubernetes;
@@ -375,6 +378,45 @@ impl RuntimePolicyEngine {
             notes.push("artifact:none".to_string());
         }
 
+        if matches!(backend, RuntimeBackend::VirtualMachine) {
+            let fallback_backend = if use_gpu {
+                RuntimeBackend::Kubernetes
+            } else {
+                RuntimeBackend::Docker
+            };
+            let stale_seconds =
+                i64::try_from(*config::VM_ATTESTATION_MAX_AGE_SECONDS).unwrap_or(300);
+            let stale_limit = Duration::seconds(stale_seconds.max(60));
+            let vm_row = sqlx::query(
+                r#"
+                SELECT attestation_status, updated_at, terminated_at
+                FROM runtime_vm_instances
+                WHERE server_id = $1
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(server_id)
+            .fetch_optional(pool)
+            .await?;
+
+            let record = vm_row.map(|row| VmAttestationRecord {
+                status: row.get("attestation_status"),
+                updated_at: row.get("updated_at"),
+                terminated_at: row.get("terminated_at"),
+            });
+
+            let posture =
+                evaluate_vm_attestation_posture(record, Utc::now(), stale_limit, fallback_backend);
+            notes.extend(posture.notes.into_iter());
+            if let Some(override_backend) = posture.backend_override {
+                backend = override_backend;
+            }
+            if posture.evaluation_required {
+                evaluation_required = true;
+            }
+        }
+
         if !capability_requirements.is_empty() {
             let reqs = capability_requirements
                 .iter()
@@ -388,8 +430,6 @@ impl RuntimePolicyEngine {
         let (backend, capabilities_satisfied, executor_name) = self
             .select_backend(candidate_backend, &capability_requirements, &mut notes)
             .await;
-
-        let mut evaluation_required = false;
 
         let capability_keys: Vec<String> = capability_requirements
             .iter()
@@ -809,6 +849,86 @@ impl RuntimePolicyEngine {
             Ok(None)
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VmAttestationRecord {
+    pub status: String,
+    pub updated_at: DateTime<Utc>,
+    pub terminated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct VmAttestationPolicyOutcome {
+    pub notes: Vec<String>,
+    pub backend_override: Option<RuntimeBackend>,
+    pub evaluation_required: bool,
+}
+
+pub fn evaluate_vm_attestation_posture(
+    record: Option<VmAttestationRecord>,
+    now: DateTime<Utc>,
+    stale_limit: Duration,
+    fallback_backend: RuntimeBackend,
+) -> VmAttestationPolicyOutcome {
+    let mut outcome = VmAttestationPolicyOutcome::default();
+    match record {
+        Some(record) => {
+            outcome
+                .notes
+                .push(format!("vm:last-status:{}", record.status));
+            outcome.notes.push(format!(
+                "vm:last-updated:{}",
+                record.updated_at.to_rfc3339()
+            ));
+            if let Some(terminated) = record.terminated_at {
+                outcome
+                    .notes
+                    .push(format!("vm:last-terminated:{}", terminated.to_rfc3339()));
+            }
+
+            match record.status.as_str() {
+                "trusted" => outcome.notes.push("vm:attestation:trusted".to_string()),
+                "untrusted" => {
+                    outcome.notes.push("vm:attestation:untrusted".to_string());
+                    outcome.notes.push("vm:attestation:blocked".to_string());
+                    outcome.notes.push(format!(
+                        "vm:attestation:fallback:{}",
+                        fallback_backend.as_str()
+                    ));
+                    outcome.backend_override = Some(fallback_backend);
+                    outcome.evaluation_required = true;
+                }
+                "pending" | "unknown" => {
+                    let age = now - record.updated_at;
+                    let age_seconds = age.num_seconds().max(0);
+                    outcome
+                        .notes
+                        .push(format!("vm:attestation:pending:{}s", age_seconds));
+                    outcome.evaluation_required = true;
+                    if age > stale_limit {
+                        outcome.notes.push("vm:attestation:stale".to_string());
+                        outcome.notes.push(format!(
+                            "vm:attestation:fallback:{}",
+                            fallback_backend.as_str()
+                        ));
+                        outcome.backend_override = Some(fallback_backend);
+                    }
+                }
+                other => outcome.notes.push(format!("vm:attestation:status:{other}")),
+            }
+        }
+        None => {
+            outcome.notes.push("vm:attestation:none".to_string());
+            outcome.notes.push(format!(
+                "vm:attestation:fallback:{}",
+                fallback_backend.as_str()
+            ));
+            outcome.backend_override = Some(fallback_backend);
+            outcome.evaluation_required = true;
+        }
+    }
+    outcome
 }
 
 fn default_image_for(server_type: &str) -> &str {

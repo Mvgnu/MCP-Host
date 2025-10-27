@@ -2,6 +2,15 @@
 
 This document tracks development progress and high level notes from the planning materials in `README.md`.
 
+## 2025-11-16
+- Runtime policy engine now reads persisted VM attestation records when selecting executors, emitting decision notes for status, timestamps, and teardown metadata.
+- Policy evaluation automatically falls back to Docker when the latest attestation is marked untrusted and flags stale pending evidence for remediation scheduling.
+- Documented telemetry propagation ensures governance layers can observe VM trust posture without relying on manual log review.
+
+### Next Steps
+- Surface attestation-derived fallbacks in the operator console and CLI streaming views.
+- Teach evaluation refresh orchestration to requeue VM attestation jobs when evidence is flagged stale.
+
 ## 2024-05-04
 - Created `backend` Rust project using `cargo init`.
 - Added dependencies (`axum`, `tokio`, `serde`, `sqlx`, etc.) and basic HTTP server at `/` returning placeholder text.
@@ -209,6 +218,18 @@ This document tracks development progress and high level notes from the planning
 - Added API endpoints to update and delete service integrations.
 - Services page now lists each integration with Edit and Delete actions.
 - Updated docs to mention editing and removing integrations.
+
+## 2025-11-16
+- Replaced the placeholder VM provisioner with an HTTP hypervisor client that drives create/start/stop/teardown flows and streams live logs for governance review.
+- Added an Ed25519-backed attestation verifier that enforces measurement allowlists, nonce checks, and evidence freshness before allowing workloads to run.
+- Hardened runtime policy evaluation to fall back to container/Kubernetes executors when attestation is stale or untrusted, wiring telemetry notes for remediation.
+- Authored new integration tests covering hypervisor lifecycles, attestation rejection paths, and VM posture fallbacks.
+
+### Secure VM Runbook
+- Configure the runtime with `CONTAINER_RUNTIME=virtual-machine` plus `VM_HYPERVISOR_ENDPOINT`, optional `VM_HYPERVISOR_TOKEN`, and comma-delimited `VM_ATTESTATION_MEASUREMENTS`/`VM_ATTESTATION_TRUST_ROOTS` for trusted posture.
+- Ensure attestors publish Ed25519 signatures over the quote report JSON; the verifier accepts keys declared via `VM_ATTESTATION_TRUST_ROOTS` or inline `public_key` fields.
+- Keep evidence fresh: `VM_ATTESTATION_MAX_AGE_SECONDS` controls remediation thresholds, triggering automatic fallback once exceeded.
+- Operators can tail VM logs via the runtime APIs or CLI once streaming endpoints are wired, and should track `vm:attestation:*` notes in policy decisions to confirm placement outcomes.
 
 ### Next Steps
 - Investigate git-based deployments for custom MCP servers.
@@ -699,3 +720,7 @@ This document tracks development progress and high level notes from the planning
 - Expanded `RuntimePolicyEngine` decisions with executor descriptors, capability enforcement, and persisted metadata via migration 0022.
 - Updated Docker/Kubernetes runtimes to honor policy capability checks and rewrote Kubernetes log streaming for the new `AsyncBufRead` API.
 - Ran `cargo fmt` and `cargo test` from `backend/` to validate the refactor.
+
+## 2025-11-07
+- Expanded `backend/tests/runtime_vm.rs` with a hypervisor error-path regression that confirms HTTP 503 responses surface actionable provisioning errors to operators.
+- Re-ran `RUSTFLAGS="-Awarnings" cargo test --test runtime_vm` to exercise the new coverage alongside the attestation and lifecycle scenarios.

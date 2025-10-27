@@ -1,3 +1,20 @@
 pub mod error;
 pub mod intelligence;
+pub mod policy;
+pub mod runtime;
 pub mod telemetry;
+
+mod build;
+mod capabilities;
+mod config;
+mod docker;
+mod evaluation;
+mod evaluations;
+mod governance;
+mod extractor;
+mod job_queue;
+mod marketplace;
+mod artifacts;
+mod invocations;
+mod proxy;
+mod servers;
