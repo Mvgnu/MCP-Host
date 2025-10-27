@@ -5,7 +5,7 @@ use axum::{
 
 use crate::{
     auth, capabilities, domains, evaluation, file_store, governance, ingestion, invocations,
-    marketplace, organizations, secrets, servers, services, vector_dbs, workflows,
+    marketplace, organizations, promotions, secrets, servers, services, vector_dbs, workflows,
 };
 
 pub fn api_routes() -> Router {
@@ -115,6 +115,7 @@ pub fn api_routes() -> Router {
         )
         .route("/api/evaluations/summary", get(evaluation::scores_summary))
         .merge(governance::routes())
+        .merge(promotions::routes())
         .merge(workflows::routes())
         .merge(organizations::routes())
 }

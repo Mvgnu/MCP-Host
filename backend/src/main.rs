@@ -21,6 +21,7 @@ mod job_queue;
 mod marketplace;
 mod organizations;
 mod policy;
+mod promotions;
 mod proxy;
 mod routes;
 mod secrets;

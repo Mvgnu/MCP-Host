@@ -122,6 +122,11 @@ pub struct PolicyDecision {
     pub capabilities_satisfied: bool,
     pub executor_name: Option<String>,
     pub notes: Vec<String>,
+    pub promotion_track_id: Option<i32>,
+    pub promotion_track_name: Option<String>,
+    pub promotion_stage: Option<String>,
+    pub promotion_status: Option<String>,
+    pub promotion_notes: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -213,6 +218,11 @@ impl RuntimePolicyEngine {
         let mut capability_requirements = Vec::new();
         let mut governance_required = false;
         let mut governance_run_id = None;
+        let mut promotion_track_id = None;
+        let mut promotion_track_name = None;
+        let mut promotion_stage = None;
+        let mut promotion_status = None;
+        let mut promotion_notes = Vec::new();
 
         if use_gpu && !matches!(backend, RuntimeBackend::Kubernetes) {
             backend = RuntimeBackend::Kubernetes;
@@ -473,6 +483,11 @@ impl RuntimePolicyEngine {
                 Ok(gate) => {
                     let run_id = gate.run_id;
                     let satisfied = gate.satisfied;
+                    promotion_track_id = gate.promotion_track_id;
+                    promotion_track_name = gate.promotion_track_name.clone();
+                    promotion_stage = gate.promotion_stage.clone();
+                    promotion_status = gate.promotion_status.clone();
+                    promotion_notes = gate.notes.clone();
                     notes.extend(gate.notes);
                     if satisfied {
                         governance_run_id = run_id;
@@ -504,6 +519,11 @@ impl RuntimePolicyEngine {
             capabilities_satisfied,
             executor_name,
             notes,
+            promotion_track_id,
+            promotion_track_name,
+            promotion_stage,
+            promotion_status,
+            promotion_notes,
         })
     }
 
@@ -543,9 +563,13 @@ impl RuntimePolicyEngine {
                 capabilities_satisfied,
                 executor_name,
                 notes,
+                promotion_track_id,
+                promotion_stage,
+                promotion_status,
+                promotion_notes,
                 decided_at
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
             )
             RETURNING id
             "#,
@@ -567,6 +591,10 @@ impl RuntimePolicyEngine {
         .bind(decision.capabilities_satisfied)
         .bind(decision.executor_name.as_deref())
         .bind(notes_json)
+        .bind(decision.promotion_track_id)
+        .bind(decision.promotion_stage.as_deref())
+        .bind(decision.promotion_status.as_deref())
+        .bind(&decision.promotion_notes)
         .bind(Utc::now())
         .fetch_one(pool)
         .await?;

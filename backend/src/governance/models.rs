@@ -76,6 +76,8 @@ pub struct StartWorkflowRunRequest {
     pub target_manifest_digest: Option<String>,
     pub target_artifact_run_id: Option<i32>,
     pub notes: Option<Vec<String>>,
+    pub promotion_track_id: Option<i32>,
+    pub promotion_stage: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +114,8 @@ pub struct GovernanceRunDetail {
     pub notes: Vec<String>,
     pub target_manifest_digest: Option<String>,
     pub target_tier: String,
+    pub promotion_track_id: Option<i32>,
+    pub promotion_stage: Option<String>,
     pub initiated_by: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

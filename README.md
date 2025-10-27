@@ -119,6 +119,24 @@ The governance service lives in `backend/src/governance/` and exposes a typed en
 
 Route handlers publish updates to the existing job queue so completed promotion runs automatically retrigger deployments. The governance engine also links completed runs back to `runtime_policy_decisions`, ensuring audit trails capture which workflow certified a placement. Contract tags (`key: governance-workflows`, `key: governance-api`) guard the engine and HTTP module for downstream automation.
 
+### Release-train promotions
+
+Release trains now have first-class schema support (`backend/migrations/0025_create_promotion_tracks.sql`) tying marketplace digests to promotion tracks and gated runtime placement:
+
+* `promotion_tracks` define ordered stage names, owning users, and the governance workflow that should execute each promotion.
+* `artifact_promotions` capture every scheduled promotion for a manifest digest, recording status transitions (`scheduled`, `in_progress`, `approved`, `active`, `rolled_back`) and the linked governance workflow run.
+
+The marketplace API (`backend/src/marketplace.rs`) now surfaces promotion lineage for every artifact. Responses include the active promotion snapshot plus a stage-by-stage history so operators can trace which track and stage delivered the currently running artifact.
+
+New REST endpoints under `/api/promotions` (implemented in `backend/src/promotions.rs`) expose release-train controls:
+
+* `GET /api/promotions/tracks` – list promotion tracks owned by the caller, including configured stages and linked workflows.
+* `POST /api/promotions/schedule` – schedule a promotion for a manifest digest/stage. The handler validates stage ordering, records the promotion, and automatically launches the configured governance workflow.
+* `POST /api/promotions/:id/approve` – capture manual checkpoint approvals before governance completes.
+* `GET /api/promotions/history` – filter promotion records by track or digest for operator dashboards.
+
+The runtime policy engine consumes promotion records before each placement. Only digests with an **active** promotion for the requested tier bypass governance holds; any other state adds `promotion:*` notes to the persisted decision and blocks deployment until the release train advances. Governance workflow status updates synchronize back to `artifact_promotions`, marking successful runs active and rolling back failed attempts, so the runtime always enforces the freshest promotion truth.
+
 ### Telemetry consumer audit
 
 The enriched registry telemetry is ingested by several non-UI paths:
