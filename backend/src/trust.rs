@@ -16,13 +16,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, warn};
 
 use crate::{
-    db::runtime_vm_trust_history::{
-        history_for_instance as history_for_vm, insert_trust_event, NewRuntimeVmTrustEvent,
-        RuntimeVmTrustEvent,
-    },
-    db::runtime_vm_trust_registry::{
-        upsert_state as upsert_registry_state, UpsertRuntimeVmTrustRegistryState,
-    },
+    db::runtime_vm_trust_history::{history_for_instance as history_for_vm, RuntimeVmTrustEvent},
+    db::runtime_vm_trust_registry::{apply_transition, ApplyRuntimeVmTrustTransition},
     error::{AppError, AppResult},
     evaluations::scheduler::{self, TrustTransitionSignal},
     extractor::AuthUser,
@@ -67,7 +62,7 @@ pub struct TrustRegistryEvent {
     pub stale: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustRegistryView {
     pub server_id: i32,
     pub server_name: String,
@@ -281,8 +276,7 @@ fn compute_stale(deadline: Option<DateTime<Utc>>) -> bool {
 
 fn normalize_attestation_status(value: &str) -> Option<String> {
     let normalized = value.trim().to_ascii_lowercase();
-    matches!(normalized.as_str(), "trusted" | "untrusted" | "unknown")
-        .then_some(normalized)
+    matches!(normalized.as_str(), "trusted" | "untrusted" | "unknown").then_some(normalized)
 }
 
 fn normalize_lifecycle_state(value: &str) -> Option<String> {
@@ -295,7 +289,10 @@ fn normalize_lifecycle_state(value: &str) -> Option<String> {
 }
 
 fn matches_filter(filter: &Option<String>, candidate: &str) -> bool {
-    filter.as_ref().map(|expected| expected == candidate).unwrap_or(true)
+    filter
+        .as_ref()
+        .map(|expected| expected == candidate)
+        .unwrap_or(true)
 }
 
 async fn load_vm_context<'c, E>(
@@ -328,18 +325,39 @@ mod tests {
 
     #[test]
     fn normalize_attestation_status_accepts_known_values() {
-        assert_eq!(normalize_attestation_status(" Trusted "), Some("trusted".into()));
-        assert_eq!(normalize_attestation_status("UNTRUSTED"), Some("untrusted".into()));
-        assert_eq!(normalize_attestation_status("unknown"), Some("unknown".into()));
+        assert_eq!(
+            normalize_attestation_status(" Trusted "),
+            Some("trusted".into())
+        );
+        assert_eq!(
+            normalize_attestation_status("UNTRUSTED"),
+            Some("untrusted".into())
+        );
+        assert_eq!(
+            normalize_attestation_status("unknown"),
+            Some("unknown".into())
+        );
         assert_eq!(normalize_attestation_status("invalid"), None);
     }
 
     #[test]
     fn normalize_lifecycle_state_accepts_expected_states() {
-        assert_eq!(normalize_lifecycle_state(" Suspect"), Some("suspect".into()));
-        assert_eq!(normalize_lifecycle_state("QUARANTINED"), Some("quarantined".into()));
-        assert_eq!(normalize_lifecycle_state("remediating"), Some("remediating".into()));
-        assert_eq!(normalize_lifecycle_state("restored"), Some("restored".into()));
+        assert_eq!(
+            normalize_lifecycle_state(" Suspect"),
+            Some("suspect".into())
+        );
+        assert_eq!(
+            normalize_lifecycle_state("QUARANTINED"),
+            Some("quarantined".into())
+        );
+        assert_eq!(
+            normalize_lifecycle_state("remediating"),
+            Some("remediating".into())
+        );
+        assert_eq!(
+            normalize_lifecycle_state("restored"),
+            Some("restored".into())
+        );
         assert_eq!(normalize_lifecycle_state("unknown"), None);
     }
 
@@ -366,8 +384,7 @@ async fn fetch_registry_view_for_vm(
         .fetch_optional(pool)
         .await?;
 
-    row.map(TrustRegistryView::from)
-        .ok_or(AppError::NotFound)
+    row.map(TrustRegistryView::from).ok_or(AppError::NotFound)
 }
 
 pub fn spawn_trust_listener(pool: PgPool, job_tx: Sender<Job>) {
@@ -487,27 +504,22 @@ pub async fn list_registry_states(
         stale,
     } = query;
 
-    let lifecycle_filter = match lifecycle_state {
-        Some(value) => Some(
-            normalize_lifecycle_state(&value).ok_or_else(|| {
+    let lifecycle_filter =
+        match lifecycle_state {
+            Some(value) => Some(normalize_lifecycle_state(&value).ok_or_else(|| {
                 AppError::BadRequest(format!("invalid lifecycle_state '{value}'"))
-            })?,
-        ),
-        None => None,
-    };
+            })?),
+            None => None,
+        };
     let status_filter = match attestation_status {
-        Some(value) => Some(
-            normalize_attestation_status(&value).ok_or_else(|| {
-                AppError::BadRequest(format!("invalid attestation_status '{value}'"))
-            })?,
-        ),
+        Some(value) => Some(normalize_attestation_status(&value).ok_or_else(|| {
+            AppError::BadRequest(format!("invalid attestation_status '{value}'"))
+        })?),
         None => None,
     };
 
-    let mut builder = QueryBuilder::<Postgres>::new(format!(
-        "{} WHERE servers.owner_id = ",
-        REGISTRY_BASE_QUERY
-    ));
+    let mut builder =
+        QueryBuilder::<Postgres>::new(format!("{} WHERE servers.owner_id = ", REGISTRY_BASE_QUERY));
     builder.push_bind(user_id);
     if let Some(server_id) = server_id {
         builder.push(" AND servers.id = ");
@@ -578,8 +590,8 @@ pub async fn get_registry_history(
 pub async fn transition_registry_state(
     AuthUser { user_id, .. }: AuthUser,
     Path(vm_instance_id): Path<i64>,
-    Json(payload): Json<TrustRegistryTransitionRequest>,
     Extension(pool): Extension<PgPool>,
+    Json(payload): Json<TrustRegistryTransitionRequest>,
 ) -> AppResult<Json<TrustRegistryView>> {
     let TrustRegistryTransitionRequest {
         attestation_status,
@@ -594,15 +606,15 @@ pub async fn transition_registry_state(
         expected_version,
     } = payload;
 
-    let attestation_status = normalize_attestation_status(&attestation_status).ok_or_else(|| {
-        AppError::BadRequest(format!("invalid attestation_status '{attestation_status}'"))
-    })?;
+    let attestation_status =
+        normalize_attestation_status(&attestation_status).ok_or_else(|| {
+            AppError::BadRequest(format!("invalid attestation_status '{attestation_status}'"))
+        })?;
     let lifecycle_state = normalize_lifecycle_state(&lifecycle_state).ok_or_else(|| {
         AppError::BadRequest(format!("invalid lifecycle_state '{lifecycle_state}'"))
     })?;
 
-    let mut tx = pool.begin().await?;
-    let context = load_vm_context(&mut *tx, vm_instance_id).await?;
+    let context = load_vm_context(&pool, vm_instance_id).await?;
     let Some(context) = context else {
         return Err(AppError::NotFound);
     };
@@ -615,7 +627,9 @@ pub async fn transition_registry_state(
     let current_attempts = context.remediation_attempts.unwrap_or(0);
     let attempts = remediation_attempts.unwrap_or(current_attempts);
     if attempts < 0 {
-        return Err(AppError::BadRequest("remediation_attempts must be non-negative".into()));
+        return Err(AppError::BadRequest(
+            "remediation_attempts must be non-negative".into(),
+        ));
     }
 
     let expected_version = match (expected_version, context.version) {
@@ -634,9 +648,10 @@ pub async fn transition_registry_state(
     };
 
     let reason = transition_reason.unwrap_or_else(|| "manual".to_string());
-    let registry = match upsert_registry_state(
-        &mut *tx,
-        UpsertRuntimeVmTrustRegistryState {
+
+    match apply_transition(
+        &pool,
+        ApplyRuntimeVmTrustTransition {
             runtime_vm_instance_id: vm_instance_id,
             attestation_status: attestation_status.as_str(),
             lifecycle_state: lifecycle_state.as_str(),
@@ -646,11 +661,15 @@ pub async fn transition_registry_state(
             provenance_ref: provenance_ref.as_deref(),
             provenance: provenance.as_ref(),
             expected_version,
+            previous_status: previous_status.as_deref(),
+            previous_lifecycle_state: previous_lifecycle.as_deref(),
+            transition_reason: reason.as_str(),
+            metadata: metadata.as_ref(),
         },
     )
     .await
     {
-        Ok(state) => state,
+        Ok(_) => {}
         Err(sqlx::Error::RowNotFound) => {
             return Err(AppError::Conflict(
                 "trust registry version mismatch during update".into(),
@@ -658,28 +677,6 @@ pub async fn transition_registry_state(
         }
         Err(err) => return Err(err.into()),
     };
-
-    insert_trust_event(
-        &mut *tx,
-        NewRuntimeVmTrustEvent {
-            runtime_vm_instance_id: vm_instance_id,
-            attestation_id: None,
-            previous_status: previous_status.as_deref(),
-            current_status: registry.attestation_status.as_str(),
-            previous_lifecycle_state: previous_lifecycle.as_deref(),
-            current_lifecycle_state: registry.lifecycle_state.as_str(),
-            transition_reason: Some(reason.as_str()),
-            remediation_state: registry.remediation_state.as_deref(),
-            remediation_attempts: attempts,
-            freshness_deadline,
-            provenance_ref: registry.provenance_ref.as_deref(),
-            provenance: provenance.as_ref(),
-            metadata: metadata.as_ref(),
-        },
-    )
-    .await?;
-
-    tx.commit().await?;
 
     let view = fetch_registry_view_for_vm(&pool, user_id, vm_instance_id).await?;
     Ok(Json(view))
@@ -689,20 +686,17 @@ pub async fn stream_trust_events(
     AuthUser { user_id, .. }: AuthUser,
     Query(params): Query<TrustWatchParams>,
 ) -> AppResult<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>> {
-    let lifecycle_filter = match params.lifecycle_state {
-        Some(value) => Some(
-            normalize_lifecycle_state(&value).ok_or_else(|| {
+    let lifecycle_filter =
+        match params.lifecycle_state {
+            Some(value) => Some(normalize_lifecycle_state(&value).ok_or_else(|| {
                 AppError::BadRequest(format!("invalid lifecycle_state '{value}'"))
-            })?,
-        ),
-        None => None,
-    };
+            })?),
+            None => None,
+        };
     let status_filter = match params.attestation_status {
-        Some(value) => Some(
-            normalize_attestation_status(&value).ok_or_else(|| {
-                AppError::BadRequest(format!("invalid attestation_status '{value}'"))
-            })?,
-        ),
+        Some(value) => Some(normalize_attestation_status(&value).ok_or_else(|| {
+            AppError::BadRequest(format!("invalid attestation_status '{value}'"))
+        })?),
         None => None,
     };
 

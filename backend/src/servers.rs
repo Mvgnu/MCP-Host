@@ -838,9 +838,9 @@ pub async fn github_webhook(
     }
 
     let server_type: String = rec.get("server_type");
-   let config: Option<serde_json::Value> = rec.try_get("config").ok();
-   let api_key: String = rec.get("api_key");
-   let use_gpu: bool = rec.get("use_gpu");
+    let config: Option<serde_json::Value> = rec.try_get("config").ok();
+    let api_key: String = rec.get("api_key");
+    let use_gpu: bool = rec.get("use_gpu");
 
     if let Some(gate) = trust_gate_for(&pool, id).await? {
         if gate.blocked {

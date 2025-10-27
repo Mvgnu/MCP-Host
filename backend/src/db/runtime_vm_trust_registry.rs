@@ -30,6 +30,23 @@ pub struct UpsertRuntimeVmTrustRegistryState<'a> {
     pub expected_version: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ApplyRuntimeVmTrustTransition<'a> {
+    pub runtime_vm_instance_id: i64,
+    pub attestation_status: &'a str,
+    pub lifecycle_state: &'a str,
+    pub remediation_state: Option<&'a str>,
+    pub remediation_attempts: i32,
+    pub freshness_deadline: Option<DateTime<Utc>>,
+    pub provenance_ref: Option<&'a str>,
+    pub provenance: Option<&'a Value>,
+    pub expected_version: Option<i64>,
+    pub previous_status: Option<&'a str>,
+    pub previous_lifecycle_state: Option<&'a str>,
+    pub transition_reason: &'a str,
+    pub metadata: Option<&'a Value>,
+}
+
 pub async fn get_state<'c, E>(
     executor: E,
     runtime_vm_instance_id: i64,
@@ -110,6 +127,107 @@ where
     .bind(input.provenance)
     .bind(expected_version)
     .fetch_optional(executor)
+    .await?;
+
+    match row {
+        Some(row) => Ok(map_row(&row)),
+        None => Err(sqlx::Error::RowNotFound),
+    }
+}
+
+pub async fn apply_transition(
+    pool: &PgPool,
+    input: ApplyRuntimeVmTrustTransition<'_>,
+) -> Result<RuntimeVmTrustRegistryState, sqlx::Error> {
+    let expected_version = input.expected_version.unwrap_or(-1);
+    let row = sqlx::query(
+        r#"
+        WITH updated AS (
+            INSERT INTO runtime_vm_trust_registry (
+                runtime_vm_instance_id,
+                attestation_status,
+                lifecycle_state,
+                remediation_state,
+                remediation_attempts,
+                freshness_deadline,
+                provenance_ref,
+                provenance,
+                version
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0)
+            ON CONFLICT (runtime_vm_instance_id) DO UPDATE
+            SET
+                attestation_status = EXCLUDED.attestation_status,
+                lifecycle_state = EXCLUDED.lifecycle_state,
+                remediation_state = EXCLUDED.remediation_state,
+                remediation_attempts = EXCLUDED.remediation_attempts,
+                freshness_deadline = EXCLUDED.freshness_deadline,
+                provenance_ref = EXCLUDED.provenance_ref,
+                provenance = EXCLUDED.provenance,
+                version = runtime_vm_trust_registry.version + 1,
+                updated_at = NOW()
+            WHERE runtime_vm_trust_registry.version = $9
+            RETURNING
+                runtime_vm_instance_id,
+                attestation_status,
+                lifecycle_state,
+                remediation_state,
+                remediation_attempts,
+                freshness_deadline,
+                provenance_ref,
+                provenance,
+                version,
+                updated_at
+        ),
+        history AS (
+            INSERT INTO runtime_vm_trust_history (
+                runtime_vm_instance_id,
+                attestation_id,
+                previous_status,
+                current_status,
+                previous_lifecycle_state,
+                current_lifecycle_state,
+                transition_reason,
+                remediation_state,
+                remediation_attempts,
+                freshness_deadline,
+                provenance_ref,
+                provenance,
+                metadata
+            )
+            SELECT
+                $1,
+                NULL,
+                $10,
+                updated.attestation_status,
+                $11,
+                updated.lifecycle_state,
+                $12,
+                updated.remediation_state,
+                $5,
+                updated.freshness_deadline,
+                updated.provenance_ref,
+                updated.provenance,
+                $13
+            FROM updated
+            RETURNING 1
+        )
+        SELECT * FROM updated
+        "#,
+    )
+    .bind(input.runtime_vm_instance_id)
+    .bind(input.attestation_status)
+    .bind(input.lifecycle_state)
+    .bind(input.remediation_state)
+    .bind(input.remediation_attempts)
+    .bind(input.freshness_deadline)
+    .bind(input.provenance_ref)
+    .bind(input.provenance)
+    .bind(expected_version)
+    .bind(input.previous_status)
+    .bind(input.previous_lifecycle_state)
+    .bind(input.transition_reason)
+    .bind(input.metadata)
+    .fetch_optional(pool)
     .await?;
 
     match row {

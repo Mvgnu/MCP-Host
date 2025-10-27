@@ -132,7 +132,10 @@ async fn handle_quarantine(pool: &PgPool, event: &TrustRegistryEvent) -> Result<
     let vm_instance_id = event.vm_instance_id;
     tokio::spawn(async move {
         if let Err(err) = complete_remediation(pool_clone, vm_instance_id).await {
-            error!(?err, vm_instance_id, "remediation automation completion failed");
+            error!(
+                ?err,
+                vm_instance_id, "remediation automation completion failed"
+            );
         }
     });
 
@@ -172,11 +175,7 @@ async fn complete_remediation(pool: PgPool, vm_instance_id: i64) -> Result<(), s
     Ok(())
 }
 
-pub async fn record_failure(
-    pool: &PgPool,
-    vm_instance_id: i64,
-    error_message: &str,
-) {
+pub async fn record_failure(pool: &PgPool, vm_instance_id: i64, error_message: &str) {
     if let Ok(mut tx) = pool.begin().await {
         if mark_run_failed(&mut *tx, vm_instance_id, error_message)
             .await
