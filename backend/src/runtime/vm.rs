@@ -9,8 +9,6 @@ use base64::Engine;
 use chrono::Utc;
 use chrono::{DateTime, Duration as ChronoDuration};
 use ed25519_dalek::{PublicKey, Signature};
-use futures_util::StreamExt;
-use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -20,6 +18,8 @@ use tokio::sync::mpsc::Receiver;
 use crate::policy::{publish_policy_event, PolicyDecision, PolicyEvent, RuntimeBackend};
 use crate::servers::{add_metric, set_status};
 
+pub mod libvirt;
+
 // key: runtime-vm-executor -> attestation,policy-hooks
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +28,7 @@ pub struct VmProvisioningResult {
     pub isolation_tier: Option<String>,
     pub attestation_evidence: Option<Value>,
     pub requested_image: String,
+    pub hypervisor: Option<HypervisorSnapshot>,
 }
 
 impl VmProvisioningResult {
@@ -36,12 +37,45 @@ impl VmProvisioningResult {
         isolation_tier: Option<String>,
         attestation_evidence: Option<Value>,
         requested_image: String,
+        hypervisor: Option<HypervisorSnapshot>,
     ) -> Self {
         Self {
             instance_id,
             isolation_tier,
             attestation_evidence,
             requested_image,
+            hypervisor,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HypervisorSnapshot {
+    pub endpoint: String,
+    #[serde(default)]
+    pub credentials: Option<Value>,
+    #[serde(default)]
+    pub network_template: Option<Value>,
+    #[serde(default)]
+    pub volume_template: Option<Value>,
+    #[serde(default)]
+    pub gpu_passthrough_policy: Option<Value>,
+}
+
+impl HypervisorSnapshot {
+    pub fn new(
+        endpoint: String,
+        credentials: Option<Value>,
+        network_template: Option<Value>,
+        volume_template: Option<Value>,
+        gpu_passthrough_policy: Option<Value>,
+    ) -> Self {
+        Self {
+            endpoint,
+            credentials,
+            network_template,
+            volume_template,
+            gpu_passthrough_policy,
         }
     }
 }
@@ -159,6 +193,7 @@ impl VirtualMachineExecutor {
             }
         }
 
+        let snapshot = provisioning.hypervisor.as_ref();
         let record_id: i64 = sqlx::query_scalar(
             r#"
             INSERT INTO runtime_vm_instances (
@@ -168,8 +203,15 @@ impl VirtualMachineExecutor {
                 attestation_status,
                 attestation_evidence,
                 policy_version,
-                capability_notes
-            ) VALUES ($1, $2, $3, 'pending', $4, $5, $6)
+                capability_notes,
+                hypervisor_endpoint,
+                hypervisor_credentials,
+                hypervisor_network_template,
+                hypervisor_volume_template,
+                gpu_passthrough_policy
+            ) VALUES (
+                $1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11
+            )
             RETURNING id
             "#,
         )
@@ -179,6 +221,11 @@ impl VirtualMachineExecutor {
         .bind(provisioning.attestation_evidence.clone())
         .bind(&decision.policy_version)
         .bind(&notes)
+        .bind(snapshot.map(|s| s.endpoint.clone()))
+        .bind(snapshot.and_then(|s| s.credentials.clone()))
+        .bind(snapshot.and_then(|s| s.network_template.clone()))
+        .bind(snapshot.and_then(|s| s.volume_template.clone()))
+        .bind(snapshot.and_then(|s| s.gpu_passthrough_policy.clone()))
         .fetch_one(pool)
         .await?;
 
@@ -570,227 +617,6 @@ impl crate::runtime::RuntimeExecutor for VirtualMachineExecutor {
             }
         });
         Some(rx)
-    }
-}
-
-#[derive(Clone)]
-pub struct HttpHypervisorProvisioner {
-    client: reqwest::Client,
-    base_url: String,
-    auth_token: Option<String>,
-    log_tail: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct HypervisorInstanceResponse {
-    instance_id: String,
-    #[serde(default)]
-    isolation_tier: Option<String>,
-    #[serde(default, rename = "attestation")]
-    attestation_evidence: Option<Value>,
-    #[serde(default)]
-    image: Option<String>,
-}
-
-impl HttpHypervisorProvisioner {
-    pub fn new(
-        base_url: impl Into<String>,
-        auth_token: Option<String>,
-        log_tail: usize,
-    ) -> Result<Self> {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::USER_AGENT,
-            reqwest::header::HeaderValue::from_static("mcp-host-runtime/1.0"),
-        );
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .context("failed to build hypervisor client")?;
-        Ok(Self {
-            client,
-            base_url: base_url.into(),
-            auth_token,
-            log_tail: log_tail.max(64),
-        })
-    }
-
-    fn auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if let Some(token) = &self.auth_token {
-            request.bearer_auth(token)
-        } else {
-            request
-        }
-    }
-
-    fn endpoint(&self, path: &str) -> String {
-        format!(
-            "{}/{}",
-            self.base_url.trim_end_matches('/'),
-            path.trim_start_matches('/')
-        )
-    }
-}
-
-#[async_trait]
-impl VmProvisioner for HttpHypervisorProvisioner {
-    async fn provision(
-        &self,
-        server_id: i32,
-        decision: &PolicyDecision,
-        config: Option<&Value>,
-    ) -> Result<VmProvisioningResult> {
-        let mut payload = json!({
-            "server_id": server_id,
-            "image": decision.image,
-            "policy_version": decision.policy_version,
-            "capabilities": decision
-                .capability_requirements
-                .iter()
-                .map(|cap| cap.as_str())
-                .collect::<Vec<_>>(),
-        });
-
-        if let Some(tier) = &decision.tier {
-            payload["tier"] = json!(tier);
-        }
-
-        if let Some(config) = config {
-            payload["config"] = config.clone();
-        }
-
-        let response = self
-            .auth(self.client.post(self.endpoint("instances")))
-            .json(&payload)
-            .send()
-            .await
-            .context("failed to contact hypervisor")?
-            .error_for_status()
-            .context("hypervisor rejected provisioning request")?;
-
-        let parsed: HypervisorInstanceResponse = response
-            .json()
-            .await
-            .context("failed to decode hypervisor response")?;
-
-        Ok(VmProvisioningResult::new(
-            parsed.instance_id,
-            parsed.isolation_tier.or_else(|| decision.tier.clone()),
-            parsed.attestation_evidence,
-            parsed.image.unwrap_or_else(|| decision.image.clone()),
-        ))
-    }
-
-    async fn start(&self, instance_id: &str) -> Result<()> {
-        self.auth(
-            self.client
-                .post(self.endpoint(&format!("instances/{instance_id}/start"))),
-        )
-        .send()
-        .await
-        .context("failed to reach hypervisor for start")?
-        .error_for_status()
-        .context("hypervisor rejected start request")?;
-        Ok(())
-    }
-
-    async fn stop(&self, instance_id: &str) -> Result<()> {
-        self.auth(
-            self.client
-                .post(self.endpoint(&format!("instances/{instance_id}/stop"))),
-        )
-        .send()
-        .await
-        .context("failed to reach hypervisor for stop")?
-        .error_for_status()
-        .context("hypervisor rejected stop request")?;
-        Ok(())
-    }
-
-    async fn teardown(&self, instance_id: &str) -> Result<()> {
-        self.auth(
-            self.client
-                .delete(self.endpoint(&format!("instances/{instance_id}"))),
-        )
-        .send()
-        .await
-        .context("failed to reach hypervisor for teardown")?
-        .error_for_status()
-        .context("hypervisor rejected teardown request")?;
-        Ok(())
-    }
-
-    async fn fetch_logs(&self, instance_id: &str) -> Result<String> {
-        let response = self
-            .auth(
-                self.client
-                    .get(self.endpoint(&format!("instances/{instance_id}/logs")))
-                    .query(&[("tail", self.log_tail)]),
-            )
-            .send()
-            .await
-            .context("failed to reach hypervisor for logs")?
-            .error_for_status()
-            .context("hypervisor rejected log fetch")?;
-        Ok(response.text().await.context("failed to read log body")?)
-    }
-
-    async fn stream_logs(&self, instance_id: &str) -> Result<Option<Receiver<String>>> {
-        let response = self
-            .auth(
-                self.client
-                    .get(self.endpoint(&format!("instances/{instance_id}/logs/stream"))),
-            )
-            .send()
-            .await
-            .context("failed to reach hypervisor for log stream")?;
-
-        if response.status() == StatusCode::NO_CONTENT {
-            return Ok(None);
-        }
-
-        let mut stream = response
-            .error_for_status()
-            .context("hypervisor rejected log stream request")?
-            .bytes_stream();
-
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
-        tokio::spawn(async move {
-            let mut buffer = Vec::new();
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(chunk) => {
-                        buffer.extend_from_slice(&chunk);
-                        while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
-                            let line = buffer.drain(..=pos).collect::<Vec<u8>>();
-                            let clean =
-                                String::from_utf8_lossy(&line[..line.len().saturating_sub(1)])
-                                    .to_string();
-                            if tx.send(clean).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        tracing::error!(?err, "log stream chunk error");
-                        break;
-                    }
-                }
-            }
-            if !buffer.is_empty() {
-                match String::from_utf8(buffer) {
-                    Ok(tail) => {
-                        let _ = tx.send(tail).await;
-                    }
-                    Err(err) => {
-                        let recovered = String::from_utf8_lossy(&err.into_bytes()).to_string();
-                        let _ = tx.send(recovered).await;
-                    }
-                }
-            }
-        });
-
-        Ok(Some(rx))
     }
 }
 
