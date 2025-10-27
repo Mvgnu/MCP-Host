@@ -17,6 +17,10 @@ pub struct GovernanceGateEvaluation {
     pub satisfied: bool,
     pub run_id: Option<i64>,
     pub notes: Vec<String>,
+    pub promotion_track_id: Option<i32>,
+    pub promotion_track_name: Option<String>,
+    pub promotion_stage: Option<String>,
+    pub promotion_status: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -128,7 +132,17 @@ impl GovernanceEngine {
             return Err(GovernanceError::Forbidden);
         }
 
-        let notes = payload.notes.unwrap_or_default();
+        let StartWorkflowRunRequest {
+            target_manifest_digest,
+            target_artifact_run_id,
+            notes,
+            promotion_track_id,
+            promotion_stage,
+        } = payload;
+
+        let notes = notes.unwrap_or_default();
+        let normalized_stage = promotion_stage.map(|stage| stage.to_lowercase());
+
         let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
 
         let run_id: i64 = sqlx::query_scalar(
@@ -139,18 +153,22 @@ impl GovernanceEngine {
                 target_artifact_run_id,
                 target_manifest_digest,
                 target_tier,
-                notes
+                notes,
+                promotion_track_id,
+                promotion_stage
             )
-            VALUES ($1, $2, $3, $4, $5, $6)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING id
             "#,
         )
         .bind(workflow.id)
         .bind(owner_id)
-        .bind(payload.target_artifact_run_id)
-        .bind(payload.target_manifest_digest)
+        .bind(target_artifact_run_id)
+        .bind(&target_manifest_digest)
         .bind(&workflow.tier)
         .bind(&notes)
+        .bind(promotion_track_id)
+        .bind(normalized_stage.clone())
         .fetch_one(&mut *tx)
         .await?;
 
@@ -199,6 +217,8 @@ impl GovernanceEngine {
                    r.notes,
                    r.target_manifest_digest,
                    r.target_tier,
+                   r.promotion_track_id,
+                   r.promotion_stage,
                    r.initiated_by,
                    r.created_at,
                    r.updated_at
@@ -256,6 +276,8 @@ impl GovernanceEngine {
                 .unwrap_or_default(),
             target_manifest_digest: row.get("target_manifest_digest"),
             target_tier: row.get("target_tier"),
+            promotion_track_id: row.get("promotion_track_id"),
+            promotion_stage: row.get("promotion_stage"),
             initiated_by: row.get("initiated_by"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
@@ -315,6 +337,9 @@ impl GovernanceEngine {
         .execute(pool)
         .await?;
 
+        self.sync_promotion_status(pool, row.get("id"), payload.status)
+            .await?;
+
         match payload.status {
             GovernanceRunStatus::Completed => {
                 sqlx::query(
@@ -356,6 +381,69 @@ impl GovernanceEngine {
         }))
     }
 
+    async fn sync_promotion_status(
+        &self,
+        pool: &PgPool,
+        run_id: i64,
+        status: GovernanceRunStatus,
+    ) -> Result<(), GovernanceError> {
+        let rec = sqlx::query(
+            r#"
+            SELECT promotion_track_id, promotion_stage, target_manifest_digest
+            FROM governance_workflow_runs
+            WHERE id = $1
+            "#,
+        )
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await?;
+
+        let Some(row) = rec else {
+            return Ok(());
+        };
+
+        let track_id: Option<i32> = row.get("promotion_track_id");
+        let stage: Option<String> = row.get("promotion_stage");
+        let digest: Option<String> = row.get("target_manifest_digest");
+
+        let (Some(track_id), Some(stage), Some(digest)) = (track_id, stage, digest) else {
+            return Ok(());
+        };
+
+        let status_str = match status {
+            GovernanceRunStatus::Pending => "scheduled",
+            GovernanceRunStatus::InProgress => "in_progress",
+            GovernanceRunStatus::Completed => "active",
+            GovernanceRunStatus::Failed | GovernanceRunStatus::Cancelled => "rolled_back",
+        };
+
+        let note = format!("promotion:governance:{run_id}:{status_str}");
+
+        sqlx::query(
+            r#"
+            UPDATE artifact_promotions
+            SET status = $1,
+                updated_at = NOW(),
+                activated_at = CASE WHEN $1 = 'active' THEN NOW() ELSE activated_at END,
+                notes = array_append(notes, $2),
+                workflow_run_id = COALESCE(workflow_run_id, $3)
+            WHERE promotion_track_id = $4
+              AND stage = $5
+              AND manifest_digest = $6
+            "#,
+        )
+        .bind(status_str)
+        .bind(note)
+        .bind(run_id)
+        .bind(track_id)
+        .bind(stage.to_lowercase())
+        .bind(digest)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn ensure_promotion_ready(
         &self,
         pool: &PgPool,
@@ -369,6 +457,10 @@ impl GovernanceEngine {
                 satisfied: false,
                 run_id: None,
                 notes,
+                promotion_track_id: None,
+                promotion_track_name: None,
+                promotion_stage: None,
+                promotion_status: None,
             });
         };
         let Some(tier_value) = tier else {
@@ -377,19 +469,34 @@ impl GovernanceEngine {
                 satisfied: false,
                 run_id: None,
                 notes,
+                promotion_track_id: None,
+                promotion_track_name: None,
+                promotion_stage: None,
+                promotion_status: None,
             });
         };
 
         let row = sqlx::query(
             r#"
-            SELECT r.id
-            FROM governance_workflow_runs r
-            JOIN governance_workflows w ON w.id = r.workflow_id
-            WHERE w.workflow_type = 'promotion'::governance_workflow_kind
-              AND r.target_manifest_digest = $1
-              AND r.target_tier = $2
-              AND r.status = 'completed'::governance_run_status
-            ORDER BY r.updated_at DESC
+            SELECT ap.id,
+                   ap.promotion_track_id,
+                   ap.stage,
+                   ap.status,
+                   ap.workflow_run_id,
+                   ap.notes,
+                   t.name AS track_name
+            FROM artifact_promotions ap
+            JOIN promotion_tracks t ON t.id = ap.promotion_track_id
+            WHERE ap.manifest_digest = $1
+              AND t.tier = $2
+            ORDER BY CASE ap.status
+                        WHEN 'active' THEN 0
+                        WHEN 'approved' THEN 1
+                        WHEN 'in_progress' THEN 2
+                        WHEN 'scheduled' THEN 3
+                        ELSE 4
+                     END,
+                     ap.updated_at DESC
             LIMIT 1
             "#,
         )
@@ -399,19 +506,49 @@ impl GovernanceEngine {
         .await?;
 
         if let Some(row) = row {
-            let run_id: i64 = row.get("id");
-            notes.push(format!("governance:run-complete:{run_id}"));
+            let status: String = row.get("status");
+            let stage_value: String = row.get("stage");
+            let track_id: i32 = row.get("promotion_track_id");
+            let track_name: String = row.get("track_name");
+            let run_id: Option<i64> = row.get("workflow_run_id");
+            let mut record_notes = row
+                .get::<Option<Vec<String>>, _>("notes")
+                .unwrap_or_default();
+
+            let stage_matches = stage_value.eq_ignore_ascii_case(tier_value);
+            let satisfied = stage_matches && status == "active";
+
+            notes.push(format!(
+                "promotion:status:{}:{}:{}",
+                track_name, stage_value, status
+            ));
+            if !stage_matches {
+                notes.push(format!(
+                    "promotion:stage-mismatch:{}:{}",
+                    stage_value, tier_value
+                ));
+            }
+            notes.append(&mut record_notes);
+
             Ok(GovernanceGateEvaluation {
-                satisfied: true,
-                run_id: Some(run_id),
+                satisfied,
+                run_id,
                 notes,
+                promotion_track_id: Some(track_id),
+                promotion_track_name: Some(track_name),
+                promotion_stage: Some(stage_value),
+                promotion_status: Some(status),
             })
         } else {
-            notes.push(format!("governance:missing-promotion:{tier_value}"));
+            notes.push(format!("promotion:missing-track:{tier_value}"));
             Ok(GovernanceGateEvaluation {
                 satisfied: false,
                 run_id: None,
                 notes,
+                promotion_track_id: None,
+                promotion_track_name: None,
+                promotion_stage: None,
+                promotion_status: None,
             })
         }
     }

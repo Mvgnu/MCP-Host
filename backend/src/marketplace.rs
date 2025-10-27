@@ -38,6 +38,16 @@ pub struct ArtifactHealth {
     pub issues: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MarketplacePromotion {
+    pub track_id: i32,
+    pub track_name: String,
+    pub stage: String,
+    pub status: String,
+    pub updated_at: DateTime<Utc>,
+    pub notes: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct MarketplaceArtifact {
     pub server_id: i32,
@@ -57,6 +67,8 @@ pub struct MarketplaceArtifact {
     pub tier: String,
     pub health: ArtifactHealth,
     pub platforms: Vec<MarketplacePlatform>,
+    pub promotion: Option<MarketplacePromotion>,
+    pub promotion_history: Vec<MarketplacePromotion>,
 }
 
 pub async fn list_marketplace(
@@ -93,6 +105,8 @@ pub async fn list_marketplace(
             runs.auth_rotation_succeeded,
             servers.name AS server_name,
             servers.server_type,
+            promotion_current.current_promotion,
+            promotion_history.promotion_history,
             COALESCE(
                 json_agg(
                     json_build_object(
@@ -113,6 +127,51 @@ pub async fn list_marketplace(
         FROM build_artifact_runs runs
         JOIN mcp_servers servers ON servers.id = runs.server_id
         LEFT JOIN build_artifact_platforms platforms ON platforms.run_id = runs.id
+        LEFT JOIN LATERAL (
+            SELECT json_build_object(
+                    'track_id', ap.promotion_track_id,
+                    'track_name', t.name,
+                    'stage', ap.stage,
+                    'status', ap.status,
+                    'updated_at', ap.updated_at,
+                    'notes', ap.notes
+                ) AS current_promotion
+            FROM artifact_promotions ap
+            JOIN promotion_tracks t ON t.id = ap.promotion_track_id
+            WHERE runs.manifest_digest IS NOT NULL
+              AND ap.manifest_digest = runs.manifest_digest
+              AND t.tier = servers.server_type
+            ORDER BY CASE ap.status
+                        WHEN 'active' THEN 0
+                        WHEN 'approved' THEN 1
+                        WHEN 'in_progress' THEN 2
+                        WHEN 'scheduled' THEN 3
+                        ELSE 4
+                     END,
+                     ap.updated_at DESC
+            LIMIT 1
+        ) promotion_current ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT COALESCE(
+                    json_agg(
+                        json_build_object(
+                            'track_id', ap.promotion_track_id,
+                            'track_name', t.name,
+                            'stage', ap.stage,
+                            'status', ap.status,
+                            'updated_at', ap.updated_at,
+                            'notes', ap.notes
+                        )
+                        ORDER BY ap.updated_at DESC
+                    ),
+                    '[]'::json
+                ) AS promotion_history
+            FROM artifact_promotions ap
+            JOIN promotion_tracks t ON t.id = ap.promotion_track_id
+            WHERE runs.manifest_digest IS NOT NULL
+              AND ap.manifest_digest = runs.manifest_digest
+              AND t.tier = servers.server_type
+        ) promotion_history ON TRUE
         WHERE ($2::text IS NULL OR servers.server_type = $2)
           AND ($3::text IS NULL OR runs.status = $3)
           AND (
@@ -147,6 +206,23 @@ pub async fn list_marketplace(
             })?;
         platforms.sort_by(|a, b| a.platform.cmp(&b.platform));
 
+        let promotion_current: Option<serde_json::Value> = row.get("current_promotion");
+        let promotion = match promotion_current {
+            Some(value) if !value.is_null() => Some(
+                serde_json::from_value::<MarketplacePromotion>(value).map_err(|error| {
+                    AppError::Message(format!("failed to deserialize promotion snapshot: {error}"))
+                })?,
+            ),
+            _ => None,
+        };
+
+        let history_value: serde_json::Value = row.get("promotion_history");
+        let mut promotion_history: Vec<MarketplacePromotion> =
+            serde_json::from_value(history_value).map_err(|error| {
+                AppError::Message(format!("failed to deserialize promotion history: {error}"))
+            })?;
+        promotion_history.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
         let status: String = row.get("status");
         let credential_health_status: String = row.get("credential_health_status");
         let health = derive_health(&status, &credential_health_status, &platforms);
@@ -171,6 +247,8 @@ pub async fn list_marketplace(
             tier: tier.clone(),
             health,
             platforms,
+            promotion,
+            promotion_history,
         };
 
         let tier_filter_allows = params
