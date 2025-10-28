@@ -13,9 +13,14 @@ DATABASE_URL="postgres://postgres:remediation@127.0.0.1:${POSTGRES_PORT}/mcp"
 BACKEND_LOG="${HARNESS_DIR}/backend.log"
 MANIFEST_PATH="${HARNESS_MANIFEST_PATH:-${HARNESS_DIR}/remediation_harness_manifest.json}"
 SCENARIO_ROOT="${HARNESS_SCENARIO_ROOT:-${HARNESS_DIR}/scenarios}"
+SSE_TRANSCRIPT="${HARNESS_DIR}/remediation_stream.jsonl"
 
 cleanup() {
     set +e
+    if [[ -n "${SSE_PID:-}" ]]; then
+        kill "${SSE_PID}" >/dev/null 2>&1 || true
+        wait "${SSE_PID}" 2>/dev/null || true
+    fi
     if [[ -n "${BACKEND_PID:-}" ]]; then
         kill "${BACKEND_PID}" >/dev/null 2>&1 || true
         wait "${BACKEND_PID}" 2>/dev/null || true
@@ -82,6 +87,35 @@ if ! curl -sf "http://127.0.0.1:${HARNESS_PORT}/" >/dev/null; then
     exit 1
 fi
 
+TOKEN=$(python3 - <<'PY' "${JWT_SECRET}"
+import base64
+import hashlib
+import hmac
+import json
+import sys
+import time
+
+secret = sys.argv[1].encode()
+
+def encode_segment(document):
+    raw = json.dumps(document, separators=(",", ":"), sort_keys=True).encode()
+    return base64.urlsafe_b64encode(raw).rstrip(b"=")
+
+header = {"alg": "HS256", "typ": "JWT"}
+payload = {"sub": 1, "role": "operator", "exp": int(time.time()) + 3600}
+segments = [encode_segment(header), encode_segment(payload)]
+signature = hmac.new(secret, b".".join(segments), hashlib.sha256).digest()
+segments.append(base64.urlsafe_b64encode(signature).rstrip(b"="))
+print(".".join(segment.decode() for segment in segments))
+PY
+)
+
+export MCP_HOST_URL="http://127.0.0.1:${HARNESS_PORT}"
+export MCP_HOST_TOKEN="${TOKEN}"
+PYTHONPATH="${REPO_ROOT}/cli" python3 -m mcpctl remediation watch --json >"${SSE_TRANSCRIPT}" 2>&1 &
+SSE_PID=$!
+sleep 2
+
 echo "[harness] executing remediation lifecycle integration test" >&2
 (
     cd "${REPO_ROOT}/backend"
@@ -90,8 +124,13 @@ echo "[harness] executing remediation lifecycle integration test" >&2
     cargo test --test remediation_flow -- --ignored --nocapture
 )
 
+if [[ -n "${SSE_PID:-}" ]]; then
+    kill "${SSE_PID}" >/dev/null 2>&1 || true
+    wait "${SSE_PID}" 2>/dev/null || true
+fi
+
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-python3 - <<'PY' "${SCENARIO_ROOT}" "${MANIFEST_PATH}" "${DATABASE_URL}" "${TIMESTAMP}"
+python3 - <<'PY' "${SCENARIO_ROOT}" "${MANIFEST_PATH}" "${DATABASE_URL}" "${TIMESTAMP}" "${SSE_TRANSCRIPT}"
 import json
 import hashlib
 import os
@@ -102,6 +141,7 @@ scenario_root = Path(sys.argv[1])
 manifest_path = Path(sys.argv[2])
 database_url = sys.argv[3]
 timestamp = sys.argv[4]
+transcript_path = Path(sys.argv[5])
 
 records = []
 if scenario_root.exists():
@@ -138,11 +178,21 @@ if scenario_root.exists():
 else:
     os.makedirs(scenario_root, exist_ok=True)
 
+transcript_record = None
+if transcript_path.exists():
+    raw = transcript_path.read_bytes()
+    transcript_record = {
+        "path": str(transcript_path),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "bytes": len(raw),
+    }
+
 manifest = {
     "generated_at": timestamp,
     "database_url": database_url,
     "scenario_root": str(scenario_root),
     "scenarios": records,
+    "stream_transcript": transcript_record,
 }
 
 manifest_path.write_text(json.dumps(manifest, indent=2))

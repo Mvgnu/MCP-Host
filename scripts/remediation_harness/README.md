@@ -24,10 +24,13 @@ The script will:
 2. Start the backend on `http://127.0.0.1:38080` with `JWT_SECRET=integration-secret`.
 3. Wait for the HTTP health endpoint to respond.
 4. Run `cargo test --test remediation_flow -- --ignored --nocapture` against the live database,
-   covering `validation:remediation_flow`, `validation:remediation-concurrency`, and the
+   covering `validation:remediation_flow`, `validation:remediation-concurrency`, the new
+   `validation:remediation-stream:sse-ordering` verification, and the
    `validation:remediation-chaos-matrix` suites executed concurrently for each tenant shard.
-5. Aggregate manifest-driven scenarios (YAML/JSON) into a machine-verifiable summary (see below).
-6. Tear down the backend process and Postgres container.
+5. Stream remediation SSE events via `mcpctl remediation watch --json`, persisting a JSONL transcript
+   tagged with manifest metadata.
+6. Aggregate manifest-driven scenarios (YAML/JSON) into a machine-verifiable summary (see below).
+7. Tear down the backend process and Postgres container.
 
 Environment variables allow customization:
 
@@ -63,13 +66,25 @@ orchestrated harness and direct `cargo test` execution stay aligned.
       "description": "Baseline remediation chaos matrix"
     },
     {
+      "path": "accelerator-posture.yaml",
+      "absolute_path": "/workspace/MCP-Host/scripts/remediation_harness/scenarios/accelerator-posture.yaml",
+      "sha256": "<sha256>",
+      "format": "yaml",
+      "description": "Accelerator remediation posture regression"
+    },
+    {
       "path": "historical-incidents.json",
       "absolute_path": "/workspace/MCP-Host/scripts/remediation_harness/scenarios/historical-incidents.json",
       "sha256": "<sha256>",
       "format": "json",
       "description": "Historical incident regression manifest"
     }
-  ]
+  ],
+  "stream_transcript": {
+    "path": "/workspace/MCP-Host/scripts/remediation_harness/remediation_stream.jsonl",
+    "sha256": "<sha256>",
+    "bytes": 2048
+  }
 }
 ```
 
@@ -80,21 +95,11 @@ check out the latest manifests before executing the harness.
 
 ## SSE and Scheduler Checks
 
-The integration test validates that remediation approval gating blocks placement until the
-registry transitions to `restored`. For streaming verification, launch the harness and then run:
-
-```bash
-export MCP_HOST_URL=http://127.0.0.1:${HARNESS_PORT:-38080}
-export MCP_HOST_TOKEN=$(python - <<'PY'
-import json, time
-import jwt
-claims = {"sub": 1, "role": "operator", "exp": int(time.time()) + 3600}
-print(jwt.encode(claims, "${HARNESS_JWT_SECRET:-integration-secret}", algorithm="HS256"))
-PY
-)
-mcpctl remediation watch --run-id <RUN_ID>
-```
-
-This streams SSE events from the live backend; replace `<RUN_ID>` with the ID emitted by the test
-logs. The optional Python snippet requires the `pyjwt` package. The SSE step is optional but
-recommended for manual confirmation that the CLI consumes live remediation events.
+The harness now spawns an operator token, streams `/api/trust/remediation/stream` via
+`mcpctl remediation watch --json`, and writes the transcript to
+`scripts/remediation_harness/remediation_stream.jsonl`. The integration suite verifies approval
+gating (`validation:remediation_flow`), duplicate suppression (`validation:remediation-concurrency`),
+manifest-driven chaos scenarios, and SSE ordering/manifest metadata propagation
+(`validation:remediation-stream:sse-ordering`). Review the transcript to confirm log sequencing,
+status transitions, and manifest tags for accelerator and tenant-focused scenarios without running
+additional manual commands.
