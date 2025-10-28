@@ -86,14 +86,17 @@ Operators should consult the remediation API/CLI roadmap before enabling automat
 
 An end-to-end SQLx integration test (`backend/tests/remediation_flow.rs`) now validates the
 remediation lifecycle: playbook creation/edit/version guards, queued runs with duplicate protection,
-approval transitions, placement gate veto notes, and artifact retrieval. The suite now includes a
-multi-tenant chaos matrix (`validation: remediation-chaos-matrix`) that exercises:
+approval transitions, placement gate veto notes, and artifact retrieval. The suite now drives a
+multi-tenant chaos matrix (`validation: remediation-chaos-matrix`) that concurrently executes each
+scenario across three tenant shards (`tenant-alpha`, `tenant-bravo`, `tenant-charlie`) to ensure
+cross-operator isolation and recovery sequencing remain stable:
 
 - `validation:tenant-isolation` – per-tenant run scoping, trust registry tagging, and placement gate
-  separation across distinct operators/servers.
-- `validation:concurrent-approvals` – approval version races to ensure stale writes are rejected.
+  separation across distinct operators/servers while preventing metadata bleed between shards.
+- `validation:concurrent-approvals` – approval version races to ensure stale writes are rejected and
+  optimistic locking holds under parallel tenant traffic.
 - `validation:executor-outage` – executor unavailability, trust registry failure tagging, and
-  scheduler resumption via successful retries.
+  scheduler resumption via successful retries (verifying failed/complete statuses and empty queues).
 
 A companion concurrency scenario (`validation: remediation-concurrency`) continues to stress-test
 duplicate enqueue races so only a single pending run survives simultaneous submissions.
