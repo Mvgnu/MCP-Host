@@ -763,3 +763,15 @@ This document tracks development progress and high level notes from the planning
 - Reintroduced the HTTP hypervisor executor with hypervisor snapshot exports so `VM_PROVISIONER_DRIVER=http` remains functional alongside libvirt.
 - Patched runtime VM unit tests to account for the new hypervisor snapshot argument and removed duplicate libvirt configuration cases in `tests/vm.rs`.
 - Ran `cargo test` from `backend/` to ensure the restored HTTP driver and updated tests pass under the expanded configuration matrix.
+
+## 2025-11-28
+- Added `validation: remediation_flow` SQLx integration test covering playbook CRUD, duplicate run protection,
+  approval transitions, placement gate veto notes, and artifact retrieval via REST stubs.
+- Delivered `scripts/remediation_harness/run_harness.sh` to spin up ephemeral Postgres, boot the backend, and execute
+  the lifecycle test end-to-end with customizable environment variables.
+- Documented harness usage in `backend/README.md` and `scripts/remediation_harness/README.md`, including optional SSE
+  verification instructions for `mcpctl remediation watch`.
+
+### Next Steps
+- Extend CLI smoke tests so `mcpctl remediation watch` assertions run automatically using the harness token flow.
+- Capture executor log SSE fixtures for automated validation once remediation workers emit structured stream events.
