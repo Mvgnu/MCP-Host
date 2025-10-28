@@ -11,7 +11,7 @@ use backend::db::runtime_vm_remediation_runs::{mark_run_completed, mark_run_fail
 use backend::db::runtime_vm_trust_registry::{upsert_state, UpsertRuntimeVmTrustRegistryState};
 use backend::policy::trust::evaluate_placement_gate;
 use chrono::{Duration, Utc};
-use futures_util::future::join_all;
+use futures_util::{future::join_all, StreamExt};
 use hyper::body;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use serde::Deserialize;
@@ -21,8 +21,10 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 use tower::ServiceExt;
+use tokio::time::timeout;
 
 #[derive(Clone)]
 struct RemediationHarness {
@@ -110,7 +112,13 @@ async fn bootstrap_remediation_harness(pool: &PgPool) -> RemediationHarness {
             "/api/trust/remediation/runs/:run_id/artifacts",
             get(backend::remediation_api::list_artifacts_handler),
         )
+        .route(
+            "/api/trust/remediation/stream",
+            get(backend::remediation_api::stream_remediation_events),
+        )
         .layer(Extension(pool.clone()));
+
+    backend::remediation::spawn(pool.clone());
 
     RemediationHarness {
         app,
@@ -770,6 +778,83 @@ async fn post_json(app: &Router, token: &str, uri: &str, payload: String) -> Res
         .unwrap()
 }
 
+async fn collect_stream_events(app: Router, token: String, run_id: i64) -> Vec<Value> {
+    let uri = format!("/api/trust/remediation/stream?run_id={run_id}");
+    let mut response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Accept", "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body();
+    timeout(Duration::from_secs(30), read_sse_stream(body, run_id))
+        .await
+        .expect("timed out waiting for remediation SSE")
+}
+
+async fn read_sse_stream(mut body: Body, run_id: i64) -> Vec<Value> {
+    let mut buffer = String::new();
+    let mut events = Vec::new();
+
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.expect("failed to read SSE chunk");
+        buffer.push_str(std::str::from_utf8(&chunk).expect("SSE chunk not UTF-8"));
+
+        loop {
+            let Some(index) = buffer.find("\n\n") else {
+                break;
+            };
+            let frame = buffer[..index].to_string();
+            buffer.drain(..index + 2);
+
+            for line in frame.lines() {
+                if let Some(data) = line.strip_prefix("data:") {
+                    let payload = data.trim();
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    let value: Value = serde_json::from_str(payload)
+                        .expect("failed to deserialize SSE remediation payload");
+                    if value
+                        .get("run_id")
+                        .and_then(|entry| entry.as_i64())
+                        .filter(|current| *current == run_id)
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    events.push(value.clone());
+                    let is_terminal = value
+                        .get("event")
+                        .and_then(|entry| entry.get("event"))
+                        .and_then(|entry| entry.as_str())
+                        .map(|kind| kind == "status")
+                        .unwrap_or(false)
+                        && value
+                            .get("event")
+                            .and_then(|entry| entry.get("status"))
+                            .and_then(|entry| entry.as_str())
+                            .map(|status| status == "completed" || status == "failed")
+                            .unwrap_or(false);
+                    if is_terminal {
+                        return events;
+                    }
+                }
+            }
+        }
+    }
+
+    events
+}
+
 // key: validation -> remediation-lifecycle-harness
 #[sqlx::test]
 #[ignore = "requires DATABASE_URL with Postgres server"]
@@ -1124,6 +1209,156 @@ async fn remediation_concurrent_enqueue_dedupe(pool: PgPool) {
     let runs_array = runs.as_array().unwrap();
     assert_eq!(runs_array.len(), 1);
     assert_eq!(runs_array[0]["id"].as_i64().unwrap(), run_id);
+}
+
+// key: validation -> remediation-stream:sse-ordering
+#[sqlx::test]
+#[ignore = "requires DATABASE_URL with Postgres server"]
+async fn remediation_stream_captures_manifest_metadata(pool: PgPool) {
+    let harness = bootstrap_remediation_harness(&pool).await;
+    let app = harness.app.clone();
+    let token = harness.token.clone();
+
+    let manifest_root = resolve_manifest_root();
+    let scenarios = load_manifest_directory(&manifest_root)
+        .expect("scenario manifests should be provisioned for SSE validation");
+    let scenario_execution = scenarios
+        .into_iter()
+        .next()
+        .expect("at least one scenario execution must be available");
+
+    let scenario = scenario_execution.definition;
+    let tenant = scenario_execution.tenant;
+    let scenario_tag = format!("{}::{}", scenario.tag, tenant);
+    let playbook_key = format!("remediation.stream.{}.{}", scenario.tag, tenant);
+
+    let playbook_payload = json!({
+        "playbook_key": playbook_key,
+        "display_name": format!("{} stream validation", scenario.name),
+        "description": "Validate remediation SSE stream ordering and manifest tags",
+        "executor_type": "shell",
+        "approval_required": true,
+        "sla_duration_seconds": 120,
+        "metadata": {"scenario": scenario_tag.clone(), "harness": "sse-validation"}
+    });
+    let playbook = create_playbook(&app, &token, playbook_payload).await;
+    let playbook_id = playbook["id"].as_i64().unwrap();
+
+    let run_request = json!({
+        "runtime_vm_instance_id": harness.vm_instance_id,
+        "playbook": playbook_key,
+        "metadata": {
+            "scenario": scenario_tag.clone(),
+            "manifest_tag": scenario.tag,
+            "tenant": tenant,
+            "playbook_id": playbook_id
+        },
+        "automation_payload": {
+            "scenario": "sse-validation",
+            "origin": "chaos-fabric"
+        }
+    });
+    let run_response = enqueue_run(&app, &token, run_request).await;
+    assert_eq!(run_response["created"], true);
+    let run = run_response["run"].clone();
+    assert_eq!(run["approval_state"], "pending");
+    let run_id = run["id"].as_i64().unwrap();
+    let run_version = run["version"].as_i64().unwrap();
+
+    let stream_task = tokio::spawn(collect_stream_events(app.clone(), token.clone(), run_id));
+
+    let approval_payload = json!({
+        "new_state": "approved",
+        "approval_notes": "SSE verification harness",
+        "expected_version": run_version
+    });
+    let approval_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/trust/remediation/runs/{run_id}/approval"))
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(approval_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approval_response.status(), StatusCode::OK);
+
+    let events = stream_task.await.expect("stream collection failed");
+    assert!(!events.is_empty(), "expected remediation SSE events");
+
+    let first_kind = events
+        .first()
+        .and_then(|event| event.get("event"))
+        .and_then(|entry| entry.get("event"))
+        .and_then(|entry| entry.as_str())
+        .unwrap_or_default();
+    assert_eq!(first_kind, "log", "first SSE entry should be a log event");
+
+    let last = events
+        .last()
+        .and_then(|event| event.get("event"))
+        .expect("expected terminal remediation event");
+    assert_eq!(last.get("event").and_then(|entry| entry.as_str()), Some("status"));
+    assert_eq!(last.get("status").and_then(|entry| entry.as_str()), Some("completed"));
+
+    let tag_presence = events.iter().all(|event| {
+        event
+            .get("manifest_tags")
+            .and_then(|value| value.as_array())
+            .map(|tags| tags.iter().any(|entry| entry.as_str() == Some(&scenario_tag)))
+            .unwrap_or(false)
+    });
+    assert!(tag_presence, "expected manifest tags to include chaos scenario tag");
+
+    let log_events: Vec<&Value> = events
+        .iter()
+        .filter(|event| {
+            event
+                .get("event")
+                .and_then(|entry| entry.get("event"))
+                .and_then(|entry| entry.as_str())
+                == Some("log")
+        })
+        .collect();
+    assert!(!log_events.is_empty(), "expected remediation log events to be streamed");
+
+    let mut tick_values = Vec::new();
+    for event in &log_events {
+        if let Some(message) = event
+            .get("event")
+            .and_then(|entry| entry.get("message"))
+            .and_then(|entry| entry.as_str())
+        {
+            if let Some(position) = message.find("tick ") {
+                let remainder = &message[position + 5..];
+                if let Some(number) = remainder.split_whitespace().next() {
+                    if let Ok(value) = number.parse::<i32>() {
+                        tick_values.push(value);
+                    }
+                }
+            }
+        }
+    }
+    if tick_values.len() > 1 {
+        let mut sorted = tick_values.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(tick_values, sorted, "log tick ordering should be monotonic");
+    }
+
+    let metadata_event = log_events.iter().find(|event| {
+        event
+            .get("event")
+            .and_then(|entry| entry.get("message"))
+            .and_then(|entry| entry.as_str())
+            .map(|message| message.contains(&scenario_tag))
+            .unwrap_or(false)
+    });
+    assert!(metadata_event.is_some(), "expected metadata log to reference manifest tag");
 }
 
 // key: validation -> remediation-chaos-matrix

@@ -1,0 +1,8 @@
+# key: verification -> remediation-fabric:accelerator-posture
+description: "Accelerator remediation posture regression"
+scenarios:
+  - name: accelerator-sse-validation
+    tag: validation:accelerator-remediation
+    kind: executor-outage-resumption
+    tenants:
+      - accelerator-lab

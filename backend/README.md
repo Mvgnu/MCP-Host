@@ -79,7 +79,9 @@ Operators should consult the remediation API/CLI roadmap before enabling automat
   - `GET/POST /api/trust/remediation/runs` to inspect lifecycle state and enqueue automation (400 on unknown playbooks, 409 on active runs).
   - `GET /api/trust/remediation/runs/:id` and `POST /api/trust/remediation/runs/:id/approval` to drive approval workflows and examine run metadata.
   - `GET /api/trust/remediation/runs/:id/artifacts` to fetch structured evidence bundles.
-  - `GET /api/trust/remediation/stream` for SSE log/status streaming filtered by `run_id`.
+  - `GET /api/trust/remediation/stream` for SSE log/status streaming filtered by `run_id`. Stream
+    payloads now include `manifest_tags` (derived from playbook/run metadata) so dashboards can
+    correlate chaos-manifest fingerprints with live execution telemetry.
 - **CLI (`mcpctl remediation`):** new subcommands mirror the REST surface (`playbooks list`, `runs list|get|enqueue|approve|artifacts`, `watch`) with JSON output toggles and structured table rendering to simplify operator workflows.
 
 ### Validation harness (`validation: remediation_flow`)
@@ -99,7 +101,10 @@ cross-operator isolation and recovery sequencing remain stable:
   scheduler resumption via successful retries (verifying failed/complete statuses and empty queues).
 
 A companion concurrency scenario (`validation: remediation-concurrency`) continues to stress-test
-duplicate enqueue races so only a single pending run survives simultaneous submissions.
+duplicate enqueue races so only a single pending run survives simultaneous submissions. The SSE
+verification suite (`validation: remediation-stream:sse-ordering`) now attaches an operator token to
+`/api/trust/remediation/stream`, asserting monotonic log sequencing and manifest tag propagation
+during the chaos manifest runs.
 
 Execute the harness via:
 
@@ -127,4 +132,6 @@ emits a JSON manifest enumerating the executed validation tags so dashboards can
 - `scripts/remediation_harness/run_harness.sh` now aggregates scenario manifests into a machine-verifiable
   JSON artifact containing the SHA-256 for each source document. Dashboards can diff the manifest to
   detect drift, while operators have a single manifest recording the backend database URL, generation
-  timestamp, scenario root, and individual scenario descriptors.
+  timestamp, scenario root, and individual scenario descriptors. The harness also records a JSONL SSE
+  transcript (captured via `mcpctl remediation watch --json`) so dashboards can replay remediation
+  log/status events tagged with the same manifest metadata enforced by the integration suite.

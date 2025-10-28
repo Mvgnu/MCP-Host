@@ -582,17 +582,61 @@ pub struct RemediationStreamMessage {
     pub run_id: i64,
     pub instance_id: i64,
     pub playbook: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manifest_tags: Vec<String>,
+    #[serde(default)]
+    pub manifest_metadata: Value,
     pub event: RemediationStreamEvent,
 }
 
 fn broadcast_event(run: &RuntimeVmRemediationRun, event: RemediationStreamEvent) {
+    let manifest_tags = manifest_tags_from_metadata(&run.metadata);
     let message = RemediationStreamMessage {
         run_id: run.id,
         instance_id: run.runtime_vm_instance_id,
         playbook: run.playbook.clone(),
+        manifest_tags,
+        manifest_metadata: run.metadata.clone(),
         event,
     };
     let _ = REMEDIATION_EVENT_CHANNEL.send(message);
+}
+
+fn manifest_tags_from_metadata(metadata: &Value) -> Vec<String> {
+    let mut tags = Vec::new();
+    collect_manifest_tags(metadata, &mut tags);
+    tags.sort();
+    tags.dedup();
+    tags
+}
+
+fn collect_manifest_tags(value: &Value, tags: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(scenario) = map.get("scenario").and_then(|entry| entry.as_str()) {
+                tags.push(scenario.to_string());
+            }
+            if let Some(tag) = map.get("tag").and_then(|entry| entry.as_str()) {
+                tags.push(tag.to_string());
+            }
+            if let Some(array) = map.get("tags").and_then(|entry| entry.as_array()) {
+                for candidate in array {
+                    if let Some(text) = candidate.as_str() {
+                        tags.push(text.to_string());
+                    }
+                }
+            }
+            if let Some(nested) = map.get("metadata") {
+                collect_manifest_tags(nested, tags);
+            }
+        }
+        Value::Array(entries) => {
+            for entry in entries {
+                collect_manifest_tags(entry, tags);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn broadcast_log(run: &RuntimeVmRemediationRun, entry: &RemediationLogEvent) {
