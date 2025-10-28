@@ -8,7 +8,7 @@ use axum::{
 use chrono::Utc;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sqlx::PgPool;
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -23,9 +23,9 @@ use crate::db::runtime_vm_remediation_playbooks::{
     UpdateRuntimeVmRemediationPlaybook,
 };
 use crate::db::runtime_vm_remediation_runs::{
-    ensure_remediation_run, get_run_by_id, list_runs, update_approval_state,
-    EnsureRemediationRunRequest, ListRuntimeVmRemediationRuns, RuntimeVmRemediationRun,
-    UpdateApprovalState,
+    ensure_remediation_run, get_active_run_for_instance, get_run_by_id, list_runs,
+    update_approval_state, update_run_workspace_linkage, EnsureRemediationRunRequest,
+    ListRuntimeVmRemediationRuns, RuntimeVmRemediationRun, UpdateApprovalState,
 };
 use crate::db::runtime_vm_remediation_workspaces::{
     apply_policy_feedback, apply_promotion, apply_sandbox_simulation, apply_schema_validation,
@@ -39,6 +39,7 @@ use crate::db::runtime_vm_remediation_workspaces::{
 use crate::error::{AppError, AppResult};
 use crate::extractor::AuthUser;
 use crate::remediation::subscribe_remediation_events;
+use tracing::{error, trace, warn};
 
 // key: remediation_surface -> http-handlers
 #[derive(Debug, Deserialize)]
@@ -104,6 +105,10 @@ pub struct RunsQuery {
     pub runtime_vm_instance_id: Option<i64>,
     #[serde(default)]
     pub status: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<i64>,
+    #[serde(default)]
+    pub workspace_revision_id: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -248,8 +253,471 @@ pub struct WorkspacePromotionRequest {
     pub promotion_status: String,
     #[serde(default)]
     pub notes: Vec<String>,
+    #[serde(default = "default_gate_context")]
+    pub gate_context: Value,
     pub expected_workspace_version: i64,
     pub expected_revision_version: i64,
+}
+
+#[derive(Debug, Clone)]
+struct PromotionAutomationTarget {
+    instance_id: i64,
+    playbook_key: Option<String>,
+    target_snapshot: Value,
+    automation_payload: Option<Value>,
+}
+
+fn parse_instance_id(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn collect_target_entries(value: Option<&Value>) -> Vec<Value> {
+    let mut targets = Vec::new();
+    if let Some(value) = value {
+        let context = Map::new();
+        collect_target_entries_recursive(value, &context, &mut targets);
+    }
+    targets
+}
+
+fn collect_target_entries_recursive(
+    value: &Value,
+    context: &Map<String, Value>,
+    targets: &mut Vec<Value>,
+) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_target_entries_recursive(item, context, targets);
+            }
+        }
+        Value::Object(map) => {
+            let has_instance =
+                map.contains_key("runtime_vm_instance_id") || map.contains_key("instance_id");
+
+            if has_instance {
+                let mut snapshot = Map::new();
+                for (key, value) in map {
+                    snapshot.insert(key.clone(), value.clone());
+                }
+                for (key, value) in context {
+                    snapshot.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+                targets.push(Value::Object(snapshot));
+                return;
+            }
+
+            let mut next_context = context.clone();
+
+            for (key, child) in map {
+                if key == "targets" {
+                    continue;
+                }
+                if should_propagate_context(child) && !next_context.contains_key(key) {
+                    next_context.insert(key.clone(), child.clone());
+                }
+            }
+
+            if let Some(targets_value) = map.get("targets") {
+                collect_target_entries_recursive(targets_value, &next_context, targets);
+            }
+
+            for (key, child) in map {
+                if key == "targets" {
+                    continue;
+                }
+                collect_target_entries_recursive(child, &next_context, targets);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn should_propagate_context(value: &Value) -> bool {
+    matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_))
+}
+
+fn extract_promotion_targets(
+    workspace: &RuntimeVmRemediationWorkspace,
+    revision: &RuntimeVmRemediationWorkspaceRevision,
+) -> Vec<PromotionAutomationTarget> {
+    let mut entries = Vec::new();
+    entries.extend(collect_target_entries(revision.plan.get("targets")));
+    entries.extend(collect_target_entries(revision.metadata.get("targets")));
+    entries.extend(collect_target_entries(workspace.metadata.get("targets")));
+
+    if entries.is_empty() {
+        if let Some(id) = revision
+            .metadata
+            .get("runtime_vm_instance_id")
+            .and_then(parse_instance_id)
+            .or_else(|| {
+                workspace
+                    .metadata
+                    .get("runtime_vm_instance_id")
+                    .and_then(parse_instance_id)
+            })
+        {
+            entries.push(json!({
+                "runtime_vm_instance_id": id,
+                "source": "workspace-default",
+            }));
+        }
+    }
+
+    let default_playbook = revision
+        .plan
+        .get("playbooks")
+        .and_then(|value| value.as_array())
+        .and_then(|array| array.first())
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+
+    let mut targets = Vec::new();
+    trace!(target_count = entries.len(), "processing promotion targets");
+
+    for entry in entries {
+        let instance_id = entry
+            .get("runtime_vm_instance_id")
+            .or_else(|| entry.get("instance_id"))
+            .and_then(parse_instance_id);
+
+        let Some(instance_id) = instance_id else {
+            warn!(target_entry = ?entry, "skipping workspace promotion target without runtime_vm_instance_id");
+            continue;
+        };
+
+        let playbook_key = entry
+            .get("playbook")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .or_else(|| default_playbook.clone());
+
+        let automation_payload = entry
+            .get("automation_payload")
+            .cloned()
+            .or_else(|| entry.get("payload").cloned());
+
+        let playbook_for_log = playbook_key.clone();
+
+        targets.push(PromotionAutomationTarget {
+            instance_id,
+            playbook_key,
+            target_snapshot: entry,
+            automation_payload,
+        });
+
+        trace!(instance_id, playbook = ?playbook_for_log, "workspace promotion target parsed");
+    }
+
+    targets
+}
+
+fn build_promotion_metadata(
+    workspace: &RuntimeVmRemediationWorkspace,
+    revision: &RuntimeVmRemediationWorkspaceRevision,
+    target_snapshot: &Value,
+    gate_context: &Value,
+    notes: &[String],
+    requested_by: i32,
+    existing_metadata: Option<&Value>,
+) -> Value {
+    let mut metadata = json!({
+        "workspace": {
+            "id": workspace.id,
+            "key": workspace.workspace_key,
+            "display_name": workspace.display_name,
+            "owner_id": workspace.owner_id,
+            "lineage_tags": workspace.lineage_tags.clone(),
+            "lineage_labels": revision.lineage_labels.clone(),
+            "metadata": workspace.metadata.clone(),
+        },
+        "revision": {
+            "id": revision.id,
+            "number": revision.revision_number,
+            "plan": revision.plan.clone(),
+            "metadata": revision.metadata.clone(),
+        },
+        "promotion": {
+            "notes": notes.to_vec(),
+            "gate_context": gate_context.clone(),
+            "requested_by": requested_by,
+            "recorded_at": Utc::now(),
+        },
+        "target": target_snapshot.clone(),
+    });
+
+    if let Some(existing) = existing_metadata {
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert("previous_metadata".to_string(), existing.clone());
+        }
+    }
+
+    metadata
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn sample_workspace(
+        plan_targets: Value,
+        metadata_targets: Value,
+    ) -> RuntimeVmRemediationWorkspace {
+        RuntimeVmRemediationWorkspace {
+            id: 77,
+            workspace_key: "workspace.test".to_string(),
+            display_name: "Workspace Test".to_string(),
+            description: None,
+            owner_id: 42,
+            lifecycle_state: "draft".to_string(),
+            active_revision_id: Some(88),
+            metadata: json!({"targets": metadata_targets}),
+            lineage_tags: vec!["test".to_string()],
+            created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            updated_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            version: 0,
+        }
+    }
+
+    fn sample_revision(plan_targets: Value) -> RuntimeVmRemediationWorkspaceRevision {
+        RuntimeVmRemediationWorkspaceRevision {
+            id: 88,
+            workspace_id: 77,
+            revision_number: 3,
+            previous_revision_id: Some(66),
+            created_by: 42,
+            plan: json!({
+                "playbooks": ["vm.restart"],
+                "targets": plan_targets,
+            }),
+            schema_status: "succeeded".to_string(),
+            schema_errors: Vec::new(),
+            policy_status: "approved".to_string(),
+            policy_veto_reasons: Vec::new(),
+            simulation_status: "succeeded".to_string(),
+            promotion_status: "pending".to_string(),
+            metadata: json!({"targets": {"metadata_only": {"runtime_vm_instance_id": 404}}}),
+            lineage_labels: vec!["alpha".to_string()],
+            schema_validated_at: None,
+            policy_evaluated_at: None,
+            simulated_at: None,
+            promoted_at: None,
+            created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            updated_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn extract_targets_flattens_nested_lanes_and_defaults_playbooks() {
+        let plan_targets = json!({
+            "lanes": [
+                {
+                    "lane": "blue",
+                    "stage": "canary",
+                    "targets": [
+                        {
+                            "instance_id": "101",
+                            "automation_payload": {"path": "lane-blue"}
+                        },
+                        {
+                            "runtime_vm_instance_id": 202,
+                            "playbook": "vm.redeploy"
+                        }
+                    ]
+                }
+            ],
+            "direct": [
+                {
+                    "runtime_vm_instance_id": 303,
+                    "automation_payload": {"path": "direct"}
+                }
+            ]
+        });
+        let metadata_targets = json!({
+            "fallback": {"runtime_vm_instance_id": 404, "source": "workspace"}
+        });
+        let workspace = sample_workspace(plan_targets.clone(), metadata_targets);
+        let revision = sample_revision(plan_targets);
+
+        let mut targets = extract_promotion_targets(&workspace, &revision);
+        targets.sort_by_key(|target| target.instance_id);
+
+        assert_eq!(targets.len(), 4);
+        assert_eq!(targets[0].instance_id, 101);
+        assert_eq!(targets[0].playbook_key.as_deref(), Some("vm.restart"));
+        assert_eq!(
+            targets[0]
+                .target_snapshot
+                .get("lane")
+                .and_then(Value::as_str),
+            Some("blue")
+        );
+        assert_eq!(
+            targets[0]
+                .target_snapshot
+                .get("stage")
+                .and_then(Value::as_str),
+            Some("canary")
+        );
+        assert!(targets[0].automation_payload.is_some());
+
+        assert_eq!(targets[1].instance_id, 202);
+        assert_eq!(targets[1].playbook_key.as_deref(), Some("vm.redeploy"));
+        assert_eq!(
+            targets[1]
+                .target_snapshot
+                .get("lane")
+                .and_then(Value::as_str),
+            Some("blue")
+        );
+
+        assert_eq!(targets[2].instance_id, 303);
+        assert_eq!(targets[2].playbook_key.as_deref(), Some("vm.restart"));
+        assert_eq!(
+            targets[2]
+                .automation_payload
+                .as_ref()
+                .and_then(|value| value.get("path"))
+                .and_then(Value::as_str),
+            Some("direct")
+        );
+
+        assert_eq!(targets[3].instance_id, 404);
+        assert_eq!(targets[3].playbook_key.as_deref(), Some("vm.restart"));
+        assert_eq!(
+            targets[3]
+                .target_snapshot
+                .get("source")
+                .and_then(Value::as_str),
+            Some("workspace")
+        );
+    }
+
+    #[test]
+    fn extract_targets_falls_back_to_revision_metadata_when_no_targets() {
+        let workspace = sample_workspace(Value::Null, json!({"runtime_vm_instance_id": 707}));
+        let mut revision = sample_revision(Value::Null);
+        revision.plan = json!({"playbooks": ["vm.restart"]});
+        revision.metadata = json!({"runtime_vm_instance_id": 808});
+
+        let targets = extract_promotion_targets(&workspace, &revision);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].instance_id, 808);
+    }
+}
+
+async fn stage_workspace_promotion_runs(
+    pool: &PgPool,
+    workspace: &RuntimeVmRemediationWorkspace,
+    revision: &RuntimeVmRemediationWorkspaceRevision,
+    gate_context: &Value,
+    notes: &[String],
+    requested_by: i32,
+) -> Result<Vec<RuntimeVmRemediationRun>, AppError> {
+    const DEFAULT_PLAYBOOK: &str = "default-vm-remediation";
+
+    let targets = extract_promotion_targets(workspace, revision);
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut staged = Vec::new();
+    for target in targets {
+        let playbook_key = target
+            .playbook_key
+            .clone()
+            .unwrap_or_else(|| DEFAULT_PLAYBOOK.to_string());
+        let playbook = get_playbook_by_key(pool, &playbook_key).await?;
+
+        let metadata_value = build_promotion_metadata(
+            workspace,
+            revision,
+            &target.target_snapshot,
+            gate_context,
+            notes,
+            requested_by,
+            None,
+        );
+        let automation_payload_value = target.automation_payload.clone();
+
+        let request = EnsureRemediationRunRequest {
+            runtime_vm_instance_id: target.instance_id,
+            playbook_key: &playbook_key,
+            playbook_id: playbook.as_ref().map(|record| record.id),
+            metadata: Some(&metadata_value),
+            automation_payload: automation_payload_value.as_ref(),
+            approval_required: playbook
+                .as_ref()
+                .map(|record| record.approval_required)
+                .unwrap_or(false),
+            assigned_owner_id: playbook
+                .as_ref()
+                .map(|record| record.owner_id)
+                .or(Some(requested_by)),
+            sla_duration_seconds: playbook
+                .as_ref()
+                .and_then(|record| record.sla_duration_seconds),
+            workspace_id: Some(workspace.id),
+            workspace_revision_id: Some(revision.id),
+            promotion_gate_context: Some(gate_context),
+        };
+
+        match ensure_remediation_run(pool, request).await? {
+            Some(run) => {
+                ingest_accelerator_posture(pool, run.runtime_vm_instance_id, &metadata_value)
+                    .await?;
+                staged.push(run);
+            }
+            None => {
+                if let Some(existing) =
+                    get_active_run_for_instance(pool, target.instance_id).await?
+                {
+                    let merged_metadata = build_promotion_metadata(
+                        workspace,
+                        revision,
+                        &target.target_snapshot,
+                        gate_context,
+                        notes,
+                        requested_by,
+                        Some(&existing.metadata),
+                    );
+                    let updated = update_run_workspace_linkage(
+                        pool,
+                        existing.id,
+                        workspace.id,
+                        revision.id,
+                        gate_context,
+                        Some(&merged_metadata),
+                    )
+                    .await?
+                    .unwrap_or(existing);
+                    ingest_accelerator_posture(
+                        pool,
+                        updated.runtime_vm_instance_id,
+                        &merged_metadata,
+                    )
+                    .await?;
+                    staged.push(updated);
+                } else {
+                    warn!(
+                        instance_id = target.instance_id,
+                        workspace_id = workspace.id,
+                        revision_id = revision.id,
+                        "no active remediation run found to update after promotion"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(staged)
 }
 
 pub async fn list_all_playbooks(
@@ -357,6 +825,7 @@ pub async fn apply_workspace_schema_validation_handler(
 
     let envelope =
         map_workspace_update_result(&pool, workspace_id, Some(revision_id), result).await?;
+
     Ok(Json(envelope))
 }
 
@@ -431,6 +900,7 @@ pub async fn apply_workspace_promotion_handler(
             requested_by: user.user_id,
             promotion_status: &request.promotion_status,
             notes: &notes,
+            gate_context: &request.gate_context,
             expected_workspace_version: request.expected_workspace_version,
             expected_revision_version: request.expected_revision_version,
         },
@@ -520,6 +990,8 @@ pub async fn list_runs_handler(
         ListRuntimeVmRemediationRuns {
             runtime_vm_instance_id: query.runtime_vm_instance_id,
             status: query.status.as_deref(),
+            workspace_id: query.workspace_id,
+            workspace_revision_id: query.workspace_revision_id,
         },
     )
     .await?;
@@ -563,6 +1035,9 @@ pub async fn enqueue_run_handler(
             approval_required: playbook.approval_required,
             assigned_owner_id: request.assigned_owner_id.or(Some(user.user_id)),
             sla_duration_seconds: playbook.sla_duration_seconds,
+            workspace_id: None,
+            workspace_revision_id: None,
+            promotion_gate_context: None,
         },
     )
     .await?;

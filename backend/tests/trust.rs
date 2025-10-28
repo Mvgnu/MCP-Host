@@ -1,6 +1,6 @@
 use axum::{routing::post, Extension, Router};
 use backend::db::runtime_vm_remediation_runs::{
-    ensure_remediation_run, EnsureRemediationRunRequest,
+    ensure_remediation_run, update_run_workspace_linkage, EnsureRemediationRunRequest,
 };
 use backend::policy::trust::evaluate_placement_gate;
 use backend::trust::TrustRegistryView;
@@ -150,6 +150,9 @@ async fn placement_gate_blocks_active_remediation(pool: PgPool) {
             approval_required: true,
             assigned_owner_id: None,
             sla_duration_seconds: None,
+            workspace_id: None,
+            workspace_revision_id: None,
+            promotion_gate_context: None,
         },
     )
     .await
@@ -220,6 +223,9 @@ async fn placement_gate_flags_structural_failure(pool: PgPool) {
             approval_required: false,
             assigned_owner_id: None,
             sla_duration_seconds: None,
+            workspace_id: None,
+            workspace_revision_id: None,
+            promotion_gate_context: None,
         },
     )
     .await
@@ -249,5 +255,144 @@ async fn placement_gate_flags_structural_failure(pool: PgPool) {
             .iter()
             .any(|note| note
                 .contains("policy_hook:remediation_gate=failure:policy-denied:structural"))
+    );
+}
+
+#[sqlx::test]
+#[ignore = "requires DATABASE_URL with Postgres server"]
+async fn update_run_workspace_linkage_merges_json_metadata(pool: PgPool) {
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let user_id: i32 =
+        sqlx::query_scalar("INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id")
+            .bind("metadata@example.com")
+            .bind("hashed")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let server_id: i32 = sqlx::query_scalar(
+        "INSERT INTO mcp_servers (owner_id, name, server_type, config, status, api_key) VALUES ($1, $2, $3, '{}'::jsonb, $4, $5) RETURNING id",
+    )
+    .bind(user_id)
+    .bind("metadata-server")
+    .bind("virtual-machine")
+    .bind("active")
+    .bind("meta-key")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let vm_instance_id: i64 = sqlx::query_scalar(
+        "INSERT INTO runtime_vm_instances (server_id, instance_id) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(server_id)
+    .bind("vm-meta-1")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let workspace_id: i64 = sqlx::query_scalar(
+        "INSERT INTO runtime_vm_remediation_workspaces (workspace_key, display_name, description, owner_id, lifecycle_state, active_revision_id, metadata, lineage_tags) VALUES ($1, $2, $3, $4, $5, NULL, '{}'::jsonb, ARRAY[]::text[]) RETURNING id",
+    )
+    .bind("workspace.meta")
+    .bind("Metadata Workspace")
+    .bind(Option::<&str>::None)
+    .bind(user_id)
+    .bind("draft")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let revision_id: i64 = sqlx::query_scalar(
+        "INSERT INTO runtime_vm_remediation_workspace_revisions (workspace_id, revision_number, previous_revision_id, created_by, plan, metadata, lineage_labels) VALUES ($1, $2, NULL, $3, '{}'::jsonb, '{}'::jsonb, ARRAY[]::text[]) RETURNING id",
+    )
+    .bind(workspace_id)
+    .bind(1_i64)
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE runtime_vm_remediation_workspaces SET active_revision_id = $1 WHERE id = $2",
+    )
+    .bind(revision_id)
+    .bind(workspace_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let initial_metadata = json!({
+        "existing": {"keep": true},
+        "unchanged": 1,
+    });
+    let run = ensure_remediation_run(
+        &pool,
+        EnsureRemediationRunRequest {
+            runtime_vm_instance_id: vm_instance_id,
+            playbook_key: "default-vm-remediation",
+            playbook_id: None,
+            metadata: Some(&initial_metadata),
+            automation_payload: None,
+            approval_required: false,
+            assigned_owner_id: None,
+            sla_duration_seconds: None,
+            workspace_id: None,
+            workspace_revision_id: None,
+            promotion_gate_context: None,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("run created");
+
+    let merged_metadata = json!({
+        "existing": {"keep": false},
+        "added": "value",
+    });
+    let gate_context = json!({"lane": "merge", "stage": "promotion"});
+    let updated = update_run_workspace_linkage(
+        &pool,
+        run.id,
+        workspace_id,
+        revision_id,
+        &gate_context,
+        Some(&merged_metadata),
+    )
+    .await
+    .unwrap()
+    .expect("run updated");
+
+    assert_eq!(updated.workspace_id, Some(workspace_id));
+    assert_eq!(updated.workspace_revision_id, Some(revision_id));
+    assert_eq!(
+        updated
+            .promotion_gate_context
+            .get("lane")
+            .and_then(|value| value.as_str()),
+        Some("merge"),
+    );
+    assert_eq!(
+        updated
+            .metadata
+            .get("existing")
+            .and_then(|value| value.get("keep"))
+            .and_then(|value| value.as_bool()),
+        Some(false),
+    );
+    assert_eq!(
+        updated
+            .metadata
+            .get("unchanged")
+            .and_then(|value| value.as_i64()),
+        Some(1),
+    );
+    assert_eq!(
+        updated
+            .metadata
+            .get("added")
+            .and_then(|value| value.as_str()),
+        Some("value"),
     );
 }

@@ -140,6 +140,9 @@ and promotion gates with explicit optimistic locking assertions. The remediation
 the same database-backed tests and now exercises the CLI stack (`mcpctl remediation workspaces`)
 to create revisions, record gate outcomes, and complete promotions under the same optimistic locking
 tokens surfaced by the REST handlers.
+`remediation_workspace_promotion_multiple_targets` extends this suite by simulating nested promotion
+targets, verifying per-target playbook selection, promotion gate context propagation, and the
+resulting automation metadata for each runtime VM instance.
 
 ### Validation harness (`validation: remediation_flow`)
 

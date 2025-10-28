@@ -140,9 +140,12 @@ env = os.environ.copy()
 base = [sys.executable, "-m", "mcpctl", "remediation", "workspaces"]
 
 
-def run(args):
-    output = subprocess.check_output(base + args + ["--json"], env=env)
-    return json.loads(output)
+def run(args, *, expect_json=True):
+    command = base + args
+    if expect_json:
+        command = command + ["--json"]
+    output = subprocess.check_output(command, env=env).decode()
+    return json.loads(output) if expect_json else output
 
 
 def select_revision(envelope, revision_id):
@@ -150,6 +153,23 @@ def select_revision(envelope, revision_id):
         if item.get("revision", {}).get("id") == revision_id:
             return item
     raise AssertionError(f"revision {revision_id} not found")
+
+
+def parse_automation_rows(output):
+    marker = "Automation status:"
+    if marker not in output:
+        raise AssertionError("missing automation status table")
+    table = output.split(marker, 1)[1].strip()
+    lines = [line.rstrip() for line in table.splitlines() if line.strip()]
+    if len(lines) < 3:
+        raise AssertionError("automation table missing rows")
+    header = lines[0].split()
+    rows = []
+    for line in lines[2:]:
+        cells = line.split()
+        row = {header[idx]: cells[idx] if idx < len(cells) else "" for idx in range(len(header))}
+        rows.append(row)
+    return rows
 
 
 records = run(["list"])
@@ -254,7 +274,7 @@ cli_revision = select_revision(simulation_envelope, cli_revision_id)
 cli_revision_version = cli_revision["revision"]["version"]
 assert cli_revision["gate_summary"].get("simulation_status") == "succeeded"
 
-promotion_envelope = run(
+promotion_output = run(
     [
         "revision",
         "promote",
@@ -262,22 +282,25 @@ promotion_envelope = run(
         str(cli_revision_id),
         "--status",
         "completed",
+        "--context",
+        json.dumps({"lane": "cli", "stage": "promotion"}),
         "--workspace-version",
         str(workspace_version),
         "--version",
         str(cli_revision_version),
         "--note",
         "cli-harness",
-    ]
+    ],
+    expect_json=False,
 )
-cli_revision = select_revision(promotion_envelope, cli_revision_id)
-workspace_version = promotion_envelope["workspace"]["version"]
-assert workspace_version >= 1
-assert cli_revision["gate_summary"].get("promotion_status") == "completed"
-assert cli_revision["revision"].get("version", 0) > cli_revision_version
+automation_rows = parse_automation_rows(promotion_output)
+if not any(row.get("gate_lane") == "cli" and row.get("gate_stage") == "promotion" for row in automation_rows):
+    raise AssertionError("promotion automation table missing expected lane/stage")
 
 latest_details = run(["get", str(workspace_id)])
+workspace_version = latest_details["workspace"]["version"]
 cli_revision_final = select_revision(latest_details, cli_revision_id)
+cli_revision_version = cli_revision_final["revision"]["version"]
 assert cli_revision_final["gate_summary"].get("policy_status") == "approved"
 assert cli_revision_final["gate_summary"].get("schema_status") == "passed"
 assert cli_revision_final["gate_summary"].get("simulation_status") == "succeeded"

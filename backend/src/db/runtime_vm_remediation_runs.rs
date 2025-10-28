@@ -22,6 +22,9 @@ pub struct RuntimeVmRemediationRun {
     pub approval_decided_at: Option<DateTime<Utc>>,
     pub approval_notes: Option<String>,
     pub metadata: Value,
+    pub workspace_id: Option<i64>,
+    pub workspace_revision_id: Option<i64>,
+    pub promotion_gate_context: Value,
     pub version: i64,
     pub updated_at: DateTime<Utc>,
     pub cancelled_at: Option<DateTime<Utc>>,
@@ -32,6 +35,8 @@ pub struct RuntimeVmRemediationRun {
 pub struct ListRuntimeVmRemediationRuns<'a> {
     pub runtime_vm_instance_id: Option<i64>,
     pub status: Option<&'a str>,
+    pub workspace_id: Option<i64>,
+    pub workspace_revision_id: Option<i64>,
 }
 
 pub async fn list_runs(
@@ -39,13 +44,17 @@ pub async fn list_runs(
     filter: ListRuntimeVmRemediationRuns<'_>,
 ) -> Result<Vec<RuntimeVmRemediationRun>, sqlx::Error> {
     let mut builder = QueryBuilder::new(
-        "SELECT id, runtime_vm_instance_id, playbook, playbook_id, status, automation_payload, \\n         approval_required, started_at, completed_at, last_error, assigned_owner_id, sla_deadline, \\n         approval_state, approval_decided_at, approval_notes, metadata, version, updated_at, \\n         cancelled_at, cancellation_reason, failure_reason FROM runtime_vm_remediation_runs",
+        "SELECT id, runtime_vm_instance_id, playbook, playbook_id, status, automation_payload, \\n         approval_required, started_at, completed_at, last_error, assigned_owner_id, sla_deadline, \\n         approval_state, approval_decided_at, approval_notes, metadata, workspace_id, \\n         workspace_revision_id, promotion_gate_context, version, updated_at, cancelled_at, \\n         cancellation_reason, failure_reason FROM runtime_vm_remediation_runs",
     );
-
-    let mut has_clause = false;
-    if filter.runtime_vm_instance_id.is_some() || filter.status.is_some() {
+    if filter.runtime_vm_instance_id.is_some()
+        || filter.status.is_some()
+        || filter.workspace_id.is_some()
+        || filter.workspace_revision_id.is_some()
+    {
         builder.push(" WHERE ");
     }
+
+    let mut has_clause = false;
 
     if let Some(instance_id) = filter.runtime_vm_instance_id {
         builder.push(" runtime_vm_instance_id = ");
@@ -59,6 +68,24 @@ pub async fn list_runs(
         }
         builder.push(" status = ");
         builder.push_bind(status);
+        has_clause = true;
+    }
+
+    if let Some(workspace_id) = filter.workspace_id {
+        if has_clause {
+            builder.push(" AND ");
+        }
+        builder.push(" workspace_id = ");
+        builder.push_bind(workspace_id);
+        has_clause = true;
+    }
+
+    if let Some(revision_id) = filter.workspace_revision_id {
+        if has_clause {
+            builder.push(" AND ");
+        }
+        builder.push(" workspace_revision_id = ");
+        builder.push_bind(revision_id);
     }
 
     builder.push(" ORDER BY started_at DESC");
@@ -92,6 +119,9 @@ pub async fn get_run_by_id(
             approval_decided_at,
             approval_notes,
             metadata,
+            workspace_id,
+            workspace_revision_id,
+            promotion_gate_context,
             version,
             updated_at,
             cancelled_at,
@@ -115,6 +145,9 @@ pub struct EnsureRemediationRunRequest<'a> {
     pub approval_required: bool,
     pub assigned_owner_id: Option<i32>,
     pub sla_duration_seconds: Option<i32>,
+    pub workspace_id: Option<i64>,
+    pub workspace_revision_id: Option<i64>,
+    pub promotion_gate_context: Option<&'a Value>,
 }
 
 pub async fn ensure_remediation_run<'c, E>(
@@ -138,7 +171,10 @@ where
                 approval_decided_at,
                 assigned_owner_id,
                 sla_deadline,
-                metadata
+                metadata,
+                workspace_id,
+                workspace_revision_id,
+                promotion_gate_context
             )
             SELECT
                 $1,
@@ -154,7 +190,10 @@ where
                     WHEN $7 IS NULL THEN NULL
                     ELSE NOW() + ($7::INT * INTERVAL '1 second')
                 END,
-                COALESCE($8, '{}'::JSONB)
+                COALESCE($8, '{}'::JSONB),
+                $9,
+                $10,
+                COALESCE($11, '{}'::JSONB)
             WHERE NOT EXISTS (
                 SELECT 1
                 FROM runtime_vm_remediation_runs
@@ -178,6 +217,9 @@ where
                 approval_decided_at,
                 approval_notes,
                 metadata,
+                workspace_id,
+                workspace_revision_id,
+                promotion_gate_context,
                 version,
                 updated_at,
                 cancelled_at,
@@ -201,6 +243,9 @@ where
             approval_decided_at,
             approval_notes,
             metadata,
+            workspace_id,
+            workspace_revision_id,
+            promotion_gate_context,
             version,
             updated_at,
             cancelled_at,
@@ -217,6 +262,9 @@ where
     .bind(request.assigned_owner_id)
     .bind(request.sla_duration_seconds)
     .bind(request.metadata)
+    .bind(request.workspace_id)
+    .bind(request.workspace_revision_id)
+    .bind(request.promotion_gate_context)
     .fetch_optional(executor)
     .await?;
 
@@ -249,6 +297,9 @@ where
             approval_decided_at,
             approval_notes,
             metadata,
+            workspace_id,
+            workspace_revision_id,
+            promotion_gate_context,
             version,
             updated_at,
             cancelled_at,
@@ -307,6 +358,9 @@ where
             runs.approval_decided_at,
             runs.approval_notes,
             runs.metadata,
+            runs.workspace_id,
+            runs.workspace_revision_id,
+            runs.promotion_gate_context,
             runs.version,
             runs.updated_at,
             runs.cancelled_at,
@@ -314,6 +368,69 @@ where
             runs.failure_reason
         "#,
     )
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(record)
+}
+
+pub async fn update_run_workspace_linkage<'c, E>(
+    executor: E,
+    run_id: i64,
+    workspace_id: i64,
+    workspace_revision_id: i64,
+    promotion_gate_context: &Value,
+    metadata: Option<&Value>,
+) -> Result<Option<RuntimeVmRemediationRun>, sqlx::Error>
+where
+    E: Executor<'c, Database = Postgres>,
+{
+    let record = sqlx::query_as::<_, RuntimeVmRemediationRun>(
+        r#"
+        UPDATE runtime_vm_remediation_runs
+        SET
+            workspace_id = $2,
+            workspace_revision_id = $3,
+            promotion_gate_context = $4,
+            metadata = CASE
+                WHEN $5 IS NULL THEN metadata
+                ELSE COALESCE(metadata, '{}'::jsonb) || $5::jsonb
+            END,
+            version = version + 1,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING
+            id,
+            runtime_vm_instance_id,
+            playbook,
+            playbook_id,
+            status,
+            automation_payload,
+            approval_required,
+            started_at,
+            completed_at,
+            last_error,
+            assigned_owner_id,
+            sla_deadline,
+            approval_state,
+            approval_decided_at,
+            approval_notes,
+            metadata,
+            workspace_id,
+            workspace_revision_id,
+            promotion_gate_context,
+            version,
+            updated_at,
+            cancelled_at,
+            cancellation_reason,
+            failure_reason
+        "#,
+    )
+    .bind(run_id)
+    .bind(workspace_id)
+    .bind(workspace_revision_id)
+    .bind(promotion_gate_context)
+    .bind(metadata)
     .fetch_optional(executor)
     .await?;
 
@@ -360,6 +477,9 @@ where
             approval_decided_at,
             approval_notes,
             metadata,
+            workspace_id,
+            workspace_revision_id,
+            promotion_gate_context,
             version,
             updated_at,
             cancelled_at,
@@ -416,6 +536,9 @@ where
             approval_decided_at,
             approval_notes,
             metadata,
+            workspace_id,
+            workspace_revision_id,
+            promotion_gate_context,
             version,
             updated_at,
             cancelled_at,
@@ -476,6 +599,9 @@ where
             approval_decided_at,
             approval_notes,
             metadata,
+            workspace_id,
+            workspace_revision_id,
+            promotion_gate_context,
             version,
             updated_at,
             cancelled_at,
