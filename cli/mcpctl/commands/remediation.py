@@ -25,6 +25,177 @@ def install(
     pb_list.set_defaults(handler=_playbooks_list)
     add_common_arguments(pb_list)
 
+    workspaces_parser = remediation_sub.add_parser(
+        "workspaces", help="Manage remediation workspaces"
+    )
+    workspaces_sub = workspaces_parser.add_subparsers(
+        dest="workspaces_cmd", required=True
+    )
+
+    ws_list = workspaces_sub.add_parser("list", help="List remediation workspaces")
+    ws_list.set_defaults(handler=_workspaces_list)
+    add_common_arguments(ws_list)
+
+    ws_get = workspaces_sub.add_parser("get", help="Show workspace details")
+    ws_get.add_argument("workspace_id", type=int)
+    ws_get.set_defaults(handler=_workspaces_get)
+    add_common_arguments(ws_get)
+
+    ws_create = workspaces_sub.add_parser("create", help="Create a workspace draft")
+    ws_create.add_argument("workspace_key")
+    ws_create.add_argument("display_name")
+    ws_create.add_argument("--plan", required=True, help="JSON plan payload")
+    ws_create.add_argument("--description")
+    ws_create.add_argument("--metadata", help="JSON metadata")
+    ws_create.add_argument(
+        "--lineage-tag",
+        dest="lineage_tags",
+        action="append",
+        default=[],
+        help="Workspace lineage tag",
+    )
+    ws_create.add_argument(
+        "--lineage-label",
+        dest="lineage_labels",
+        action="append",
+        default=[],
+        help="Initial revision lineage label",
+    )
+    ws_create.set_defaults(handler=_workspaces_create)
+    add_common_arguments(ws_create)
+
+    revision_parser = workspaces_sub.add_parser(
+        "revision", help="Operate on workspace revisions"
+    )
+    revision_sub = revision_parser.add_subparsers(
+        dest="workspace_revision_cmd", required=True
+    )
+
+    rev_create = revision_sub.add_parser(
+        "create", help="Create a new workspace revision"
+    )
+    rev_create.add_argument("workspace_id", type=int)
+    rev_create.add_argument("--plan", required=True, help="JSON plan payload")
+    rev_create.add_argument("--metadata", help="JSON metadata")
+    rev_create.add_argument(
+        "--expected-version",
+        dest="expected_workspace_version",
+        type=int,
+        required=True,
+    )
+    rev_create.add_argument(
+        "--previous-revision",
+        dest="previous_revision_id",
+        type=int,
+    )
+    rev_create.add_argument(
+        "--lineage-label",
+        dest="lineage_labels",
+        action="append",
+        default=[],
+    )
+    rev_create.set_defaults(handler=_workspace_revision_create)
+    add_common_arguments(rev_create)
+
+    rev_schema = revision_sub.add_parser(
+        "schema", help="Record schema validation outcome"
+    )
+    rev_schema.add_argument("workspace_id", type=int)
+    rev_schema.add_argument("revision_id", type=int)
+    rev_schema.add_argument("--status", dest="result_status", required=True)
+    rev_schema.add_argument(
+        "--error",
+        dest="errors",
+        action="append",
+        default=[],
+        help="Validation error",
+    )
+    rev_schema.add_argument("--context", dest="gate_context", help="JSON gate context")
+    rev_schema.add_argument("--metadata", help="JSON metadata")
+    rev_schema.add_argument(
+        "--version",
+        dest="expected_revision_version",
+        type=int,
+        required=True,
+    )
+    rev_schema.set_defaults(handler=_workspace_revision_schema)
+    add_common_arguments(rev_schema)
+
+    rev_policy = revision_sub.add_parser(
+        "policy", help="Record policy feedback for a revision"
+    )
+    rev_policy.add_argument("workspace_id", type=int)
+    rev_policy.add_argument("revision_id", type=int)
+    rev_policy.add_argument("--status", dest="policy_status", required=True)
+    rev_policy.add_argument(
+        "--veto",
+        dest="veto_reasons",
+        action="append",
+        default=[],
+        help="Policy veto reason",
+    )
+    rev_policy.add_argument("--context", dest="gate_context", help="JSON gate context")
+    rev_policy.add_argument("--metadata", help="JSON metadata")
+    rev_policy.add_argument(
+        "--version",
+        dest="expected_revision_version",
+        type=int,
+        required=True,
+    )
+    rev_policy.set_defaults(handler=_workspace_revision_policy)
+    add_common_arguments(rev_policy)
+
+    rev_sim = revision_sub.add_parser(
+        "simulate", help="Record sandbox simulation state"
+    )
+    rev_sim.add_argument("workspace_id", type=int)
+    rev_sim.add_argument("revision_id", type=int)
+    rev_sim.add_argument("--simulator", dest="simulator_kind", required=True)
+    rev_sim.add_argument("--state", dest="execution_state", required=True)
+    rev_sim.add_argument("--context", dest="gate_context", help="JSON gate context")
+    rev_sim.add_argument("--diff", dest="diff_snapshot", help="JSON diff snapshot")
+    rev_sim.add_argument("--metadata", help="JSON metadata")
+    rev_sim.add_argument(
+        "--version",
+        dest="expected_revision_version",
+        type=int,
+        required=True,
+    )
+    rev_sim.set_defaults(handler=_workspace_revision_simulation)
+    add_common_arguments(rev_sim)
+
+    rev_promote = revision_sub.add_parser(
+        "promote", help="Update promotion status for a revision"
+    )
+    rev_promote.add_argument("workspace_id", type=int)
+    rev_promote.add_argument("revision_id", type=int)
+    rev_promote.add_argument("--status", dest="promotion_status", required=True)
+    rev_promote.add_argument(
+        "--note", dest="notes", action="append", default=[], help="Promotion note"
+    )
+    rev_promote.add_argument(
+        "--workspace-version",
+        dest="expected_workspace_version",
+        type=int,
+        required=True,
+    )
+    rev_promote.add_argument(
+        "--version",
+        dest="expected_revision_version",
+        type=int,
+        required=True,
+    )
+    rev_promote.set_defaults(handler=_workspace_revision_promote)
+    add_common_arguments(rev_promote)
+
+    rev_diff = revision_sub.add_parser(
+        "diff", help="Show latest sandbox diff for a revision"
+    )
+    rev_diff.add_argument("workspace_id", type=int)
+    rev_diff.add_argument("revision_id", type=int)
+    rev_diff.set_defaults(handler=_workspace_revision_diff)
+    add_common_arguments(rev_diff)
+
     runs_parser = remediation_sub.add_parser("runs", help="Inspect remediation runs")
     runs_sub = runs_parser.add_subparsers(dest="runs_cmd", required=True)
 
@@ -94,6 +265,252 @@ def _playbooks_list(client: APIClient, as_json: bool, _: Dict[str, object]) -> N
     ]
     columns = ["id", "key", "executor", "approval", "sla"]
     print(render_table(rows, columns))
+
+
+def _workspaces_list(client: APIClient, as_json: bool, _: Dict[str, object]) -> None:
+    records = client.get("/api/trust/remediation/workspaces")
+    if as_json:
+        print(dumps_json(records))
+        return
+    rows = []
+    for envelope in records:
+        if not isinstance(envelope, dict):
+            continue
+        workspace = envelope.get("workspace", {})
+        revisions = envelope.get("revisions", [])
+        latest = revisions[0] if revisions else {}
+        revision_body = latest.get("revision", {}) if isinstance(latest, dict) else {}
+        gate = latest.get("gate_summary", {}) if isinstance(latest, dict) else {}
+        rows.append(
+            {
+                "id": workspace.get("id"),
+                "key": workspace.get("workspace_key"),
+                "state": workspace.get("lifecycle_state"),
+                "revision": revision_body.get("revision_number"),
+                "schema": gate.get("schema_status"),
+                "policy": gate.get("policy_status"),
+                "simulation": gate.get("simulation_status"),
+                "promotion": gate.get("promotion_status"),
+            }
+        )
+    columns = ["id", "key", "state", "revision", "schema", "policy", "simulation", "promotion"]
+    print(render_table(rows, columns))
+
+
+def _workspaces_get(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
+    envelope = client.get(f"/api/trust/remediation/workspaces/{args['workspace_id']}")
+    if as_json:
+        print(dumps_json(envelope))
+        return
+    _print_workspace_details(envelope)
+
+
+def _workspaces_create(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
+    plan = _loads_json(args["plan"], "plan") or {}
+    metadata = _loads_json(args.get("metadata"), "metadata") or {}
+    payload: Dict[str, Any] = {
+        "workspace_key": args["workspace_key"],
+        "display_name": args["display_name"],
+        "plan": plan,
+        "metadata": metadata,
+        "lineage_tags": list(args.get("lineage_tags", [])),
+        "lineage_labels": list(args.get("lineage_labels", [])),
+    }
+    if args.get("description"):
+        payload["description"] = args["description"]
+    envelope = client.post(
+        "/api/trust/remediation/workspaces",
+        json_body=payload,
+    )
+    if as_json:
+        print(dumps_json(envelope))
+        return
+    _print_workspace_details(envelope)
+
+
+def _workspace_revision_create(
+    client: APIClient, as_json: bool, args: Dict[str, object]
+) -> None:
+    plan = _loads_json(args["plan"], "plan") or {}
+    metadata = _loads_json(args.get("metadata"), "metadata") or {}
+    payload: Dict[str, Any] = {
+        "plan": plan,
+        "metadata": metadata,
+        "expected_workspace_version": args["expected_workspace_version"],
+        "lineage_labels": list(args.get("lineage_labels", [])),
+    }
+    if args.get("previous_revision_id") is not None:
+        payload["previous_revision_id"] = args["previous_revision_id"]
+    envelope = client.post(
+        f"/api/trust/remediation/workspaces/{args['workspace_id']}/revisions",
+        json_body=payload,
+    )
+    if as_json:
+        print(dumps_json(envelope))
+        return
+    _print_workspace_details(envelope)
+
+
+def _workspace_revision_schema(
+    client: APIClient, as_json: bool, args: Dict[str, object]
+) -> None:
+    gate_context = _loads_json(args.get("gate_context"), "context") or {}
+    metadata = _loads_json(args.get("metadata"), "metadata") or {}
+    payload = {
+        "result_status": args["result_status"],
+        "errors": list(args.get("errors", [])),
+        "gate_context": gate_context,
+        "metadata": metadata,
+        "expected_revision_version": args["expected_revision_version"],
+    }
+    envelope = client.post(
+        f"/api/trust/remediation/workspaces/{args['workspace_id']}/revisions/{args['revision_id']}/schema",
+        json_body=payload,
+    )
+    if as_json:
+        print(dumps_json(envelope))
+        return
+    _print_workspace_details(envelope)
+
+
+def _workspace_revision_policy(
+    client: APIClient, as_json: bool, args: Dict[str, object]
+) -> None:
+    gate_context = _loads_json(args.get("gate_context"), "context") or {}
+    metadata = _loads_json(args.get("metadata"), "metadata") or {}
+    payload = {
+        "policy_status": args["policy_status"],
+        "veto_reasons": list(args.get("veto_reasons", [])),
+        "gate_context": gate_context,
+        "metadata": metadata,
+        "expected_revision_version": args["expected_revision_version"],
+    }
+    envelope = client.post(
+        f"/api/trust/remediation/workspaces/{args['workspace_id']}/revisions/{args['revision_id']}/policy",
+        json_body=payload,
+    )
+    if as_json:
+        print(dumps_json(envelope))
+        return
+    _print_workspace_details(envelope)
+
+
+def _workspace_revision_simulation(
+    client: APIClient, as_json: bool, args: Dict[str, object]
+) -> None:
+    gate_context = _loads_json(args.get("gate_context"), "context") or {}
+    metadata = _loads_json(args.get("metadata"), "metadata") or {}
+    diff_snapshot = _loads_json(args.get("diff_snapshot"), "diff")
+    payload = {
+        "simulator_kind": args["simulator_kind"],
+        "execution_state": args["execution_state"],
+        "gate_context": gate_context,
+        "metadata": metadata,
+        "expected_revision_version": args["expected_revision_version"],
+    }
+    if diff_snapshot is not None:
+        payload["diff_snapshot"] = diff_snapshot
+    envelope = client.post(
+        f"/api/trust/remediation/workspaces/{args['workspace_id']}/revisions/{args['revision_id']}/simulation",
+        json_body=payload,
+    )
+    if as_json:
+        print(dumps_json(envelope))
+        return
+    _print_workspace_details(envelope)
+
+
+def _workspace_revision_promote(
+    client: APIClient, as_json: bool, args: Dict[str, object]
+) -> None:
+    payload = {
+        "promotion_status": args["promotion_status"],
+        "notes": list(args.get("notes", [])),
+        "expected_workspace_version": args["expected_workspace_version"],
+        "expected_revision_version": args["expected_revision_version"],
+    }
+    envelope = client.post(
+        f"/api/trust/remediation/workspaces/{args['workspace_id']}/revisions/{args['revision_id']}/promotion",
+        json_body=payload,
+    )
+    if as_json:
+        print(dumps_json(envelope))
+        return
+    _print_workspace_details(envelope)
+
+
+def _workspace_revision_diff(
+    client: APIClient, as_json: bool, args: Dict[str, object]
+) -> None:
+    envelope = client.get(f"/api/trust/remediation/workspaces/{args['workspace_id']}")
+    revision = _find_revision(envelope, args["revision_id"])
+    if revision is None:
+        raise ValueError("Revision not found")
+    sandbox_runs = revision.get("sandbox_executions", [])
+    if not sandbox_runs:
+        message = "No sandbox executions recorded"
+        if as_json:
+            print(dumps_json({"message": message}))
+        else:
+            print(message)
+        return
+    latest = sandbox_runs[0]
+    if as_json:
+        print(dumps_json(latest))
+        return
+    print(
+        f"Simulator {latest.get('simulator_kind')} status {latest.get('execution_state')}"
+    )
+    if latest.get("diff_snapshot") is not None:
+        print(dumps_json(latest.get("diff_snapshot")))
+    else:
+        print("No diff snapshot available")
+
+
+def _print_workspace_details(envelope: Dict[str, Any]) -> None:
+    workspace = envelope.get("workspace", {})
+    summary_row = {
+        "id": workspace.get("id"),
+        "key": workspace.get("workspace_key"),
+        "state": workspace.get("lifecycle_state"),
+        "active_revision": workspace.get("active_revision_id"),
+        "version": workspace.get("version"),
+        "owner": workspace.get("owner_id"),
+    }
+    print(render_table([summary_row], list(summary_row.keys())))
+    revision_rows = []
+    for revision in envelope.get("revisions", []):
+        if not isinstance(revision, dict):
+            continue
+        body = revision.get("revision", {})
+        gate = revision.get("gate_summary", {})
+        revision_rows.append(
+            {
+                "revision": body.get("revision_number"),
+                "schema": gate.get("schema_status"),
+                "policy": gate.get("policy_status"),
+                "simulation": gate.get("simulation_status"),
+                "promotion": gate.get("promotion_status"),
+                "veto_reasons": ";".join(
+                    gate.get("policy_veto_reasons", []) or []
+                ),
+                "updated_at": body.get("updated_at"),
+            }
+        )
+    if revision_rows:
+        print(render_table(revision_rows, list(revision_rows[0].keys())))
+
+
+def _find_revision(
+    envelope: Dict[str, Any], revision_id: int
+) -> Optional[Dict[str, Any]]:
+    for revision in envelope.get("revisions", []):
+        if not isinstance(revision, dict):
+            continue
+        body = revision.get("revision")
+        if isinstance(body, dict) and body.get("id") == revision_id:
+            return revision
+    return None
 
 
 def _runs_list(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:

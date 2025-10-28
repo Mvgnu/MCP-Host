@@ -136,3 +136,25 @@ manifest-driven chaos scenarios, and SSE ordering/manifest metadata propagation
 (`validation:remediation-stream:sse-ordering`). Review the transcript to confirm log sequencing,
 status transitions, and manifest tags for accelerator and tenant-focused scenarios without running
 additional manual commands.
+
+## Workspace lifecycle validation (in progress)
+
+Workspace lifecycle APIs are now live in the backend (`/api/trust/remediation/workspaces/*`) and the
+CLI (`mcpctl remediation workspaces`). Upcoming harness iterations will stitch the following phases
+into the chaos fabric so remediation plans can be rehearsed before production promotion:
+
+1. **Draft creation:** call `mcpctl remediation workspaces create` with manifest-driven plan JSON to
+   persist a workspace and seed revision `1`.
+2. **Revision iteration:** replay harness manifests through
+   `mcpctl remediation workspaces revision create` to simulate operators uploading revised plans,
+   including lineage labels that tie revisions back to chaos manifests.
+3. **Validation and policy feedback:** issue `revision schema` / `revision policy` commands to record
+   gate outcomes, ensuring SSE payloads and REST envelopes surface structured veto reasons.
+4. **Simulation playback:** apply `revision simulate` with diff snapshots from chaos scenarios so the
+   harness can assert sandbox parity before promotion.
+5. **Promotion gates:** finalize flows with `revision promote`, verifying optimistic locking tokens
+   (`--workspace-version`, `--version`) and policy veto propagation.
+
+The current harness documentation tracks these tasks as open follow-ups; once implemented, expect
+new validation tags (for example `validation:remediation-workspace-draft`) and transcript checks that
+confirm gate context flows from harness manifests through backend envelopes and CLI summaries.
