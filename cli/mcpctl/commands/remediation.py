@@ -254,6 +254,7 @@ def _render_event(event: Dict[str, Any]) -> None:
         kind = None
     prefix = f"run {run_id} (instance {instance})"
     policy_feedback = _string_list(event.get("policy_feedback"))
+    remediation_gate, accelerator_gates = _policy_gate_summary(event.get("policy_gate"))
     accelerators = _accelerator_summaries(event.get("accelerators"))
     if isinstance(body, dict) and body.get("event") == "log":
         stream = body.get("stream")
@@ -261,6 +262,14 @@ def _render_event(event: Dict[str, Any]) -> None:
         timestamp = body.get("timestamp")
         print(f"[{timestamp}] {prefix} [{stream}] {message}")
     elif isinstance(body, dict) and body.get("event") == "status":
+        if remediation_gate:
+            print(f"{prefix} remediation gate -> {', '.join(remediation_gate)}")
+        for gate in accelerator_gates:
+            hooks = f" hooks={', '.join(gate.hooks)}" if gate.hooks else ""
+            reasons = f" reasons={'; '.join(gate.reasons)}" if gate.reasons else ""
+            print(
+                f"{prefix} accelerator gate {gate.accelerator_id}{hooks}{reasons}"
+            )
         if policy_feedback:
             print(f"{prefix} policy feedback -> {', '.join(policy_feedback)}")
         for accelerator in accelerators:
@@ -297,6 +306,17 @@ class _AcceleratorSummary:
         self.policy_feedback = list(policy_feedback)
 
 
+class _AcceleratorGateSummary:
+    __slots__ = ("accelerator_id", "hooks", "reasons")
+
+    def __init__(
+        self, accelerator_id: str, hooks: Iterable[str], reasons: Iterable[str]
+    ) -> None:
+        self.accelerator_id = accelerator_id
+        self.hooks = list(hooks)
+        self.reasons = list(reasons)
+
+
 def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -307,6 +327,14 @@ def _string_list(value: Any) -> list[str]:
             if normalized:
                 result.append(normalized)
     return result
+
+
+def _policy_gate_summary(value: Any) -> tuple[list[str], list[_AcceleratorGateSummary]]:
+    if not isinstance(value, dict):
+        return ([], [])
+    remediation_hooks = _string_list(value.get("remediation_hooks"))
+    accelerator_gates = _accelerator_gate_summaries(value.get("accelerator_gates"))
+    return (remediation_hooks, accelerator_gates)
 
 
 def _accelerator_summaries(value: Any) -> list[_AcceleratorSummary]:
@@ -323,4 +351,22 @@ def _accelerator_summaries(value: Any) -> list[_AcceleratorSummary]:
         summaries.append(
             _AcceleratorSummary(accelerator_id, accelerator_type, posture, feedback)
         )
+    return summaries
+
+
+def _accelerator_gate_summaries(value: Any) -> list[_AcceleratorGateSummary]:
+    if not isinstance(value, list):
+        return []
+    summaries: list[_AcceleratorGateSummary] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        accelerator_id = entry.get("accelerator_id")
+        if not isinstance(accelerator_id, str):
+            continue
+        hooks = _string_list(entry.get("hooks"))
+        reasons = _string_list(entry.get("reasons"))
+        if not hooks and not reasons:
+            continue
+        summaries.append(_AcceleratorGateSummary(accelerator_id, hooks, reasons))
     return summaries

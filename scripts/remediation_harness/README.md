@@ -99,8 +99,12 @@ know to check out the latest manifests before executing the harness.
 `metadata` entries now support structured accelerator posture ingestion and policy feedback wiring:
 
 * `policy_feedback`: array of string tags (for example
-  `policy_hook:accelerator_gate=awaiting-attestation`). Values propagate into remediation SSE
-  payloads and CLI summaries so operators immediately see which governance hooks fired.
+  `policy_hook:remediation_gate=accelerator-awaiting-attestation`). Values propagate into remediation
+  SSE payloads and CLI summaries so operators immediately see which governance hooks fired.
+* `policy_gate`: structured remediation gating payload rendered inside SSE/CLI events. The
+  `remediation_hooks` array captures `policy_hook:remediation_gate=*` entries while the
+  `accelerator_gates` list encodes per-accelerator hooks (`policy_hook:accelerator_gate=*`) alongside
+  human-readable gating `reasons`.
 * `accelerators`: array of accelerator descriptors with the following fields:
   * `id`: accelerator inventory identifier stored in the new
     `runtime_vm_accelerator_posture` table.
@@ -108,10 +112,19 @@ know to check out the latest manifests before executing the harness.
   * `posture`: current remediation posture tag (`trusted`, `quarantined`, etc.).
   * `policy_feedback`: optional string array mirroring placement/policy hooks for the accelerator.
   * `metadata`: arbitrary JSON surfaced through SSE payloads and persisted alongside the posture
-    record.
+    record. Harness fixtures now include `gating_reasons` so verification tooling can validate that
+    CLI/REST surfaces explain accelerator veto context.
 
-The accelerator scenario (`accelerator-posture.yaml`) demonstrates the new fields and drives the
-`validation:accelerator-remediation` harness coverage.
+The accelerator manifest (`accelerator-posture.yaml`) now contains four scenarios:
+
+1. `validation:accelerator-remediation` &mdash; quarantined accelerator awaiting attestation.
+2. `validation:accelerator-degraded` &mdash; degraded posture surfacing maintenance guidance.
+3. `validation:accelerator-mixed` &mdash; mixed inventory with partial gating.
+4. `validation:accelerator-policy-veto` &mdash; governance-driven veto that pairs accelerator and
+   remediation hooks.
+
+Use them to exercise degraded health, mixed fleet, and policy-veto pathways inside the continuous
+verification fabric.
 
 ## SSE and Scheduler Checks
 

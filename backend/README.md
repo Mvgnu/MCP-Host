@@ -67,6 +67,8 @@ Remediation is now a first-class control plane built on top of persistent tables
   `kind`, `posture` tag, policy feedback signals, and opaque metadata) keyed by VM instance. The
   remediation API ingests this table whenever scenario metadata supplies accelerator fixtures so
   placement policy, telemetry, and SSE payloads share a consistent view of accelerator governance.
+  Scenario metadata now publishes structured `policy_gate` information that pairs remediation
+  veto hooks with per-accelerator gating reasons to explain why automation remains blocked.
 
 The orchestrator (`backend/src/remediation.rs`) wires these tables into a stateful execution engine:
 
@@ -86,9 +88,10 @@ Operators should consult the remediation API/CLI roadmap before enabling automat
   - `GET /api/trust/remediation/runs/:id/artifacts` to fetch structured evidence bundles.
   - `GET /api/trust/remediation/stream` for SSE log/status streaming filtered by `run_id`. Stream
     payloads now include `manifest_tags` (derived from playbook/run metadata), aggregated
-    `policy_feedback` hooks, and structured `accelerators` arrays so dashboards can correlate
-    chaos-manifest fingerprints, placement veto notes, and accelerator posture in a single feed.
-- **CLI (`mcpctl remediation`):** new subcommands mirror the REST surface (`playbooks list`, `runs list|get|enqueue|approve|artifacts`, `watch`) with JSON output toggles and structured table rendering to simplify operator workflows. The `watch` renderer now surfaces policy feedback and accelerator posture summaries alongside status transitions so operators see governance context without parsing raw JSON.
+    `policy_feedback` hooks, structured `policy_gate` objects, and enriched `accelerators` arrays so
+    dashboards can correlate chaos-manifest fingerprints, placement veto notes, accelerator posture,
+    and gating reasons in a single feed.
+- **CLI (`mcpctl remediation`):** new subcommands mirror the REST surface (`playbooks list`, `runs list|get|enqueue|approve|artifacts`, `watch`) with JSON output toggles and structured table rendering to simplify operator workflows. The `watch` renderer now surfaces policy feedback, remediation gates, and accelerator posture summaries alongside status transitions so operators see governance context without parsing raw JSON.
 
 ### Validation harness (`validation: remediation_flow`)
 
