@@ -251,6 +251,82 @@ def test_remediation_workspace_revision_diff_json(
     assert FakeClient.calls[-1] == ("GET", "/api/trust/remediation/workspaces/5", {})
 
 
+def test_remediation_promotion_prints_automation_summary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    envelope = {
+        "workspace": {
+            "id": 7,
+            "workspace_key": "workspace.multi",
+            "lifecycle_state": "promoted",
+            "active_revision_id": 11,
+            "version": 4,
+            "owner_id": 3,
+        },
+        "revisions": [
+            {
+                "revision": {
+                    "id": 11,
+                    "revision_number": 3,
+                    "updated_at": "2025-12-03T00:00:00Z",
+                },
+                "gate_summary": {
+                    "schema_status": "passed",
+                    "policy_status": "approved",
+                    "simulation_status": "succeeded",
+                    "promotion_status": "completed",
+                    "policy_veto_reasons": [],
+                },
+                "sandbox_executions": [],
+                "validation_snapshots": [],
+            }
+        ],
+    }
+    runs = [
+        {
+            "id": 55,
+            "workspace_id": 7,
+            "workspace_revision_id": 11,
+            "runtime_vm_instance_id": 202,
+            "status": "pending",
+            "approval_state": "auto-approved",
+            "promotion_gate_context": {"lane": "cli", "stage": "promotion"},
+            "updated_at": "2025-12-03T00:00:00Z",
+        }
+    ]
+
+    FakeClient.responses[(
+        "POST",
+        "/api/trust/remediation/workspaces/7/revisions/11/promotion",
+    )] = envelope
+    FakeClient.responses[("GET", "/api/trust/remediation/runs")] = runs
+
+    cli_module.main(
+        [
+            "remediation",
+            "workspaces",
+            "revision",
+            "promote",
+            "7",
+            "11",
+            "--status",
+            "completed",
+            "--workspace-version",
+            "3",
+            "--version",
+            "2",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert "Automation status:" in output
+    assert "cli" in output
+    assert "promotion" in output
+    method, path, params = FakeClient.calls[-1]
+    assert (method, path) == ("GET", "/api/trust/remediation/runs")
+    assert params == {"workspace_id": 7, "workspace_revision_id": 11}
+
+
 def test_policy_intelligence_displays_scores(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

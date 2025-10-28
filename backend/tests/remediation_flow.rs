@@ -810,9 +810,7 @@ async fn apply_workspace_schema(
     let response = post_workspace_request(
         app,
         token,
-        format!(
-            "/api/trust/remediation/workspaces/{workspace_id}/revisions/{revision_id}/schema"
-        ),
+        format!("/api/trust/remediation/workspaces/{workspace_id}/revisions/{revision_id}/schema"),
         payload,
     )
     .await;
@@ -831,9 +829,7 @@ async fn apply_workspace_policy(
     let response = post_workspace_request(
         app,
         token,
-        format!(
-            "/api/trust/remediation/workspaces/{workspace_id}/revisions/{revision_id}/policy"
-        ),
+        format!("/api/trust/remediation/workspaces/{workspace_id}/revisions/{revision_id}/policy"),
         payload,
     )
     .await;
@@ -920,6 +916,31 @@ async fn list_workspaces(app: &Router, token: &str) -> Vec<Value> {
     serde_json::from_slice(&body_bytes).unwrap()
 }
 
+async fn list_workspace_runs(
+    app: &Router,
+    token: &str,
+    workspace_id: i64,
+    revision_id: i64,
+) -> Vec<Value> {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/api/trust/remediation/runs?workspace_id={workspace_id}&workspace_revision_id={revision_id}"
+                ))
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = body::to_bytes(response.into_body()).await.unwrap();
+    serde_json::from_slice(&body_bytes).unwrap()
+}
+
 fn select_revision<'a>(envelope: &'a Value, revision_id: i64) -> &'a Value {
     envelope["revisions"]
         .as_array()
@@ -945,11 +966,35 @@ async fn remediation_workspace_lifecycle_end_to_end(pool: PgPool) {
     let harness = bootstrap_remediation_harness(&pool).await;
     let app = harness.app.clone();
     let token = harness.token.clone();
+    let vm_instance_id = harness.vm_instance_id;
+
+    let restart_playbook = json!({
+        "playbook_key": "vm.restart",
+        "display_name": "VM Restart",
+        "description": "Restart target VM instances",
+        "executor_type": "shell",
+        "approval_required": false,
+        "metadata": {"origin": "workspace-lifecycle"},
+    });
+    create_playbook(&app, &token, restart_playbook).await;
+
     let workspace_payload = json!({
         "workspace_key": "workspace.alpha",
         "display_name": "Workspace Alpha",
         "description": "Draft remediation workspace",
-        "plan": {"playbooks": ["vm.restart"]},
+        "plan": {
+            "playbooks": ["vm.restart"],
+            "targets": [
+                {
+                    "runtime_vm_instance_id": vm_instance_id,
+                    "playbook": "vm.restart",
+                    "automation_payload": {
+                        "trigger": "workspace-draft",
+                        "reason": "initial baseline",
+                    },
+                }
+            ]
+        },
         "metadata": {"source": "integration"},
         "lineage_tags": ["validation:remediation-workspace-draft"],
         "lineage_labels": ["channel:alpha"],
@@ -958,7 +1003,9 @@ async fn remediation_workspace_lifecycle_end_to_end(pool: PgPool) {
     let workspace = create_workspace(&app, &token, workspace_payload).await;
     let workspace_id = workspace["workspace"]["id"].as_i64().unwrap();
     let mut workspace_version = workspace["workspace"]["version"].as_i64().unwrap();
-    let active_revision_id = workspace["workspace"]["active_revision_id"].as_i64().unwrap();
+    let active_revision_id = workspace["workspace"]["active_revision_id"]
+        .as_i64()
+        .unwrap();
     let initial_revision = select_revision(&workspace, active_revision_id);
     assert_eq!(
         initial_revision["revision"]["revision_number"].as_i64(),
@@ -972,7 +1019,19 @@ async fn remediation_workspace_lifecycle_end_to_end(pool: PgPool) {
     let initial_revision_version = initial_revision["revision"]["version"].as_i64().unwrap();
 
     let revision_payload = json!({
-        "plan": {"playbooks": ["vm.restart", "vm.redeploy"]},
+        "plan": {
+            "playbooks": ["vm.restart", "vm.redeploy"],
+            "targets": [
+                {
+                    "runtime_vm_instance_id": vm_instance_id,
+                    "playbook": "vm.restart",
+                    "automation_payload": {
+                        "trigger": "workspace-revision",
+                        "reason": "v2 rollout",
+                    },
+                }
+            ]
+        },
         "metadata": {"change": "v2"},
         "lineage_labels": ["channel:alpha", "experiment:v2"],
         "expected_workspace_version": workspace_version,
@@ -1023,7 +1082,9 @@ async fn remediation_workspace_lifecycle_end_to_end(pool: PgPool) {
     );
     let schema_snapshot = find_snapshot(revision_after_schema, "schema").unwrap();
     assert_eq!(schema_snapshot["status"].as_str(), Some("passed"));
-    revision_version = revision_after_schema["revision"]["version"].as_i64().unwrap();
+    revision_version = revision_after_schema["revision"]["version"]
+        .as_i64()
+        .unwrap();
 
     let policy_payload = json!({
         "policy_status": "vetoed",
@@ -1046,15 +1107,21 @@ async fn remediation_workspace_lifecycle_end_to_end(pool: PgPool) {
         revision_after_policy["gate_summary"]["policy_status"].as_str(),
         Some("vetoed")
     );
-    assert!(revision_after_policy["gate_summary"]["policy_veto_reasons"].as_array().unwrap().iter().any(|value| {
-        value
-            .as_str()
-            .map(|entry| entry.starts_with("policy_hook:remediation_gate"))
-            .unwrap_or(false)
-    }));
+    assert!(revision_after_policy["gate_summary"]["policy_veto_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| {
+            value
+                .as_str()
+                .map(|entry| entry.starts_with("policy_hook:remediation_gate"))
+                .unwrap_or(false)
+        }));
     let policy_snapshot = find_snapshot(revision_after_policy, "policy").unwrap();
     assert_eq!(policy_snapshot["status"].as_str(), Some("vetoed"));
-    revision_version = revision_after_policy["revision"]["version"].as_i64().unwrap();
+    revision_version = revision_after_policy["revision"]["version"]
+        .as_i64()
+        .unwrap();
     let stale_promotion_revision_version = revision_version;
 
     let simulation_payload = json!({
@@ -1079,10 +1146,14 @@ async fn remediation_workspace_lifecycle_end_to_end(pool: PgPool) {
         revision_after_sim["gate_summary"]["simulation_status"].as_str(),
         Some("succeeded")
     );
-    assert!(revision_after_sim["sandbox_executions"].as_array().unwrap().iter().any(|entry| {
-        entry["simulator_kind"].as_str() == Some("chaos-matrix")
-            && entry["execution_state"].as_str() == Some("succeeded")
-    }));
+    assert!(revision_after_sim["sandbox_executions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| {
+            entry["simulator_kind"].as_str() == Some("chaos-matrix")
+                && entry["execution_state"].as_str() == Some("succeeded")
+        }));
     revision_version = revision_after_sim["revision"]["version"].as_i64().unwrap();
 
     let stale_promotion = post_workspace_request(
@@ -1104,6 +1175,7 @@ async fn remediation_workspace_lifecycle_end_to_end(pool: PgPool) {
     let promotion_payload = json!({
         "promotion_status": "completed",
         "notes": ["validated via harness"],
+        "gate_context": {"lane": "alpha", "stage": "production"},
         "expected_workspace_version": workspace_version,
         "expected_revision_version": revision_version,
     });
@@ -1127,11 +1199,43 @@ async fn remediation_workspace_lifecycle_end_to_end(pool: PgPool) {
     );
     let promotion_snapshot = find_snapshot(promoted_revision, "promotion").unwrap();
     assert_eq!(promotion_snapshot["status"].as_str(), Some("completed"));
-    assert!(promotion_snapshot["notes"].as_array().unwrap().iter().any(|note| {
-        note.as_str()
-            .map(|entry| entry.starts_with("requested_by="))
-            .unwrap_or(false)
+    assert!(promotion_snapshot["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|note| {
+            note.as_str()
+                .map(|entry| entry.starts_with("requested_by="))
+                .unwrap_or(false)
+        }));
+    tokio::time::sleep(StdDuration::from_millis(50)).await;
+    let automation_runs = list_workspace_runs(&app, &token, workspace_id, latest_revision_id).await;
+    assert!(automation_runs.iter().any(|run| {
+        run["workspace_revision_id"].as_i64() == Some(latest_revision_id)
+            && run["runtime_vm_instance_id"].as_i64() == Some(vm_instance_id)
     }));
+    let automation_run = automation_runs
+        .into_iter()
+        .find(|run| run["runtime_vm_instance_id"].as_i64() == Some(vm_instance_id))
+        .unwrap();
+    assert_eq!(automation_run["workspace_id"].as_i64(), Some(workspace_id));
+    assert_eq!(
+        automation_run["workspace_revision_id"].as_i64(),
+        Some(latest_revision_id)
+    );
+    let gate_context = automation_run["promotion_gate_context"]
+        .as_object()
+        .unwrap();
+    assert_eq!(
+        gate_context.get("lane").and_then(|value| value.as_str()),
+        Some("alpha")
+    );
+    let promotion_metadata = automation_run["metadata"]["promotion"].as_object().unwrap();
+    assert!(promotion_metadata["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|note| note.as_str() == Some("validated via harness")));
     let promoted_workspace_version = after_promotion["workspace"]["version"].as_i64().unwrap();
     assert_eq!(promoted_workspace_version, workspace_version + 1);
     let listed = list_workspaces(&app, &token).await;
@@ -1147,21 +1251,221 @@ async fn remediation_workspace_lifecycle_end_to_end(pool: PgPool) {
         Some("completed")
     );
     assert_eq!(
-        fetched_revision["gate_summary"]["policy_veto_reasons"].as_array().unwrap().len(),
+        fetched_revision["gate_summary"]["policy_veto_reasons"]
+            .as_array()
+            .unwrap()
+            .len(),
         1
     );
-    assert!(
-        fetched_revision["gate_summary"]["policy_veto_reasons"][0]
-            .as_str()
-            .unwrap()
-            .starts_with("policy_hook:remediation_gate")
-    );
+    assert!(fetched_revision["gate_summary"]["policy_veto_reasons"][0]
+        .as_str()
+        .unwrap()
+        .starts_with("policy_hook:remediation_gate"));
 
-    let initial_revision_after_promotion =
-        select_revision(&fetched, initial_revision["revision"]["id"].as_i64().unwrap());
+    let initial_revision_after_promotion = select_revision(
+        &fetched,
+        initial_revision["revision"]["id"].as_i64().unwrap(),
+    );
     assert_eq!(
         initial_revision_after_promotion["revision"]["version"].as_i64(),
         Some(initial_revision_version)
+    );
+}
+
+#[sqlx::test]
+#[ignore = "requires DATABASE_URL with Postgres server"]
+async fn remediation_workspace_promotion_multiple_targets(pool: PgPool) {
+    let harness = bootstrap_remediation_harness(&pool).await;
+    let app = harness.app.clone();
+    let token = harness.token.clone();
+
+    let secondary_vm: i64 = sqlx::query_scalar(
+        "INSERT INTO runtime_vm_instances (server_id, instance_id) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(harness.server_id)
+    .bind("vm-remediation-2")
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+
+    let restart_playbook = json!({
+        "playbook_key": "vm.restart",
+        "display_name": "VM Restart",
+        "description": "Restart VM instance",
+        "executor_type": "shell",
+        "approval_required": false,
+        "metadata": {"origin": "multi-target"},
+    });
+    create_playbook(&app, &token, restart_playbook).await;
+
+    let redeploy_playbook = json!({
+        "playbook_key": "vm.redeploy",
+        "display_name": "VM Redeploy",
+        "description": "Redeploy VM instance",
+        "executor_type": "shell",
+        "approval_required": false,
+        "metadata": {"origin": "multi-target"},
+    });
+    create_playbook(&app, &token, redeploy_playbook).await;
+
+    let workspace_payload = json!({
+        "workspace_key": "workspace.multi",
+        "display_name": "Workspace Multi Target",
+        "description": "Covers nested targets and default playbooks",
+        "plan": {
+            "playbooks": ["vm.restart"],
+            "targets": {
+                "lanes": [
+                    {
+                        "lane": "cli",
+                        "stage": "promotion",
+                        "targets": [
+                            {
+                                "instance_id": secondary_vm.to_string(),
+                                "automation_payload": {"kind": "lane"}
+                            }
+                        ]
+                    }
+                ],
+                "direct": [
+                    {
+                        "runtime_vm_instance_id": harness.vm_instance_id,
+                        "playbook": "vm.redeploy",
+                        "automation_payload": {"kind": "direct"}
+                    }
+                ]
+            }
+        },
+        "metadata": {"origin": "integration"},
+        "lineage_tags": ["validation:remediation-workspace-multi"],
+        "lineage_labels": ["channel:multi"],
+    });
+
+    let workspace = create_workspace(&app, &token, workspace_payload).await;
+    let workspace_id = workspace["workspace"]["id"].as_i64().unwrap();
+    let mut workspace_version = workspace["workspace"]["version"].as_i64().unwrap();
+    let revision_id = workspace["workspace"]["active_revision_id"]
+        .as_i64()
+        .unwrap();
+    let revision = select_revision(&workspace, revision_id);
+    let mut revision_version = revision["revision"]["version"].as_i64().unwrap();
+
+    let schema_envelope = apply_workspace_schema(
+        &app,
+        &token,
+        workspace_id,
+        revision_id,
+        json!({
+            "result_status": "passed",
+            "gate_context": {"validator": "multi"},
+            "metadata": {"notes": "schema-ok"},
+            "expected_workspace_version": workspace_version,
+            "expected_revision_version": revision_version,
+        }),
+    )
+    .await;
+    workspace_version = schema_envelope["workspace"]["version"].as_i64().unwrap();
+    let revision_after_schema = select_revision(&schema_envelope, revision_id);
+    revision_version = revision_after_schema["revision"]["version"]
+        .as_i64()
+        .unwrap();
+
+    let policy_envelope = apply_workspace_policy(
+        &app,
+        &token,
+        workspace_id,
+        revision_id,
+        json!({
+            "policy_status": "approved",
+            "gate_context": {"policy": "multi"},
+            "metadata": {"ticket": "MULTI-1"},
+            "expected_workspace_version": workspace_version,
+            "expected_revision_version": revision_version,
+        }),
+    )
+    .await;
+    workspace_version = policy_envelope["workspace"]["version"].as_i64().unwrap();
+    let revision_after_policy = select_revision(&policy_envelope, revision_id);
+    revision_version = revision_after_policy["revision"]["version"]
+        .as_i64()
+        .unwrap();
+
+    let simulation_envelope = apply_workspace_simulation(
+        &app,
+        &token,
+        workspace_id,
+        revision_id,
+        json!({
+            "simulator_kind": "harness",
+            "execution_state": "succeeded",
+            "gate_context": {"simulator": "multi"},
+            "metadata": {"diff": "ok"},
+            "expected_workspace_version": workspace_version,
+            "expected_revision_version": revision_version,
+        }),
+    )
+    .await;
+    workspace_version = simulation_envelope["workspace"]["version"]
+        .as_i64()
+        .unwrap();
+    let revision_after_sim = select_revision(&simulation_envelope, revision_id);
+    revision_version = revision_after_sim["revision"]["version"].as_i64().unwrap();
+
+    let promotion_gate_context = json!({"lane": "cli", "stage": "promotion"});
+    let promotion_envelope = apply_workspace_promotion(
+        &app,
+        &token,
+        workspace_id,
+        revision_id,
+        json!({
+            "promotion_status": "completed",
+            "gate_context": promotion_gate_context,
+            "notes": ["multi-target"],
+            "expected_workspace_version": workspace_version,
+            "expected_revision_version": revision_version,
+        }),
+    )
+    .await;
+
+    let revision_after_promotion = select_revision(&promotion_envelope, revision_id);
+    assert_eq!(
+        revision_after_promotion["gate_summary"]["promotion_status"].as_str(),
+        Some("completed")
+    );
+
+    let primary_runs = list_runs_for_instance(&app, &token, harness.vm_instance_id).await;
+    let secondary_runs = list_runs_for_instance(&app, &token, secondary_vm).await;
+
+    assert_eq!(primary_runs.len(), 1);
+    assert_eq!(secondary_runs.len(), 1);
+
+    let primary_run = &primary_runs[0];
+    assert_eq!(primary_run["run"]["playbook"].as_str(), Some("vm.redeploy"));
+    assert_eq!(
+        primary_run["run"]["promotion_gate_context"]["lane"].as_str(),
+        Some("cli")
+    );
+    assert_eq!(
+        primary_run["run"]["metadata"]["target"]["automation_payload"]["kind"].as_str(),
+        Some("direct")
+    );
+
+    let secondary_run = &secondary_runs[0];
+    assert_eq!(
+        secondary_run["run"]["playbook"].as_str(),
+        Some("vm.restart")
+    );
+    assert_eq!(
+        secondary_run["run"]["promotion_gate_context"]["lane"].as_str(),
+        Some("cli")
+    );
+    assert_eq!(
+        secondary_run["run"]["metadata"]["target"]["lane"].as_str(),
+        Some("cli")
+    );
+    assert_eq!(
+        secondary_run["run"]["metadata"]["target"]["stage"].as_str(),
+        Some("promotion")
     );
 }
 

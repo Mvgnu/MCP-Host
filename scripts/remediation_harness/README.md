@@ -157,6 +157,13 @@ During a harness run the workspace fabric validation performs:
 4. **Promotion orchestration** executed twice—once in the SQLx test and once through the CLI—so the
    harness can confirm optimistic locking enforcement, workspace lifecycle transitions, and CLI JSON
    envelopes mirror the REST responses (`validation:remediation-workspace-cli`).
+5. **Automation linkage verification** validating that workspace promotions seed remediation runs.
+   The REST test asserts remediation run metadata contains workspace lineage, gate context, and
+   promotion notes, while the CLI now surfaces a post-promotion automation table summarizing run
+   status, approval state, and gate lanes per instance. Harness scripts pass structured gate context
+   to `mcpctl remediation workspaces revision promote`, parse the rendered automation table, and
+   assert that the expected lane/stage pair is present before fetching JSON envelopes to confirm the
+   staged automation, closing the loop between promotion governance and execution triggers.
 
 The harness manifest now lists all executed validation tags (`validation:remediation_flow`,
 `validation:remediation-concurrency`, `validation:remediation-chaos-matrix`,

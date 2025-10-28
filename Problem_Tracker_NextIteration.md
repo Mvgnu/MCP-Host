@@ -281,3 +281,10 @@
   Log:
     - 2025-12-03 09:00:00 UTC: Beginning workspace lifecycle integration coverage; auditing backend tests, harness scripts, and documentation for validation tag updates and CLI transcript assertions.
     - 2025-12-03 13:20:00 UTC: Added SQLx workspace lifecycle test, harness CLI automation, manifest validation tags, and documentation updates verifying draft/simulation/promotion gates end-to-end.
+- ID: BE-REMED-WORKSPACE-AUTO
+  Status: IN_PROGRESS
+  Task: Harden workspace promotion automation triggers and operator feedback loops.
+  Hypothesis: Expanding promotion target parsing, merging automation metadata, and asserting CLI automation summaries will keep automation aligned with gate context while preventing regressions across harness scenarios.
+  Log:
+    - 2025-12-03 18:00:00 UTC: Continuing iteration to address promotion target parsing TODOs, metadata merge behaviour, CLI automation assertions, and regression coverage.
+    - 2025-12-03 23:30:00 UTC: Added recursive promotion target parsing with lane/stage context, merged workspace linkage metadata updates, extended SQLx + CLI tests, and taught the harness to parse automation tables for gate assertions.
