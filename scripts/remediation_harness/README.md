@@ -26,7 +26,7 @@ The script will:
 4. Run `cargo test --test remediation_flow -- --ignored --nocapture` against the live database,
    covering `validation:remediation_flow`, `validation:remediation-concurrency`, and the
    `validation:remediation-chaos-matrix` suites executed concurrently for each tenant shard.
-5. Emit a machine-readable manifest (see below).
+5. Aggregate manifest-driven scenarios (YAML/JSON) into a machine-verifiable summary (see below).
 6. Tear down the backend process and Postgres container.
 
 Environment variables allow customization:
@@ -39,32 +39,44 @@ Environment variables allow customization:
 | `HARNESS_PORT` | `38080` | Backend HTTP port. |
 | `HARNESS_JWT_SECRET` | `integration-secret` | JWT secret exported to the backend and integration test. |
 | `HARNESS_MANIFEST_PATH` | `${HARNESS_DIR}/remediation_harness_manifest.json` | Override manifest output location. |
+| `HARNESS_SCENARIO_ROOT` | `${HARNESS_DIR}/scenarios` | Directory scanned for YAML/JSON scenario manifests. |
 
 ## Manifest Output
 
-After a successful run the harness writes a JSON manifest enumerating executed scenarios and their
-`validation:*` tags. Downstream dashboards can ingest this artifact to confirm multi-tenant chaos
-coverage; each listed scenario now represents three tenant-specific executions under the hood.
+After a successful run the harness writes a JSON manifest summarizing every scenario definition
+discovered under `HARNESS_SCENARIO_ROOT`. Each entry includes a stable SHA-256 checksum so
+dashboards can diff for drift and operators can trace which manifest drove the run. The backend
+integration suite consumes the same directory via `REM_FABRIC_SCENARIO_DIR`, guaranteeing the
+orchestrated harness and direct `cargo test` execution stay aligned.
 
 ```json
 {
   "generated_at": "2025-11-29T00:00:00Z",
   "database_url": "postgres://postgres:remediation@127.0.0.1:6543/mcp",
+  "scenario_root": "/workspace/MCP-Host/scripts/remediation_harness/scenarios",
   "scenarios": [
-    {"test": "remediation_lifecycle_harness", "tags": ["validation:remediation_flow"]},
-    {"test": "remediation_concurrent_enqueue_dedupe", "tags": ["validation:remediation-concurrency"]},
     {
-      "test": "remediation_multi_tenant_chaos_matrix",
-      "tags": [
-        "validation:remediation-chaos-matrix",
-        "validation:tenant-isolation",
-        "validation:concurrent-approvals",
-        "validation:executor-outage"
-      ]
+      "path": "chaos-matrix.yaml",
+      "absolute_path": "/workspace/MCP-Host/scripts/remediation_harness/scenarios/chaos-matrix.yaml",
+      "sha256": "<sha256>",
+      "format": "yaml",
+      "description": "Baseline remediation chaos matrix"
+    },
+    {
+      "path": "historical-incidents.json",
+      "absolute_path": "/workspace/MCP-Host/scripts/remediation_harness/scenarios/historical-incidents.json",
+      "sha256": "<sha256>",
+      "format": "json",
+      "description": "Historical incident regression manifest"
     }
   ]
 }
 ```
+
+Author new scenario manifests under `scripts/remediation_harness/scenarios/` to extend the fabric.
+Each document accepts `name`, `tag`, `kind`, and `tenants` keys; YAML and JSON formats are both
+supported. The backend integration suite fails fast when the directory is empty so operators know to
+check out the latest manifests before executing the harness.
 
 ## SSE and Scheduler Checks
 

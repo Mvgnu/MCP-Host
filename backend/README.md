@@ -113,3 +113,18 @@ For a fully orchestrated run—including ephemeral Postgres and backend bootstra
 script under `scripts/remediation_harness/` (documented in the harness README). The harness now
 emits a JSON manifest enumerating the executed validation tags so dashboards can ingest
 `validation:remediation_flow`, `validation:remediation-concurrency`, and the chaos matrix lineage.
+
+### Continuous verification manifests
+
+- Scenario definitions live under `scripts/remediation_harness/scenarios/` and can be authored as
+  YAML or JSON. Each document includes a scenario `name`, tracking `tag`, `kind`, and one or more
+  tenant shards to exercise. The backend integration test loader resolves the directory via the
+  `REM_FABRIC_SCENARIO_DIR` environment variable (defaulting to the repo's harness folder) and will
+  fail fast if the directory is empty or missing.
+- `backend/tests/remediation_flow.rs` materializes a run matrix from the manifest documents before
+  spawning chaos scenarios, ensuring new regression fixtures (for example historical incidents)
+  automatically join the verification fabric without code changes.
+- `scripts/remediation_harness/run_harness.sh` now aggregates scenario manifests into a machine-verifiable
+  JSON artifact containing the SHA-256 for each source document. Dashboards can diff the manifest to
+  detect drift, while operators have a single manifest recording the backend database URL, generation
+  timestamp, scenario root, and individual scenario descriptors.

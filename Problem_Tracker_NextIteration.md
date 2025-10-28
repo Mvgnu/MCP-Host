@@ -246,3 +246,9 @@
     - 2025-11-28 14:25:00 UTC: Delivered `scripts/remediation_harness/run_harness.sh` with README guidance for spinning up
       ephemeral Postgres/backends and running the integration test under the `validation: remediation_flow` tag. Follow-up to
       extend CLI SSE smoke tests remains open.
+- ID: BE-REM-VER-001
+  Status: IN_PROGRESS
+  Task: Complete continuous verification fabric automation (CLI SSE gates, regression dashboards, accelerator hooks).
+  Hypothesis: Wiring manifest-driven chaos execution into CLI SSE regression gates and marketplace timelines will let operators trust automation outcomes without manual log spelunking.
+  Log:
+    - 2025-11-30 12:40:00 UTC: Landed manifest loader for remediation chaos harness, scenario index aggregation, and documentation updates. Follow-ups required for CLI SSE verification, accelerator posture ingestion, and policy feedback loops.
