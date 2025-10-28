@@ -274,3 +274,10 @@
   Log:
     - 2025-12-02 16:00:00 UTC: Initiated remediation workspace lifecycle implementation; auditing existing remediation control plane schema and API surfaces to design workspace normalization.
     - 2025-12-02 20:30:00 UTC: Added workspace lifecycle migration, SQLx data access layer, REST handlers, CLI surfaces, and documentation updates; recorded follow-up actions for integration tests, harness coverage, and policy gate verification.
+- ID: BE-REMED-WORKSPACE-INT
+  Status: IN_PROGRESS
+  Task: Land integration and harness coverage for remediation workspace lifecycle flows.
+  Hypothesis: Exercising draft-to-promotion APIs/tests plus harness CLI parity will catch workspace regressions early and align verification manifests with promotion gate metadata.
+  Log:
+    - 2025-12-03 09:00:00 UTC: Beginning workspace lifecycle integration coverage; auditing backend tests, harness scripts, and documentation for validation tag updates and CLI transcript assertions.
+    - 2025-12-03 13:20:00 UTC: Added SQLx workspace lifecycle test, harness CLI automation, manifest validation tags, and documentation updates verifying draft/simulation/promotion gates end-to-end.

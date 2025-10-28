@@ -129,6 +129,161 @@ if [[ -n "${SSE_PID:-}" ]]; then
     wait "${SSE_PID}" 2>/dev/null || true
 fi
 
+echo "[harness] exercising remediation workspace CLI flow" >&2
+PYTHONPATH="${REPO_ROOT}/cli" python3 - <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+env = os.environ.copy()
+base = [sys.executable, "-m", "mcpctl", "remediation", "workspaces"]
+
+
+def run(args):
+    output = subprocess.check_output(base + args + ["--json"], env=env)
+    return json.loads(output)
+
+
+def select_revision(envelope, revision_id):
+    for item in envelope.get("revisions", []):
+        if item.get("revision", {}).get("id") == revision_id:
+            return item
+    raise AssertionError(f"revision {revision_id} not found")
+
+
+records = run(["list"])
+if not records:
+    raise SystemExit("workspace list returned no records")
+
+records.sort(key=lambda item: item.get("workspace", {}).get("id", 0))
+workspace = records[-1]
+workspace_id = workspace["workspace"]["id"]
+workspace_version = workspace["workspace"]["version"]
+
+details = run(["get", str(workspace_id)])
+latest_revision = details["revisions"][0]
+latest_revision_id = latest_revision["revision"]["id"]
+latest_revision_version = latest_revision["revision"]["version"]
+assert latest_revision["gate_summary"].get("schema_status"), "missing gate summary"
+assert latest_revision_version >= 1
+
+plan_body = json.dumps({"steps": ["cli-validation"]})
+revision_envelope = run(
+    [
+        "revision",
+        "create",
+        str(workspace_id),
+        "--plan",
+        plan_body,
+        "--expected-version",
+        str(workspace_version),
+        "--lineage-label",
+        "harness:cli",
+        "--metadata",
+        json.dumps({"origin": "harness"}),
+    ]
+)
+workspace_version = revision_envelope["workspace"]["version"]
+cli_revision = revision_envelope["revisions"][0]
+cli_revision_id = cli_revision["revision"]["id"]
+cli_revision_version = cli_revision["revision"]["version"]
+assert cli_revision["gate_summary"].get("schema_status") == "pending"
+
+schema_envelope = run(
+    [
+        "revision",
+        "schema",
+        str(workspace_id),
+        str(cli_revision_id),
+        "--status",
+        "passed",
+        "--context",
+        json.dumps({"validator": "cli-harness"}),
+        "--metadata",
+        json.dumps({"token": "cli-schema"}),
+        "--version",
+        str(cli_revision_version),
+    ]
+)
+cli_revision = select_revision(schema_envelope, cli_revision_id)
+cli_revision_version = cli_revision["revision"]["version"]
+assert cli_revision["gate_summary"].get("schema_status") == "passed"
+
+policy_envelope = run(
+    [
+        "revision",
+        "policy",
+        str(workspace_id),
+        str(cli_revision_id),
+        "--status",
+        "approved",
+        "--context",
+        json.dumps({"policy": "cli"}),
+        "--metadata",
+        json.dumps({"ticket": "CLI-1"}),
+        "--version",
+        str(cli_revision_version),
+    ]
+)
+cli_revision = select_revision(policy_envelope, cli_revision_id)
+cli_revision_version = cli_revision["revision"]["version"]
+assert cli_revision["gate_summary"].get("policy_status") == "approved"
+
+simulation_envelope = run(
+    [
+        "revision",
+        "simulate",
+        str(workspace_id),
+        str(cli_revision_id),
+        "--simulator",
+        "cli-harness",
+        "--state",
+        "succeeded",
+        "--context",
+        json.dumps({"source": "cli"}),
+        "--diff",
+        json.dumps({"delta": 1}),
+        "--metadata",
+        json.dumps({"transcript": "cli"}),
+        "--version",
+        str(cli_revision_version),
+    ]
+)
+cli_revision = select_revision(simulation_envelope, cli_revision_id)
+cli_revision_version = cli_revision["revision"]["version"]
+assert cli_revision["gate_summary"].get("simulation_status") == "succeeded"
+
+promotion_envelope = run(
+    [
+        "revision",
+        "promote",
+        str(workspace_id),
+        str(cli_revision_id),
+        "--status",
+        "completed",
+        "--workspace-version",
+        str(workspace_version),
+        "--version",
+        str(cli_revision_version),
+        "--note",
+        "cli-harness",
+    ]
+)
+cli_revision = select_revision(promotion_envelope, cli_revision_id)
+workspace_version = promotion_envelope["workspace"]["version"]
+assert workspace_version >= 1
+assert cli_revision["gate_summary"].get("promotion_status") == "completed"
+assert cli_revision["revision"].get("version", 0) > cli_revision_version
+
+latest_details = run(["get", str(workspace_id)])
+cli_revision_final = select_revision(latest_details, cli_revision_id)
+assert cli_revision_final["gate_summary"].get("policy_status") == "approved"
+assert cli_revision_final["gate_summary"].get("schema_status") == "passed"
+assert cli_revision_final["gate_summary"].get("simulation_status") == "succeeded"
+assert cli_revision_final["gate_summary"].get("promotion_status") == "completed"
+PY
+
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 python3 - <<'PY' "${SCENARIO_ROOT}" "${MANIFEST_PATH}" "${DATABASE_URL}" "${TIMESTAMP}" "${SSE_TRANSCRIPT}"
 import json
@@ -193,6 +348,14 @@ manifest = {
     "scenario_root": str(scenario_root),
     "scenarios": records,
     "stream_transcript": transcript_record,
+    "validation_tags": [
+        "validation:remediation_flow",
+        "validation:remediation-concurrency",
+        "validation:remediation-chaos-matrix",
+        "validation:remediation-workspace-draft",
+        "validation:remediation-workspace-promotion",
+        "validation:remediation-workspace-cli",
+    ],
 }
 
 manifest_path.write_text(json.dumps(manifest, indent=2))

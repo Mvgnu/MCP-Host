@@ -134,9 +134,12 @@ schema/policy feedback, capturing sandbox simulations, diffing the latest sandbo
 issuing promotion status updates. Each command accepts `--json` for raw payload emission so harness
 automation and dashboards can consume identical artefacts.
 
-Integration and harness coverage is queued: backend integration tests will exercise the new REST
-surface, while the remediation harness will stitch lifecycle API calls into the existing chaos
-matrix once policy/promotion verification scenarios are finalized.
+Integration coverage now includes the `remediation_workspace_lifecycle_end_to_end` SQLx test which
+drives draft creation, revision iteration, schema/policy validation snapshots, sandbox simulation,
+and promotion gates with explicit optimistic locking assertions. The remediation harness executes
+the same database-backed tests and now exercises the CLI stack (`mcpctl remediation workspaces`)
+to create revisions, record gate outcomes, and complete promotions under the same optimistic locking
+tokens surfaced by the REST handlers.
 
 ### Validation harness (`validation: remediation_flow`)
 
@@ -171,7 +174,9 @@ cargo test --test remediation_flow -- --ignored --nocapture
 For a fully orchestrated run—including ephemeral Postgres and backend bootstrapping—use the shell
 script under `scripts/remediation_harness/` (documented in the harness README). The harness now
 emits a JSON manifest enumerating the executed validation tags so dashboards can ingest
-`validation:remediation_flow`, `validation:remediation-concurrency`, and the chaos matrix lineage.
+`validation:remediation_flow`, `validation:remediation-concurrency`,
+`validation:remediation-workspace-draft`, `validation:remediation-workspace-promotion`,
+`validation:remediation-workspace-cli`, and the chaos matrix lineage.
 
 ### Continuous verification manifests
 
