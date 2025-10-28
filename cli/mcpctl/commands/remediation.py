@@ -502,6 +502,75 @@ def _print_workspace_details(envelope: Dict[str, Any]) -> None:
     if revision_rows:
         print(render_table(revision_rows, list(revision_rows[0].keys())))
 
+    promotion_runs = envelope.get("promotion_runs")
+    if isinstance(promotion_runs, list) and promotion_runs:
+        run_rows = []
+        for run in promotion_runs:
+            if not isinstance(run, dict):
+                continue
+            metadata = run.get("metadata") if isinstance(run.get("metadata"), dict) else {}
+            target = metadata.get("target") if isinstance(metadata, dict) else {}
+            promotion = metadata.get("promotion") if isinstance(metadata, dict) else {}
+            notes = []
+            if isinstance(promotion, dict):
+                raw_notes = promotion.get("notes")
+                if isinstance(raw_notes, list):
+                    notes = [str(note) for note in raw_notes]
+            target_posture = ""
+            if isinstance(target, dict):
+                if isinstance(target.get("trust_posture"), str):
+                    target_posture = target["trust_posture"]
+                elif isinstance(target.get("posture"), str):
+                    target_posture = target["posture"]
+            gate_context = run.get("promotion_gate_context")
+            automation_payload = run.get("automation_payload")
+            gate_lane = ""
+            gate_stage = ""
+            if isinstance(gate_context, dict):
+                lane_value = gate_context.get("lane")
+                stage_value = gate_context.get("stage")
+                if isinstance(lane_value, str):
+                    gate_lane = lane_value
+                if isinstance(stage_value, str):
+                    gate_stage = stage_value
+            run_rows.append(
+                {
+                    "run": run.get("id"),
+                    "instance": run.get("runtime_vm_instance_id"),
+                    "playbook": run.get("playbook"),
+                    "status": run.get("status"),
+                    "approval": run.get("approval_state"),
+                    "posture": target_posture,
+                    "gate_lane": gate_lane,
+                    "gate_stage": gate_stage,
+                    "gate": dumps_json(gate_context) if gate_context else "",
+                    "automation": dumps_json(automation_payload)
+                    if automation_payload is not None
+                    else "",
+                    "notes": ", ".join(notes),
+                }
+            )
+        if run_rows:
+            print("\nAutomation status:")
+            print(
+                render_table(
+                    run_rows,
+                    [
+                        "run",
+                        "instance",
+                        "playbook",
+                        "status",
+                        "approval",
+                        "posture",
+                        "gate_lane",
+                        "gate_stage",
+                        "gate",
+                        "automation",
+                        "notes",
+                    ],
+                )
+            )
+
 
 def _find_revision(
     envelope: Dict[str, Any], revision_id: int
@@ -547,6 +616,9 @@ def _runs_list(client: APIClient, as_json: bool, args: Dict[str, object]) -> Non
                 "sla_deadline": item.get("sla_deadline"),
                 "updated_at": item.get("updated_at"),
                 "gate": dumps_json(gate_context) if gate_context else "",
+                "automation": dumps_json(item.get("automation_payload"))
+                if item.get("automation_payload") is not None
+                else "",
             }
         )
     columns = [
@@ -561,6 +633,7 @@ def _runs_list(client: APIClient, as_json: bool, args: Dict[str, object]) -> Non
         "sla_deadline",
         "updated_at",
         "gate",
+        "automation",
     ]
     print(render_table(rows, columns))
 

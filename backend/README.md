@@ -134,6 +134,15 @@ schema/policy feedback, capturing sandbox simulations, diffing the latest sandbo
 issuing promotion status updates. Each command accepts `--json` for raw payload emission so harness
 automation and dashboards can consume identical artefacts.
 
+Promotion status handlers now return a `promotion_runs` array that captures the
+`runtime_vm_instance_id`, promotion gate context, trust posture, automation payload, and promotion
+notes for each staged remediation run. The remediation SSE feed mirrors that information in real
+time—`RemediationStreamMessage` includes the refreshed `automation_payload` alongside existing gate
+context and accelerator posture metadata—so CLI watchers and consoles surface actionable automation
+context the moment a promotion creates or refreshes a run. The CLI promotion renderer prints an
+"Automation status" table highlighting gate lanes/stages, trust posture, automation payload summaries,
+and promotion notes to close the operator feedback loop.
+
 Integration coverage now includes the `remediation_workspace_lifecycle_end_to_end` SQLx test which
 drives draft creation, revision iteration, schema/policy validation snapshots, sandbox simulation,
 and promotion gates with explicit optimistic locking assertions. The remediation harness executes

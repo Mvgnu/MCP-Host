@@ -20,3 +20,13 @@ scenarios:
     tenants:
       - tenant-alpha
       - tenant-bravo
+  - name: promotion-automation-loop
+    tag: validation:promotion-automation-loop
+    kind: promotion-automation-refresh
+    tenants:
+      - tenant-alpha
+    metadata:
+      gate_expectations:
+        lane: cli
+        stage: promotion
+      automation_payload: refreshed

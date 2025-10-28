@@ -1188,6 +1188,18 @@ async fn remediation_workspace_lifecycle_end_to_end(pool: PgPool) {
         promotion_payload,
     )
     .await;
+    let promotion_runs = after_promotion["promotion_runs"].as_array().unwrap();
+    assert!(
+        promotion_runs
+            .iter()
+            .any(|run| run["runtime_vm_instance_id"].as_i64() == Some(vm_instance_id)),
+        "promotion response should include staged automation run"
+    );
+    let staged_run = promotion_runs
+        .iter()
+        .find(|run| run["runtime_vm_instance_id"].as_i64() == Some(vm_instance_id))
+        .cloned()
+        .unwrap();
     assert_eq!(
         after_promotion["workspace"]["lifecycle_state"].as_str(),
         Some("promoted")
@@ -1218,6 +1230,15 @@ async fn remediation_workspace_lifecycle_end_to_end(pool: PgPool) {
         .into_iter()
         .find(|run| run["runtime_vm_instance_id"].as_i64() == Some(vm_instance_id))
         .unwrap();
+    assert_eq!(staged_run["id"], automation_run["id"]);
+    assert_eq!(
+        staged_run["automation_payload"],
+        automation_run["automation_payload"]
+    );
+    assert_eq!(
+        staged_run["promotion_gate_context"],
+        automation_run["promotion_gate_context"]
+    );
     assert_eq!(automation_run["workspace_id"].as_i64(), Some(workspace_id));
     assert_eq!(
         automation_run["workspace_revision_id"].as_i64(),
@@ -1588,6 +1609,17 @@ async fn remediation_workspace_promotion_refreshes_pending_run_payload(pool: PgP
     )
     .await;
 
+    let first_promotion_runs = first_envelope["promotion_runs"].as_array().unwrap();
+    assert_eq!(first_promotion_runs.len(), 1);
+    assert_eq!(
+        first_promotion_runs[0]["automation_payload"]["attempt"].as_i64(),
+        Some(1)
+    );
+    assert_eq!(
+        first_promotion_runs[0]["promotion_gate_context"]["lane"].as_str(),
+        Some("initial")
+    );
+
     let first_runs = list_runs_for_instance(&app, &token, harness.vm_instance_id).await;
     assert_eq!(first_runs.len(), 1, "expected initial promotion run");
     let first_run = &first_runs[0]["run"];
@@ -1620,7 +1652,7 @@ async fn remediation_workspace_promotion_refreshes_pending_run_payload(pool: PgP
     .unwrap();
 
     let refreshed_gate_context = json!({"lane": "refresh", "stage": "promotion"});
-    apply_workspace_promotion(
+    let refreshed_envelope = apply_workspace_promotion(
         &app,
         &token,
         workspace_id,
@@ -1634,6 +1666,17 @@ async fn remediation_workspace_promotion_refreshes_pending_run_payload(pool: PgP
         }),
     )
     .await;
+
+    let refreshed_promotion_runs = refreshed_envelope["promotion_runs"].as_array().unwrap();
+    assert_eq!(refreshed_promotion_runs.len(), 1);
+    assert_eq!(
+        refreshed_promotion_runs[0]["automation_payload"]["attempt"].as_i64(),
+        Some(2)
+    );
+    assert_eq!(
+        refreshed_promotion_runs[0]["promotion_gate_context"]["lane"].as_str(),
+        Some("refresh")
+    );
 
     let refreshed_runs = list_runs_for_instance(&app, &token, harness.vm_instance_id).await;
     assert_eq!(
@@ -1847,6 +1890,14 @@ async fn remediation_workspace_promotion_stream_includes_workspace_context(pool:
             .and_then(|value| value.get("lane"))
             .and_then(Value::as_str),
         Some("sse")
+    );
+    assert_eq!(
+        first
+            .get("automation_payload")
+            .and_then(Value::as_object)
+            .and_then(|payload| payload.get("scenario"))
+            .and_then(Value::as_str),
+        Some("workspace-sse")
     );
 }
 

@@ -288,3 +288,10 @@
   Log:
     - 2025-12-03 18:00:00 UTC: Continuing iteration to address promotion target parsing TODOs, metadata merge behaviour, CLI automation assertions, and regression coverage.
     - 2025-12-03 23:30:00 UTC: Added recursive promotion target parsing with lane/stage context, merged workspace linkage metadata updates, extended SQLx + CLI tests, and taught the harness to parse automation tables for gate assertions.
+- ID: BE-REMED-PROMO-LOOP
+  Status: IN_PROGRESS
+  Task: Close promotion-triggered automation refresh loop with deterministic run orchestration and operator visibility.
+  Hypothesis: Ensuring every promotion triggers creation or refresh of remediation runs with synchronized gate context, SSE emissions, CLI surfaces, and documentation will complete the "Close Promotion → Automation Loop" objective.
+  Log:
+    - 2025-12-04 09:05:00 UTC: Auditing promotion apply handler, remediation run linkage helpers, SSE builders, CLI renderers, and harness coverage to scope deterministic refresh updates and visibility gaps.
+    - 2025-12-04 12:40:00 UTC: Updated promotion orchestration to re-link remediation runs deterministically, broadcast refresh events, expose `promotion_runs` via REST/SSE, refreshed CLI automation tables, expanded integration + CLI tests, and documented the new harness scenario + operator workflow.

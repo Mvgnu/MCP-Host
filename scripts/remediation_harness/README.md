@@ -166,9 +166,14 @@ During a harness run the workspace fabric validation performs:
    to `mcpctl remediation workspaces revision promote`, parse the rendered automation table, and
    assert that the expected lane/stage pair is present before fetching JSON envelopes to confirm the
    staged automation, closing the loop between promotion governance and execution triggers.
+6. **Promotion automation refresh coverage** ensuring promotion responses expose the
+   `promotion_runs` array and that SSE payloads deliver refreshed automation payloads. The harness
+   drives `validation:promotion-automation-loop`, confirming the CLI automation table captures trust
+   posture, automation payload metadata, and gate context for both newly created and refreshed runs.
 
 The harness manifest now lists all executed validation tags (`validation:remediation_flow`,
 `validation:remediation-concurrency`, `validation:remediation-chaos-matrix`,
 `validation:remediation-stream:workspace-context`, `validation:remediation-workspace-draft`,
-`validation:remediation-workspace-promotion`, and `validation:remediation-workspace-cli`) so
+`validation:remediation-workspace-promotion`, `validation:remediation-workspace-cli`, and
+`validation:promotion-automation-loop`) so
 dashboards and drift detectors can reason about coverage without re-running the suite.

@@ -38,7 +38,9 @@ use crate::db::runtime_vm_remediation_workspaces::{
 };
 use crate::error::{AppError, AppResult};
 use crate::extractor::AuthUser;
-use crate::remediation::subscribe_remediation_events;
+use crate::remediation::{
+    broadcast_promotion_refresh, subscribe_remediation_events, PromotionAutomationRefresh,
+};
 use tracing::{trace, warn};
 
 // key: remediation_surface -> http-handlers
@@ -153,6 +155,8 @@ pub struct WorkspaceRevisionEnvelope {
 pub struct WorkspaceEnvelope {
     pub workspace: RuntimeVmRemediationWorkspace,
     pub revisions: Vec<WorkspaceRevisionEnvelope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub promotion_runs: Vec<RuntimeVmRemediationRun>,
 }
 
 impl From<WorkspaceDetails> for WorkspaceEnvelope {
@@ -180,6 +184,7 @@ impl From<WorkspaceDetails> for WorkspaceEnvelope {
         WorkspaceEnvelope {
             workspace,
             revisions,
+            promotion_runs: Vec::new(),
         }
     }
 }
@@ -636,6 +641,14 @@ async fn stage_workspace_promotion_runs(
             .unwrap_or_else(|| DEFAULT_PLAYBOOK.to_string());
         let playbook = get_playbook_by_key(pool, &playbook_key).await?;
 
+        let automation_payload_value = target.automation_payload.clone().unwrap_or(Value::Null);
+        let automation_payload_for_insert =
+            if automation_payload_value.is_null() && target.automation_payload.is_none() {
+                None
+            } else {
+                Some(&automation_payload_value)
+            };
+
         let metadata_value = build_promotion_metadata(
             workspace,
             revision,
@@ -645,14 +658,13 @@ async fn stage_workspace_promotion_runs(
             requested_by,
             None,
         );
-        let automation_payload_value = target.automation_payload.clone();
 
         let request = EnsureRemediationRunRequest {
             runtime_vm_instance_id: target.instance_id,
             playbook_key: &playbook_key,
             playbook_id: playbook.as_ref().map(|record| record.id),
             metadata: Some(&metadata_value),
-            automation_payload: automation_payload_value.as_ref(),
+            automation_payload: automation_payload_for_insert,
             approval_required: playbook
                 .as_ref()
                 .map(|record| record.approval_required)
@@ -671,9 +683,21 @@ async fn stage_workspace_promotion_runs(
 
         match ensure_remediation_run(pool, request).await? {
             Some(run) => {
-                ingest_accelerator_posture(pool, run.runtime_vm_instance_id, &metadata_value)
+                let updated = update_run_workspace_linkage(
+                    pool,
+                    run.id,
+                    workspace.id,
+                    revision.id,
+                    gate_context,
+                    Some(&automation_payload_value),
+                    Some(&metadata_value),
+                )
+                .await?
+                .unwrap_or(run);
+                ingest_accelerator_posture(pool, updated.runtime_vm_instance_id, &metadata_value)
                     .await?;
-                staged.push(run);
+                broadcast_promotion_refresh(&updated, PromotionAutomationRefresh::Created);
+                staged.push(updated);
             }
             None => {
                 if let Some(existing) =
@@ -694,7 +718,7 @@ async fn stage_workspace_promotion_runs(
                         workspace.id,
                         revision.id,
                         gate_context,
-                        automation_payload_value.as_ref(),
+                        Some(&automation_payload_value),
                         Some(&merged_metadata),
                     )
                     .await?
@@ -705,6 +729,7 @@ async fn stage_workspace_promotion_runs(
                         &merged_metadata,
                     )
                     .await?;
+                    broadcast_promotion_refresh(&updated, PromotionAutomationRefresh::Refreshed);
                     staged.push(updated);
                 } else {
                     warn!(
@@ -941,6 +966,7 @@ pub async fn apply_workspace_promotion_handler(
                     "promotion triggered remediation orchestration"
                 );
             }
+            envelope.promotion_runs = runs;
         } else {
             warn!(
                 workspace_id,

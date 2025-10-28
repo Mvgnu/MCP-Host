@@ -601,6 +601,8 @@ pub struct RemediationStreamMessage {
     pub accelerators: Vec<RemediationAcceleratorPosture>,
     #[serde(default, skip_serializing_if = "is_empty_value")]
     pub promotion_gate_context: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_payload: Option<Value>,
     pub event: RemediationStreamEvent,
 }
 
@@ -649,9 +651,34 @@ fn broadcast_event(run: &RuntimeVmRemediationRun, event: RemediationStreamEvent)
         policy_gate,
         accelerators,
         promotion_gate_context: run.promotion_gate_context.clone(),
+        automation_payload: run.automation_payload.clone(),
         event,
     };
     let _ = REMEDIATION_EVENT_CHANNEL.send(message);
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PromotionAutomationRefresh {
+    Created,
+    Refreshed,
+}
+
+pub fn broadcast_promotion_refresh(
+    run: &RuntimeVmRemediationRun,
+    refresh: PromotionAutomationRefresh,
+) {
+    let message = match refresh {
+        PromotionAutomationRefresh::Created => format!(
+            "promotion automation run {} created for workspace {:?}",
+            run.id, run.workspace_id
+        ),
+        PromotionAutomationRefresh::Refreshed => format!(
+            "promotion automation run {} refreshed for workspace {:?}",
+            run.id, run.workspace_id
+        ),
+    };
+
+    broadcast_status(run, &run.status, None, Some(message));
 }
 
 fn is_empty_value(value: &Value) -> bool {
