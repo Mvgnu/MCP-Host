@@ -290,16 +290,23 @@ def test_remediation_promotion_prints_automation_summary(
             "runtime_vm_instance_id": 202,
             "status": "pending",
             "approval_state": "auto-approved",
+            "playbook": "vm.restart",
             "promotion_gate_context": {"lane": "cli", "stage": "promotion"},
+            "automation_payload": {"kind": "direct"},
+            "metadata": {
+                "target": {"trust_posture": "quarantined"},
+                "promotion": {"notes": ["cli-harness"]},
+            },
             "updated_at": "2025-12-03T00:00:00Z",
         }
     ]
+
+    envelope["promotion_runs"] = runs
 
     FakeClient.responses[(
         "POST",
         "/api/trust/remediation/workspaces/7/revisions/11/promotion",
     )] = envelope
-    FakeClient.responses[("GET", "/api/trust/remediation/runs")] = runs
 
     cli_module.main(
         [
@@ -322,9 +329,14 @@ def test_remediation_promotion_prints_automation_summary(
     assert "Automation status:" in output
     assert "cli" in output
     assert "promotion" in output
-    method, path, params = FakeClient.calls[-1]
-    assert (method, path) == ("GET", "/api/trust/remediation/runs")
-    assert params == {"workspace_id": 7, "workspace_revision_id": 11}
+    assert "quarantined" in output
+    assert "direct" in output
+    assert len(FakeClient.calls) == 1
+    method, path, params = FakeClient.calls[0]
+    assert (method, path) == (
+        "POST",
+        "/api/trust/remediation/workspaces/7/revisions/11/promotion",
+    )
 
 
 def test_policy_intelligence_displays_scores(
