@@ -1,5 +1,12 @@
 # Problem_Tracker_NextIteration
 
+- ID: BE-TRUST-010
+  Status: DONE
+  Task: Enforce remediation-aware scheduling and policy gating with transparent veto metadata.
+  Hypothesis: Sharing remediation run/registry state with evaluation refresh and placement policy should prevent distrusted assets from executing workloads until automation succeeds or is triaged, while structured `policy_hook:remediation_gate` notes explain the block to operators.
+  Log:
+    - 2025-11-24 18:05:00 UTC: Integrated placement gate lookups into `evaluations::scheduler` with caching, extended trust policy notes, and broadened the remediation failure taxonomy; documented outcomes and added SQLx-backed regression tests.
+
 - ID: BE-BUILD-001
   Status: DONE
   Task: Replace docker tag/push subprocess with Bollard operations and improve error handling/tests.

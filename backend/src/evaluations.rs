@@ -313,7 +313,7 @@ pub async fn retry_certification(
     if matches!(last_status.as_deref(), Some("untrusted")) {
         let attempts: i32 = state.try_get("remediation_attempts").unwrap_or(0);
         let fallback_launched_at = state.try_get("fallback_launched_at").unwrap_or(None);
-        record_trust_block(pool, certification_id, attempts, fallback_launched_at).await?;
+        record_trust_block(pool, certification_id, attempts, fallback_launched_at, None).await?;
         return Ok(None);
     }
 

@@ -15,6 +15,7 @@ from .commands import (
     install_marketplace,
     install_policy,
     install_promotions,
+    install_remediation,
     install_scaffold,
     install_trust,
 )
@@ -43,6 +44,7 @@ def build_parser() -> ArgumentParser:
     install_promotions(subparsers)
     install_governance(subparsers)
     install_evaluations(subparsers)
+    install_remediation(subparsers)
     install_trust(subparsers)
     install_scaffold(subparsers)
     return parser

@@ -1,4 +1,8 @@
 use axum::{routing::post, Extension, Router};
+use backend::db::runtime_vm_remediation_runs::{
+    ensure_remediation_run, EnsureRemediationRunRequest,
+};
+use backend::policy::trust::evaluate_placement_gate;
 use backend::trust::TrustRegistryView;
 use chrono::{Duration, Utc};
 use hyper::{Body, Request, StatusCode};
@@ -99,4 +103,151 @@ async fn transition_endpoint_records_event(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(history_count, 1);
+}
+
+#[sqlx::test]
+#[ignore = "requires DATABASE_URL with Postgres server"]
+async fn placement_gate_blocks_active_remediation(pool: PgPool) {
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let user_id: i32 =
+        sqlx::query_scalar("INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id")
+            .bind("gatekeeper@example.com")
+            .bind("hashed")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let server_id: i32 = sqlx::query_scalar(
+        "INSERT INTO mcp_servers (owner_id, name, server_type, config, status, api_key) VALUES ($1, $2, $3, '{}'::jsonb, $4, $5) RETURNING id",
+    )
+    .bind(user_id)
+    .bind("gate-test")
+    .bind("virtual-machine")
+    .bind("active")
+    .bind("gate-key")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let vm_instance_id: i64 = sqlx::query_scalar(
+        "INSERT INTO runtime_vm_instances (server_id, instance_id) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(server_id)
+    .bind("vm-gate-1")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let run = ensure_remediation_run(
+        &pool,
+        EnsureRemediationRunRequest {
+            runtime_vm_instance_id: vm_instance_id,
+            playbook_key: "default-vm-remediation",
+            playbook_id: None,
+            metadata: None,
+            automation_payload: None,
+            approval_required: true,
+            assigned_owner_id: None,
+            sla_duration_seconds: None,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("run");
+
+    let gate = evaluate_placement_gate(&pool, server_id)
+        .await
+        .unwrap()
+        .expect("gate");
+
+    assert!(
+        gate.blocked,
+        "expected placement gate to block active remediation"
+    );
+    assert!(gate
+        .notes
+        .iter()
+        .any(|note| note.contains("policy_hook:remediation_gate=active-run")));
+    assert!(gate
+        .notes
+        .iter()
+        .any(|note| note.contains(&format!("remediation:awaiting-approval:{}", run.id))));
+}
+
+#[sqlx::test]
+#[ignore = "requires DATABASE_URL with Postgres server"]
+async fn placement_gate_flags_structural_failure(pool: PgPool) {
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let user_id: i32 =
+        sqlx::query_scalar("INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id")
+            .bind("structural@example.com")
+            .bind("hashed")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let server_id: i32 = sqlx::query_scalar(
+        "INSERT INTO mcp_servers (owner_id, name, server_type, config, status, api_key) VALUES ($1, $2, $3, '{}'::jsonb, $4, $5) RETURNING id",
+    )
+    .bind(user_id)
+    .bind("failure-test")
+    .bind("virtual-machine")
+    .bind("active")
+    .bind("fail-key")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let vm_instance_id: i64 = sqlx::query_scalar(
+        "INSERT INTO runtime_vm_instances (server_id, instance_id) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(server_id)
+    .bind("vm-failure-1")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let run = ensure_remediation_run(
+        &pool,
+        EnsureRemediationRunRequest {
+            runtime_vm_instance_id: vm_instance_id,
+            playbook_key: "default-vm-remediation",
+            playbook_id: None,
+            metadata: None,
+            automation_payload: None,
+            approval_required: false,
+            assigned_owner_id: None,
+            sla_duration_seconds: None,
+        },
+    )
+    .await
+    .unwrap()
+    .expect("run");
+
+    sqlx::query(
+        "UPDATE runtime_vm_remediation_runs SET status = 'failed', failure_reason = $2, completed_at = NOW(), approval_state = 'approved' WHERE id = $1",
+    )
+    .bind(run.id)
+    .bind("policy-denied")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let gate = evaluate_placement_gate(&pool, server_id)
+        .await
+        .unwrap()
+        .expect("gate");
+
+    assert!(
+        gate.blocked,
+        "expected placement gate to block after structural failure"
+    );
+    assert!(
+        gate.notes
+            .iter()
+            .any(|note| note
+                .contains("policy_hook:remediation_gate=failure:policy-denied:structural"))
+    );
 }

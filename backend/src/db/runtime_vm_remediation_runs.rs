@@ -1,9 +1,10 @@
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use serde_json::Value;
-use sqlx::{Executor, Postgres};
+use sqlx::{Executor, PgPool, Postgres, QueryBuilder};
 
 // key: remediation-db -> run-tracking
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct RuntimeVmRemediationRun {
     pub id: i64,
     pub runtime_vm_instance_id: i64,
@@ -26,6 +27,83 @@ pub struct RuntimeVmRemediationRun {
     pub cancelled_at: Option<DateTime<Utc>>,
     pub cancellation_reason: Option<String>,
     pub failure_reason: Option<String>,
+}
+
+pub struct ListRuntimeVmRemediationRuns<'a> {
+    pub runtime_vm_instance_id: Option<i64>,
+    pub status: Option<&'a str>,
+}
+
+pub async fn list_runs(
+    pool: &PgPool,
+    filter: ListRuntimeVmRemediationRuns<'_>,
+) -> Result<Vec<RuntimeVmRemediationRun>, sqlx::Error> {
+    let mut builder = QueryBuilder::new(
+        "SELECT id, runtime_vm_instance_id, playbook, playbook_id, status, automation_payload, \\n         approval_required, started_at, completed_at, last_error, assigned_owner_id, sla_deadline, \\n         approval_state, approval_decided_at, approval_notes, metadata, version, updated_at, \\n         cancelled_at, cancellation_reason, failure_reason FROM runtime_vm_remediation_runs",
+    );
+
+    let mut has_clause = false;
+    if filter.runtime_vm_instance_id.is_some() || filter.status.is_some() {
+        builder.push(" WHERE ");
+    }
+
+    if let Some(instance_id) = filter.runtime_vm_instance_id {
+        builder.push(" runtime_vm_instance_id = ");
+        builder.push_bind(instance_id);
+        has_clause = true;
+    }
+
+    if let Some(status) = filter.status {
+        if has_clause {
+            builder.push(" AND ");
+        }
+        builder.push(" status = ");
+        builder.push_bind(status);
+    }
+
+    builder.push(" ORDER BY started_at DESC");
+
+    builder
+        .build_query_as::<RuntimeVmRemediationRun>()
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn get_run_by_id(
+    pool: &PgPool,
+    run_id: i64,
+) -> Result<Option<RuntimeVmRemediationRun>, sqlx::Error> {
+    sqlx::query_as::<_, RuntimeVmRemediationRun>(
+        r#"
+        SELECT
+            id,
+            runtime_vm_instance_id,
+            playbook,
+            playbook_id,
+            status,
+            automation_payload,
+            approval_required,
+            started_at,
+            completed_at,
+            last_error,
+            assigned_owner_id,
+            sla_deadline,
+            approval_state,
+            approval_decided_at,
+            approval_notes,
+            metadata,
+            version,
+            updated_at,
+            cancelled_at,
+            cancellation_reason,
+            failure_reason
+        FROM runtime_vm_remediation_runs
+        WHERE id = $1
+        "#,
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await
 }
 
 pub struct EnsureRemediationRunRequest<'a> {
