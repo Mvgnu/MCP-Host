@@ -209,3 +209,12 @@
   Log:
     - 2025-11-22 09:35:00 UTC: Outlined remediation playbook schema needs, automation triggers, and override flows aligned with registry lifecycle states.
     - 2025-11-22 17:55:00 UTC: Captured orchestrator rollout notes in backend docs and highlighted the placeholder automation window for future playbook wiring.
+
+- ID: BE-REMED-001
+  Status: IN_PROGRESS
+  Task: Stand up remediation control plane schema, execution engine, and operator surfaces.
+  Hypothesis: Persisted playbooks, structured runs/artifacts, and automation-backed execution with policy feedback will convert the trust registry from passive alerts into a closure-oriented workflow.
+  Log:
+    - 2025-11-24 09:00:00 UTC: Began remediation control plane iteration focusing on schema extensions, executor abstraction, queue integration, and policy feedback loops.
+    - 2025-11-24 11:30:00 UTC: Added remediation control plane migration (playbooks/runs/artifacts), expanded DB helpers with optimistic locking + approval semantics, and documented new data contracts.
+    - 2025-11-24 13:10:00 UTC: Implemented `RemediationExecutor` trait with simulated shell/Ansible/cloud adapters, queue worker, structured logging artifacts, and trust registry updates for success/failure outcomes.

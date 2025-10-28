@@ -1,98 +1,417 @@
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{Executor, Postgres};
 
-// key: remediation-db -> automation-tracking
-pub async fn ensure_running_playbook<'c, E>(
+// key: remediation-db -> run-tracking
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RuntimeVmRemediationRun {
+    pub id: i64,
+    pub runtime_vm_instance_id: i64,
+    pub playbook: String,
+    pub playbook_id: Option<i64>,
+    pub status: String,
+    pub automation_payload: Option<Value>,
+    pub approval_required: bool,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub assigned_owner_id: Option<i32>,
+    pub sla_deadline: Option<DateTime<Utc>>,
+    pub approval_state: String,
+    pub approval_decided_at: Option<DateTime<Utc>>,
+    pub approval_notes: Option<String>,
+    pub metadata: Value,
+    pub version: i64,
+    pub updated_at: DateTime<Utc>,
+    pub cancelled_at: Option<DateTime<Utc>>,
+    pub cancellation_reason: Option<String>,
+    pub failure_reason: Option<String>,
+}
+
+pub struct EnsureRemediationRunRequest<'a> {
+    pub runtime_vm_instance_id: i64,
+    pub playbook_key: &'a str,
+    pub playbook_id: Option<i64>,
+    pub metadata: Option<&'a Value>,
+    pub automation_payload: Option<&'a Value>,
+    pub approval_required: bool,
+    pub assigned_owner_id: Option<i32>,
+    pub sla_duration_seconds: Option<i32>,
+}
+
+pub async fn ensure_remediation_run<'c, E>(
     executor: E,
-    runtime_vm_instance_id: i64,
-    playbook: &str,
-    payload: Option<&Value>,
-    approval_required: bool,
-) -> Result<bool, sqlx::Error>
+    request: EnsureRemediationRunRequest<'_>,
+) -> Result<Option<RuntimeVmRemediationRun>, sqlx::Error>
 where
     E: Executor<'c, Database = Postgres>,
 {
-    let row = sqlx::query(
+    let record = sqlx::query_as::<_, RuntimeVmRemediationRun>(
         r#"
-        INSERT INTO runtime_vm_remediation_runs (
+        WITH inserted AS (
+            INSERT INTO runtime_vm_remediation_runs (
+                runtime_vm_instance_id,
+                playbook,
+                playbook_id,
+                status,
+                automation_payload,
+                approval_required,
+                approval_state,
+                approval_decided_at,
+                assigned_owner_id,
+                sla_deadline,
+                metadata
+            )
+            SELECT
+                $1,
+                $2,
+                $3,
+                'pending',
+                $4,
+                $5,
+                CASE WHEN $5 THEN 'pending' ELSE 'auto-approved' END,
+                CASE WHEN $5 THEN NULL ELSE NOW() END,
+                $6,
+                CASE
+                    WHEN $7 IS NULL THEN NULL
+                    ELSE NOW() + ($7::INT * INTERVAL '1 second')
+                END,
+                COALESCE($8, '{}'::JSONB)
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM runtime_vm_remediation_runs
+                WHERE runtime_vm_instance_id = $1
+                  AND status IN ('pending', 'running')
+            )
+            RETURNING
+                id,
+                runtime_vm_instance_id,
+                playbook,
+                playbook_id,
+                status,
+                automation_payload,
+                approval_required,
+                started_at,
+                completed_at,
+                last_error,
+                assigned_owner_id,
+                sla_deadline,
+                approval_state,
+                approval_decided_at,
+                approval_notes,
+                metadata,
+                version,
+                updated_at,
+                cancelled_at,
+                cancellation_reason,
+                failure_reason
+        )
+        SELECT
+            id,
             runtime_vm_instance_id,
             playbook,
+            playbook_id,
             status,
             automation_payload,
-            approval_required
-        )
-        SELECT $1, $2, 'running', $3, $4
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM runtime_vm_remediation_runs
-            WHERE runtime_vm_instance_id = $1
-              AND status = 'running'
-        )
-        RETURNING id
+            approval_required,
+            started_at,
+            completed_at,
+            last_error,
+            assigned_owner_id,
+            sla_deadline,
+            approval_state,
+            approval_decided_at,
+            approval_notes,
+            metadata,
+            version,
+            updated_at,
+            cancelled_at,
+            cancellation_reason,
+            failure_reason
+        FROM inserted
         "#,
     )
-    .bind(runtime_vm_instance_id)
-    .bind(playbook)
-    .bind(payload)
-    .bind(approval_required)
+    .bind(request.runtime_vm_instance_id)
+    .bind(request.playbook_key)
+    .bind(request.playbook_id)
+    .bind(request.automation_payload)
+    .bind(request.approval_required)
+    .bind(request.assigned_owner_id)
+    .bind(request.sla_duration_seconds)
+    .bind(request.metadata)
     .fetch_optional(executor)
     .await?;
 
-    Ok(row.is_some())
+    Ok(record)
+}
+
+pub async fn get_active_run_for_instance<'c, E>(
+    executor: E,
+    runtime_vm_instance_id: i64,
+) -> Result<Option<RuntimeVmRemediationRun>, sqlx::Error>
+where
+    E: Executor<'c, Database = Postgres>,
+{
+    sqlx::query_as::<_, RuntimeVmRemediationRun>(
+        r#"
+        SELECT
+            id,
+            runtime_vm_instance_id,
+            playbook,
+            playbook_id,
+            status,
+            automation_payload,
+            approval_required,
+            started_at,
+            completed_at,
+            last_error,
+            assigned_owner_id,
+            sla_deadline,
+            approval_state,
+            approval_decided_at,
+            approval_notes,
+            metadata,
+            version,
+            updated_at,
+            cancelled_at,
+            cancellation_reason,
+            failure_reason
+        FROM runtime_vm_remediation_runs
+        WHERE runtime_vm_instance_id = $1
+          AND status IN ('pending', 'running')
+        ORDER BY started_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(runtime_vm_instance_id)
+    .fetch_optional(executor)
+    .await
+}
+
+pub async fn try_acquire_next_run<'c, E>(
+    executor: E,
+) -> Result<Option<RuntimeVmRemediationRun>, sqlx::Error>
+where
+    E: Executor<'c, Database = Postgres>,
+{
+    let record = sqlx::query_as::<_, RuntimeVmRemediationRun>(
+        r#"
+        WITH candidate AS (
+            SELECT id
+            FROM runtime_vm_remediation_runs
+            WHERE status = 'pending'
+              AND approval_state IN ('approved', 'auto-approved')
+            ORDER BY COALESCE(sla_deadline, started_at), started_at
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        )
+        UPDATE runtime_vm_remediation_runs AS runs
+        SET
+            status = 'running',
+            version = runs.version + 1,
+            updated_at = NOW()
+        FROM candidate
+        WHERE runs.id = candidate.id
+        RETURNING
+            runs.id,
+            runs.runtime_vm_instance_id,
+            runs.playbook,
+            runs.playbook_id,
+            runs.status,
+            runs.automation_payload,
+            runs.approval_required,
+            runs.started_at,
+            runs.completed_at,
+            runs.last_error,
+            runs.assigned_owner_id,
+            runs.sla_deadline,
+            runs.approval_state,
+            runs.approval_decided_at,
+            runs.approval_notes,
+            runs.metadata,
+            runs.version,
+            runs.updated_at,
+            runs.cancelled_at,
+            runs.cancellation_reason,
+            runs.failure_reason
+        "#,
+    )
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(record)
 }
 
 pub async fn mark_run_completed<'c, E>(
     executor: E,
-    runtime_vm_instance_id: i64,
+    run_id: i64,
+    metadata: Option<&Value>,
     payload: Option<&Value>,
-) -> Result<bool, sqlx::Error>
+) -> Result<Option<RuntimeVmRemediationRun>, sqlx::Error>
 where
     E: Executor<'c, Database = Postgres>,
 {
-    let row = sqlx::query(
+    let record = sqlx::query_as::<_, RuntimeVmRemediationRun>(
         r#"
         UPDATE runtime_vm_remediation_runs
         SET
             status = 'completed',
-            automation_payload = COALESCE($2, automation_payload),
-            completed_at = NOW()
-        WHERE runtime_vm_instance_id = $1
+            automation_payload = COALESCE($3, automation_payload),
+            metadata = COALESCE($2, metadata),
+            completed_at = NOW(),
+            version = version + 1,
+            updated_at = NOW(),
+            failure_reason = NULL,
+            last_error = NULL
+        WHERE id = $1
           AND status = 'running'
-        RETURNING id
+        RETURNING
+            id,
+            runtime_vm_instance_id,
+            playbook,
+            playbook_id,
+            status,
+            automation_payload,
+            approval_required,
+            started_at,
+            completed_at,
+            last_error,
+            assigned_owner_id,
+            sla_deadline,
+            approval_state,
+            approval_decided_at,
+            approval_notes,
+            metadata,
+            version,
+            updated_at,
+            cancelled_at,
+            cancellation_reason,
+            failure_reason
         "#,
     )
-    .bind(runtime_vm_instance_id)
+    .bind(run_id)
+    .bind(metadata)
     .bind(payload)
     .fetch_optional(executor)
     .await?;
 
-    Ok(row.is_some())
+    Ok(record)
 }
 
 pub async fn mark_run_failed<'c, E>(
     executor: E,
-    runtime_vm_instance_id: i64,
+    run_id: i64,
+    failure_reason: &str,
     error: &str,
-) -> Result<bool, sqlx::Error>
+    metadata: Option<&Value>,
+) -> Result<Option<RuntimeVmRemediationRun>, sqlx::Error>
 where
     E: Executor<'c, Database = Postgres>,
 {
-    let row = sqlx::query(
+    let record = sqlx::query_as::<_, RuntimeVmRemediationRun>(
         r#"
         UPDATE runtime_vm_remediation_runs
         SET
             status = 'failed',
-            last_error = $2,
-            completed_at = NOW()
-        WHERE runtime_vm_instance_id = $1
+            last_error = $3,
+            failure_reason = $2,
+            metadata = COALESCE($4, metadata),
+            completed_at = NOW(),
+            version = version + 1,
+            updated_at = NOW()
+        WHERE id = $1
           AND status = 'running'
-        RETURNING id
+        RETURNING
+            id,
+            runtime_vm_instance_id,
+            playbook,
+            playbook_id,
+            status,
+            automation_payload,
+            approval_required,
+            started_at,
+            completed_at,
+            last_error,
+            assigned_owner_id,
+            sla_deadline,
+            approval_state,
+            approval_decided_at,
+            approval_notes,
+            metadata,
+            version,
+            updated_at,
+            cancelled_at,
+            cancellation_reason,
+            failure_reason
         "#,
     )
-    .bind(runtime_vm_instance_id)
+    .bind(run_id)
+    .bind(failure_reason)
     .bind(error)
+    .bind(metadata)
     .fetch_optional(executor)
     .await?;
 
-    Ok(row.is_some())
+    Ok(record)
+}
+
+pub struct UpdateApprovalState<'a> {
+    pub run_id: i64,
+    pub new_state: &'a str,
+    pub approval_notes: Option<&'a str>,
+    pub decided_at: DateTime<Utc>,
+    pub expected_version: i64,
+}
+
+pub async fn update_approval_state<'c, E>(
+    executor: E,
+    update: UpdateApprovalState<'_>,
+) -> Result<Option<RuntimeVmRemediationRun>, sqlx::Error>
+where
+    E: Executor<'c, Database = Postgres>,
+{
+    let record = sqlx::query_as::<_, RuntimeVmRemediationRun>(
+        r#"
+        UPDATE runtime_vm_remediation_runs
+        SET
+            approval_state = $2,
+            approval_notes = $3,
+            approval_decided_at = $4,
+            version = version + 1,
+            updated_at = NOW()
+        WHERE id = $1
+          AND version = $5
+        RETURNING
+            id,
+            runtime_vm_instance_id,
+            playbook,
+            playbook_id,
+            status,
+            automation_payload,
+            approval_required,
+            started_at,
+            completed_at,
+            last_error,
+            assigned_owner_id,
+            sla_deadline,
+            approval_state,
+            approval_decided_at,
+            approval_notes,
+            metadata,
+            version,
+            updated_at,
+            cancelled_at,
+            cancellation_reason,
+            failure_reason
+        "#,
+    )
+    .bind(update.run_id)
+    .bind(update.new_state)
+    .bind(update.approval_notes)
+    .bind(update.decided_at)
+    .bind(update.expected_version)
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(record)
 }

@@ -2,6 +2,16 @@
 
 This document tracks development progress and high level notes from the planning materials in `README.md`.
 
+## 2025-11-24
+- Landed remediation control plane schema upgrades (`runtime_vm_remediation_playbooks`, `runtime_vm_remediation_runs`, `runtime_vm_remediation_artifacts`) with optimistic locking, owner assignment, approval state tracking, SLA deadlines, and artifact persistence.
+- Replaced the stub automation loop with a queue-backed execution engine: `RemediationExecutor` trait (shell/Ansible/cloud adapters), log streaming, structured exit codes, cancellation support, and typed failure reasons feeding the trust registry.
+- Updated remediation documentation to describe the new data contracts and orchestrator lifecycle semantics for downstream REST/CLI consumers.
+
+### Next Steps
+- Expose `/api/trust/remediation/*` REST + SSE endpoints and `mcpctl remediation` commands that consume optimistic concurrency tokens.
+- Teach scheduler and policy admission control to consult remediation outcomes before queueing placements.
+- Extend intelligence scoring to ingest remediation artifacts and adjust trust thresholds dynamically.
+
 ## 2025-11-18
 - Hydrated libvirt executor configuration from environment variables covering credentials, isolation defaults, memory/vCPU sizing, templates, GPU policy, and console preferences.
 - Added a runtime provisioner driver switch that selects the libvirt executor when enabled, persisting sanitized hypervisor snapshots and attestation hints for downstream consumers.
