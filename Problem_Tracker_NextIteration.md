@@ -325,3 +325,11 @@
   Log:
     - 2025-12-07 09:00:00 UTC: Initiated lifecycle console resilience iteration, auditing backend queries, SSE envelopes, and frontend persistence gaps.
     - 2025-12-07 12:30:00 UTC: Added workspace/promotion/severity filters, SSE delta envelopes with trust/intel replay, offline cache hydration, and drill-down UI surfaces with Playwright coverage.
+
+- ID: BE-PROMO-TRUST-INTEL
+  Status: IN_PROGRESS
+  Task: Fuse trust registry and intelligence verdicts into promotion scheduling with operator-visible veto metadata.
+  Hypothesis: Querying remediation workspaces, trust transitions, and intelligence scores before inserting promotions will prevent risky artifacts from advancing while providing actionable context to console and CLI consumers.
+  Log:
+    - 2025-12-08 10:05:00 UTC: Audited promotion scheduling flow, lifecycle console aggregation, and trust/intelligence data paths to scope blended gate evaluation and payload surfacing requirements.
+    - 2025-12-08 14:45:00 UTC: Implemented promotion posture evaluation wiring trust registry, remediation run, and intelligence queries; surfaced JSON veto payloads plus machine-readable notes, and added unit tests covering healthy vs. critical veto scenarios.

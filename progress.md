@@ -2,6 +2,11 @@
 
 This document tracks development progress and high level notes from the planning materials in `README.md`.
 
+## 2025-12-08
+- Wired promotion scheduling to query remediation runs, trust registry posture, and capability intelligence scores before persisting new records, emitting machine-readable notes and JSON veto payloads when posture is unhealthy.
+- Added `PromotionPostureSignals`/`PromotionVerdict` helpers with targeted unit tests so blended promotion gates stay deterministic as new signals land.
+- Documented the promotion posture integration path so console/CLI surfaces can reuse the structured metadata emitted on success or veto.
+
 ## 2025-11-24
 - Landed remediation control plane schema upgrades (`runtime_vm_remediation_playbooks`, `runtime_vm_remediation_runs`, `runtime_vm_remediation_artifacts`) with optimistic locking, owner assignment, approval state tracking, SLA deadlines, and artifact persistence.
 - Replaced the stub automation loop with a queue-backed execution engine: `RemediationExecutor` trait (shell/Ansible/cloud adapters), log streaming, structured exit codes, cancellation support, and typed failure reasons feeding the trust registry.
