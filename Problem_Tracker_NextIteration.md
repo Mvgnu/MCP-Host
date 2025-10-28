@@ -225,3 +225,14 @@
     - 2025-11-24 09:00:00 UTC: Began remediation control plane iteration focusing on schema extensions, executor abstraction, queue integration, and policy feedback loops.
     - 2025-11-24 11:30:00 UTC: Added remediation control plane migration (playbooks/runs/artifacts), expanded DB helpers with optimistic locking + approval semantics, and documented new data contracts.
     - 2025-11-24 13:10:00 UTC: Implemented `RemediationExecutor` trait with simulated shell/Ansible/cloud adapters, queue worker, structured logging artifacts, and trust registry updates for success/failure outcomes.
+- ID: BE-VAL-001
+  Status: IN_PROGRESS
+  Task: Create remediation lifecycle validation harness with SQLx integration coverage and operator tooling hooks.
+  Hypothesis: Automating playbook/run/approval flows plus scheduler gate assertions will surface regressions before production
+  rollout; pairing the harness with scripts and documentation keeps operators aligned on validation steps.
+  Log:
+    - 2025-11-28 14:05:00 UTC: Added `backend/tests/remediation_flow.rs` covering playbook CRUD, duplicate run protection,
+      approval gating, placement veto notes, and artifact retrieval via REST handlers. Documented execution in backend README.
+    - 2025-11-28 14:25:00 UTC: Delivered `scripts/remediation_harness/run_harness.sh` with README guidance for spinning up
+      ephemeral Postgres/backends and running the integration test under the `validation: remediation_flow` tag. Follow-up to
+      extend CLI SSE smoke tests remains open.

@@ -81,3 +81,19 @@ Operators should consult the remediation API/CLI roadmap before enabling automat
   - `GET /api/trust/remediation/runs/:id/artifacts` to fetch structured evidence bundles.
   - `GET /api/trust/remediation/stream` for SSE log/status streaming filtered by `run_id`.
 - **CLI (`mcpctl remediation`):** new subcommands mirror the REST surface (`playbooks list`, `runs list|get|enqueue|approve|artifacts`, `watch`) with JSON output toggles and structured table rendering to simplify operator workflows.
+
+### Validation harness (`validation: remediation_flow`)
+
+An end-to-end SQLx integration test (`backend/tests/remediation_flow.rs`) now validates the
+remediation lifecycle: playbook creation/edit/version guards, queued runs with duplicate protection,
+approval transitions, placement gate veto notes, and artifact retrieval. Execute the harness via:
+
+```bash
+DATABASE_URL=postgres://postgres:password@localhost/mcp \
+JWT_SECRET=integration-secret \
+cargo test --test remediation_flow -- --ignored --nocapture
+```
+
+For a fully orchestrated run—including ephemeral Postgres and backend bootstrapping—use the shell
+script under `scripts/remediation_harness/` (documented in the harness README). The script tags
+results with `validation: remediation_flow` so future rollups can track regression coverage.
