@@ -85,6 +85,35 @@ async fn bootstrap_remediation_harness(pool: &PgPool) -> RemediationHarness {
 
     let app = Router::new()
         .route(
+            "/api/trust/remediation/workspaces",
+            get(backend::remediation_api::list_workspaces_handler)
+                .post(backend::remediation_api::create_workspace_handler),
+        )
+        .route(
+            "/api/trust/remediation/workspaces/:workspace_id",
+            get(backend::remediation_api::get_workspace_handler),
+        )
+        .route(
+            "/api/trust/remediation/workspaces/:workspace_id/revisions",
+            post(backend::remediation_api::create_workspace_revision_handler),
+        )
+        .route(
+            "/api/trust/remediation/workspaces/:workspace_id/revisions/:revision_id/schema",
+            post(backend::remediation_api::apply_workspace_schema_validation_handler),
+        )
+        .route(
+            "/api/trust/remediation/workspaces/:workspace_id/revisions/:revision_id/policy",
+            post(backend::remediation_api::apply_workspace_policy_feedback_handler),
+        )
+        .route(
+            "/api/trust/remediation/workspaces/:workspace_id/revisions/:revision_id/simulation",
+            post(backend::remediation_api::apply_workspace_simulation_handler),
+        )
+        .route(
+            "/api/trust/remediation/workspaces/:workspace_id/revisions/:revision_id/promotion",
+            post(backend::remediation_api::apply_workspace_promotion_handler),
+        )
+        .route(
             "/api/trust/remediation/playbooks",
             get(backend::remediation_api::list_all_playbooks)
                 .post(backend::remediation_api::create_playbook_handler),
@@ -718,6 +747,422 @@ async fn scenario_executor_outage_resumption(
         .unwrap()
         .unwrap();
     assert!(!restored_gate.blocked);
+}
+
+async fn post_workspace_request(
+    app: &Router,
+    token: &str,
+    uri: String,
+    payload: Value,
+) -> Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn create_workspace(app: &Router, token: &str, payload: Value) -> Value {
+    let response = post_workspace_request(
+        app,
+        token,
+        "/api/trust/remediation/workspaces".to_string(),
+        payload,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = body::to_bytes(response.into_body()).await.unwrap();
+    serde_json::from_slice(&body_bytes).unwrap()
+}
+
+async fn create_workspace_revision(
+    app: &Router,
+    token: &str,
+    workspace_id: i64,
+    payload: Value,
+) -> Value {
+    let response = post_workspace_request(
+        app,
+        token,
+        format!("/api/trust/remediation/workspaces/{workspace_id}/revisions"),
+        payload,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = body::to_bytes(response.into_body()).await.unwrap();
+    serde_json::from_slice(&body_bytes).unwrap()
+}
+
+async fn apply_workspace_schema(
+    app: &Router,
+    token: &str,
+    workspace_id: i64,
+    revision_id: i64,
+    payload: Value,
+) -> Value {
+    let response = post_workspace_request(
+        app,
+        token,
+        format!(
+            "/api/trust/remediation/workspaces/{workspace_id}/revisions/{revision_id}/schema"
+        ),
+        payload,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = body::to_bytes(response.into_body()).await.unwrap();
+    serde_json::from_slice(&body_bytes).unwrap()
+}
+
+async fn apply_workspace_policy(
+    app: &Router,
+    token: &str,
+    workspace_id: i64,
+    revision_id: i64,
+    payload: Value,
+) -> Value {
+    let response = post_workspace_request(
+        app,
+        token,
+        format!(
+            "/api/trust/remediation/workspaces/{workspace_id}/revisions/{revision_id}/policy"
+        ),
+        payload,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = body::to_bytes(response.into_body()).await.unwrap();
+    serde_json::from_slice(&body_bytes).unwrap()
+}
+
+async fn apply_workspace_simulation(
+    app: &Router,
+    token: &str,
+    workspace_id: i64,
+    revision_id: i64,
+    payload: Value,
+) -> Value {
+    let response = post_workspace_request(
+        app,
+        token,
+        format!(
+            "/api/trust/remediation/workspaces/{workspace_id}/revisions/{revision_id}/simulation"
+        ),
+        payload,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = body::to_bytes(response.into_body()).await.unwrap();
+    serde_json::from_slice(&body_bytes).unwrap()
+}
+
+async fn apply_workspace_promotion(
+    app: &Router,
+    token: &str,
+    workspace_id: i64,
+    revision_id: i64,
+    payload: Value,
+) -> Value {
+    let response = post_workspace_request(
+        app,
+        token,
+        format!(
+            "/api/trust/remediation/workspaces/{workspace_id}/revisions/{revision_id}/promotion"
+        ),
+        payload,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = body::to_bytes(response.into_body()).await.unwrap();
+    serde_json::from_slice(&body_bytes).unwrap()
+}
+
+async fn fetch_workspace_details(app: &Router, token: &str, workspace_id: i64) -> Value {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/trust/remediation/workspaces/{workspace_id}"))
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = body::to_bytes(response.into_body()).await.unwrap();
+    serde_json::from_slice(&body_bytes).unwrap()
+}
+
+async fn list_workspaces(app: &Router, token: &str) -> Vec<Value> {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/trust/remediation/workspaces")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = body::to_bytes(response.into_body()).await.unwrap();
+    serde_json::from_slice(&body_bytes).unwrap()
+}
+
+fn select_revision<'a>(envelope: &'a Value, revision_id: i64) -> &'a Value {
+    envelope["revisions"]
+        .as_array()
+        .expect("revisions array")
+        .iter()
+        .find(|entry| entry["revision"]["id"].as_i64() == Some(revision_id))
+        .expect("revision not found")
+}
+
+fn find_snapshot<'a>(revision: &'a Value, snapshot_type: &str) -> Option<&'a Value> {
+    revision["validation_snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|snapshot| snapshot["snapshot_type"].as_str() == Some(snapshot_type))
+}
+
+// key: validation -> remediation-workspace-draft
+// key: validation -> remediation-workspace-promotion
+#[sqlx::test]
+#[ignore = "requires DATABASE_URL with Postgres server"]
+async fn remediation_workspace_lifecycle_end_to_end(pool: PgPool) {
+    let harness = bootstrap_remediation_harness(&pool).await;
+    let app = harness.app.clone();
+    let token = harness.token.clone();
+    let workspace_payload = json!({
+        "workspace_key": "workspace.alpha",
+        "display_name": "Workspace Alpha",
+        "description": "Draft remediation workspace",
+        "plan": {"playbooks": ["vm.restart"]},
+        "metadata": {"source": "integration"},
+        "lineage_tags": ["validation:remediation-workspace-draft"],
+        "lineage_labels": ["channel:alpha"],
+    });
+
+    let workspace = create_workspace(&app, &token, workspace_payload).await;
+    let workspace_id = workspace["workspace"]["id"].as_i64().unwrap();
+    let mut workspace_version = workspace["workspace"]["version"].as_i64().unwrap();
+    let active_revision_id = workspace["workspace"]["active_revision_id"].as_i64().unwrap();
+    let initial_revision = select_revision(&workspace, active_revision_id);
+    assert_eq!(
+        initial_revision["revision"]["revision_number"].as_i64(),
+        Some(1)
+    );
+    assert_eq!(
+        initial_revision["gate_summary"]["schema_status"].as_str(),
+        Some("pending")
+    );
+
+    let initial_revision_version = initial_revision["revision"]["version"].as_i64().unwrap();
+
+    let revision_payload = json!({
+        "plan": {"playbooks": ["vm.restart", "vm.redeploy"]},
+        "metadata": {"change": "v2"},
+        "lineage_labels": ["channel:alpha", "experiment:v2"],
+        "expected_workspace_version": workspace_version,
+        "previous_revision_id": initial_revision["revision"]["id"].as_i64(),
+    });
+
+    let updated = create_workspace_revision(&app, &token, workspace_id, revision_payload).await;
+    workspace_version = updated["workspace"]["version"].as_i64().unwrap();
+    let latest_revision = updated["revisions"].as_array().unwrap()[0].clone();
+    let latest_revision_id = latest_revision["revision"]["id"].as_i64().unwrap();
+    let mut revision_version = latest_revision["revision"]["version"].as_i64().unwrap();
+
+    let stale_revision_response = post_workspace_request(
+        &app,
+        &token,
+        format!("/api/trust/remediation/workspaces/{workspace_id}/revisions"),
+        json!({
+            "plan": {"playbooks": ["vm.restart"]},
+            "metadata": {"change": "stale"},
+            "lineage_labels": [],
+            "expected_workspace_version": workspace_version - 1,
+            "previous_revision_id": latest_revision["revision"]["id"].as_i64(),
+        }),
+    )
+    .await;
+    assert_eq!(stale_revision_response.status(), StatusCode::CONFLICT);
+
+    let schema_payload = json!({
+        "result_status": "passed",
+        "errors": [],
+        "gate_context": {"validator": "schema-bot"},
+        "metadata": {"token": "schema-v1"},
+        "expected_revision_version": revision_version,
+    });
+
+    let after_schema = apply_workspace_schema(
+        &app,
+        &token,
+        workspace_id,
+        latest_revision_id,
+        schema_payload,
+    )
+    .await;
+    let revision_after_schema = select_revision(&after_schema, latest_revision_id);
+    assert_eq!(
+        revision_after_schema["gate_summary"]["schema_status"].as_str(),
+        Some("passed")
+    );
+    let schema_snapshot = find_snapshot(revision_after_schema, "schema").unwrap();
+    assert_eq!(schema_snapshot["status"].as_str(), Some("passed"));
+    revision_version = revision_after_schema["revision"]["version"].as_i64().unwrap();
+
+    let policy_payload = json!({
+        "policy_status": "vetoed",
+        "veto_reasons": ["policy_hook:remediation_gate=pending-signal"],
+        "gate_context": {"policy": "trust-intelligence"},
+        "metadata": {"ticket": "RISK-42"},
+        "expected_revision_version": revision_version,
+    });
+
+    let after_policy = apply_workspace_policy(
+        &app,
+        &token,
+        workspace_id,
+        latest_revision_id,
+        policy_payload,
+    )
+    .await;
+    let revision_after_policy = select_revision(&after_policy, latest_revision_id);
+    assert_eq!(
+        revision_after_policy["gate_summary"]["policy_status"].as_str(),
+        Some("vetoed")
+    );
+    assert!(revision_after_policy["gate_summary"]["policy_veto_reasons"].as_array().unwrap().iter().any(|value| {
+        value
+            .as_str()
+            .map(|entry| entry.starts_with("policy_hook:remediation_gate"))
+            .unwrap_or(false)
+    }));
+    let policy_snapshot = find_snapshot(revision_after_policy, "policy").unwrap();
+    assert_eq!(policy_snapshot["status"].as_str(), Some("vetoed"));
+    revision_version = revision_after_policy["revision"]["version"].as_i64().unwrap();
+    let stale_promotion_revision_version = revision_version;
+
+    let simulation_payload = json!({
+        "simulator_kind": "chaos-matrix",
+        "execution_state": "succeeded",
+        "gate_context": {"scenario": "workspace-lifecycle"},
+        "diff_snapshot": {"changes": 3},
+        "metadata": {"transcript": "ok"},
+        "expected_revision_version": revision_version,
+    });
+
+    let after_simulation = apply_workspace_simulation(
+        &app,
+        &token,
+        workspace_id,
+        latest_revision_id,
+        simulation_payload,
+    )
+    .await;
+    let revision_after_sim = select_revision(&after_simulation, latest_revision_id);
+    assert_eq!(
+        revision_after_sim["gate_summary"]["simulation_status"].as_str(),
+        Some("succeeded")
+    );
+    assert!(revision_after_sim["sandbox_executions"].as_array().unwrap().iter().any(|entry| {
+        entry["simulator_kind"].as_str() == Some("chaos-matrix")
+            && entry["execution_state"].as_str() == Some("succeeded")
+    }));
+    revision_version = revision_after_sim["revision"]["version"].as_i64().unwrap();
+
+    let stale_promotion = post_workspace_request(
+        &app,
+        &token,
+        format!(
+            "/api/trust/remediation/workspaces/{workspace_id}/revisions/{latest_revision_id}/promotion"
+        ),
+        json!({
+            "promotion_status": "completed",
+            "notes": ["ready"],
+            "expected_workspace_version": workspace_version,
+            "expected_revision_version": stale_promotion_revision_version,
+        }),
+    )
+    .await;
+    assert_eq!(stale_promotion.status(), StatusCode::CONFLICT);
+
+    let promotion_payload = json!({
+        "promotion_status": "completed",
+        "notes": ["validated via harness"],
+        "expected_workspace_version": workspace_version,
+        "expected_revision_version": revision_version,
+    });
+
+    let after_promotion = apply_workspace_promotion(
+        &app,
+        &token,
+        workspace_id,
+        latest_revision_id,
+        promotion_payload,
+    )
+    .await;
+    assert_eq!(
+        after_promotion["workspace"]["lifecycle_state"].as_str(),
+        Some("promoted")
+    );
+    let promoted_revision = select_revision(&after_promotion, latest_revision_id);
+    assert_eq!(
+        promoted_revision["gate_summary"]["promotion_status"].as_str(),
+        Some("completed")
+    );
+    let promotion_snapshot = find_snapshot(promoted_revision, "promotion").unwrap();
+    assert_eq!(promotion_snapshot["status"].as_str(), Some("completed"));
+    assert!(promotion_snapshot["notes"].as_array().unwrap().iter().any(|note| {
+        note.as_str()
+            .map(|entry| entry.starts_with("requested_by="))
+            .unwrap_or(false)
+    }));
+    let promoted_workspace_version = after_promotion["workspace"]["version"].as_i64().unwrap();
+    assert_eq!(promoted_workspace_version, workspace_version + 1);
+    let listed = list_workspaces(&app, &token).await;
+    assert!(listed.iter().any(|entry| {
+        entry["workspace"]["id"].as_i64() == Some(workspace_id)
+            && entry["workspace"]["lifecycle_state"].as_str() == Some("promoted")
+    }));
+
+    let fetched = fetch_workspace_details(&app, &token, workspace_id).await;
+    let fetched_revision = select_revision(&fetched, latest_revision_id);
+    assert_eq!(
+        fetched_revision["gate_summary"]["promotion_status"].as_str(),
+        Some("completed")
+    );
+    assert_eq!(
+        fetched_revision["gate_summary"]["policy_veto_reasons"].as_array().unwrap().len(),
+        1
+    );
+    assert!(
+        fetched_revision["gate_summary"]["policy_veto_reasons"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("policy_hook:remediation_gate")
+    );
+
+    let initial_revision_after_promotion =
+        select_revision(&fetched, initial_revision["revision"]["id"].as_i64().unwrap());
+    assert_eq!(
+        initial_revision_after_promotion["revision"]["version"].as_i64(),
+        Some(initial_revision_version)
+    );
 }
 
 async fn create_playbook(

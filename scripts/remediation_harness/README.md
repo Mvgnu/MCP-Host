@@ -137,24 +137,29 @@ manifest-driven chaos scenarios, and SSE ordering/manifest metadata propagation
 status transitions, and manifest tags for accelerator and tenant-focused scenarios without running
 additional manual commands.
 
-## Workspace lifecycle validation (in progress)
+## Workspace lifecycle validation
 
-Workspace lifecycle APIs are now live in the backend (`/api/trust/remediation/workspaces/*`) and the
-CLI (`mcpctl remediation workspaces`). Upcoming harness iterations will stitch the following phases
-into the chaos fabric so remediation plans can be rehearsed before production promotion:
+Workspace lifecycle APIs are now fully exercised by the integration suite and harness. The
+`remediation_workspace_lifecycle_end_to_end` SQLx test drives draft creation, revision iteration,
+schema/policy validation snapshots, sandbox simulations, and promotion gates while asserting each
+optimistic locking token. The harness mirrors those flows and extends verification into the CLI by
+invoking `mcpctl remediation workspaces` subcommands to create a new revision, record gate feedback,
+and complete promotion using the optimistic locking tokens returned by the REST handlers.
 
-1. **Draft creation:** call `mcpctl remediation workspaces create` with manifest-driven plan JSON to
-   persist a workspace and seed revision `1`.
-2. **Revision iteration:** replay harness manifests through
-   `mcpctl remediation workspaces revision create` to simulate operators uploading revised plans,
-   including lineage labels that tie revisions back to chaos manifests.
-3. **Validation and policy feedback:** issue `revision schema` / `revision policy` commands to record
-   gate outcomes, ensuring SSE payloads and REST envelopes surface structured veto reasons.
-4. **Simulation playback:** apply `revision simulate` with diff snapshots from chaos scenarios so the
-   harness can assert sandbox parity before promotion.
-5. **Promotion gates:** finalize flows with `revision promote`, verifying optimistic locking tokens
-   (`--workspace-version`, `--version`) and policy veto propagation.
+During a harness run the workspace fabric validation performs:
 
-The current harness documentation tracks these tasks as open follow-ups; once implemented, expect
-new validation tags (for example `validation:remediation-workspace-draft`) and transcript checks that
-confirm gate context flows from harness manifests through backend envelopes and CLI summaries.
+1. **Draft + revision coverage** via the integration test, asserting version bumps, lineage tags,
+   and revision metadata for `validation:remediation-workspace-draft`.
+2. **Schema and policy gates** recorded through both REST and CLI surfaces, capturing gate context
+   and veto metadata while updating `validation:remediation-workspace-promotion` snapshots.
+3. **Sandbox simulation playback** recorded through `revision simulate`, ensuring diff snapshots and
+   gate context propagate into the persisted audit trail.
+4. **Promotion orchestration** executed twice—once in the SQLx test and once through the CLI—so the
+   harness can confirm optimistic locking enforcement, workspace lifecycle transitions, and CLI JSON
+   envelopes mirror the REST responses (`validation:remediation-workspace-cli`).
+
+The harness manifest now lists all executed validation tags (`validation:remediation_flow`,
+`validation:remediation-concurrency`, `validation:remediation-chaos-matrix`,
+`validation:remediation-workspace-draft`, `validation:remediation-workspace-promotion`, and
+`validation:remediation-workspace-cli`) so dashboards and drift detectors can reason about coverage
+without re-running the suite.
