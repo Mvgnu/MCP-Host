@@ -1469,6 +1469,214 @@ async fn remediation_workspace_promotion_multiple_targets(pool: PgPool) {
     );
 }
 
+// key: validation -> remediation-workspace:pending-refresh
+#[sqlx::test]
+#[ignore = "requires DATABASE_URL with Postgres server"]
+async fn remediation_workspace_promotion_refreshes_pending_run_payload(pool: PgPool) {
+    let harness = bootstrap_remediation_harness(&pool).await;
+    let app = harness.app.clone();
+    let token = harness.token.clone();
+
+    let playbook_payload = json!({
+        "playbook_key": "vm.promotion.refresh",
+        "display_name": "Refresh Pending Promotion Run",
+        "description": "Ensures promotion refresh updates pending runs",
+        "executor_type": "shell",
+        "approval_required": true,
+        "metadata": {"origin": "workspace-refresh"},
+    });
+    create_playbook(&app, &token, playbook_payload).await;
+
+    let workspace_payload = json!({
+        "workspace_key": "workspace.refresh",
+        "display_name": "Workspace Promotion Refresh",
+        "description": "Covers refreshing pending promotion automation payloads",
+        "plan": {
+            "playbooks": ["vm.promotion.refresh"],
+            "targets": [{
+                "runtime_vm_instance_id": harness.vm_instance_id,
+                "playbook": "vm.promotion.refresh",
+                "automation_payload": {"kind": "initial", "attempt": 1},
+            }],
+        },
+        "metadata": {"channel": "refresh"},
+        "lineage_tags": ["validation:remediation-workspace-refresh"],
+        "lineage_labels": ["channel:refresh"],
+    });
+    let workspace = create_workspace(&app, &token, workspace_payload).await;
+    let workspace_id = workspace["workspace"]["id"].as_i64().unwrap();
+    let workspace_version = workspace["workspace"]["version"].as_i64().unwrap();
+    let revision_id = workspace["workspace"]["active_revision_id"]
+        .as_i64()
+        .unwrap();
+    let revision_envelope = select_revision(&workspace, revision_id);
+    let mut revision_version = revision_envelope["revision"]["version"].as_i64().unwrap();
+
+    let schema_envelope = apply_workspace_schema(
+        &app,
+        &token,
+        workspace_id,
+        revision_id,
+        json!({
+            "result_status": "passed",
+            "errors": [],
+            "gate_context": {"stage": "schema"},
+            "metadata": {"validator": "workspace-refresh"},
+            "expected_revision_version": revision_version,
+        }),
+    )
+    .await;
+    let schema_revision = select_revision(&schema_envelope, revision_id);
+    revision_version = schema_revision["revision"]["version"].as_i64().unwrap();
+
+    let policy_expected_workspace_version = workspace_version;
+    let policy_envelope = apply_workspace_policy(
+        &app,
+        &token,
+        workspace_id,
+        revision_id,
+        json!({
+            "policy_status": "approved",
+            "veto_reasons": [],
+            "gate_context": {"stage": "policy"},
+            "metadata": {"ticket": "REFRESH-1"},
+            "expected_workspace_version": policy_expected_workspace_version,
+            "expected_revision_version": revision_version,
+        }),
+    )
+    .await;
+    let policy_workspace_version = policy_envelope["workspace"]["version"].as_i64().unwrap();
+    let policy_revision = select_revision(&policy_envelope, revision_id);
+    revision_version = policy_revision["revision"]["version"].as_i64().unwrap();
+
+    let simulation_expected_workspace_version = policy_workspace_version;
+    let simulation_envelope = apply_workspace_simulation(
+        &app,
+        &token,
+        workspace_id,
+        revision_id,
+        json!({
+            "simulator_kind": "workspace-refresh",
+            "execution_state": "succeeded",
+            "gate_context": {"stage": "simulation"},
+            "metadata": {"diff": "clean"},
+            "expected_workspace_version": simulation_expected_workspace_version,
+            "expected_revision_version": revision_version,
+        }),
+    )
+    .await;
+    let simulation_workspace_version = simulation_envelope["workspace"]["version"]
+        .as_i64()
+        .unwrap();
+    let simulation_revision = select_revision(&simulation_envelope, revision_id);
+    revision_version = simulation_revision["revision"]["version"].as_i64().unwrap();
+
+    let first_gate_context = json!({"lane": "initial", "stage": "promotion"});
+    let promotion_expected_workspace_version = simulation_workspace_version;
+    let first_envelope = apply_workspace_promotion(
+        &app,
+        &token,
+        workspace_id,
+        revision_id,
+        json!({
+            "promotion_status": "approved",
+            "gate_context": first_gate_context,
+            "notes": ["initial"],
+            "expected_workspace_version": promotion_expected_workspace_version,
+            "expected_revision_version": revision_version,
+        }),
+    )
+    .await;
+
+    let first_runs = list_runs_for_instance(&app, &token, harness.vm_instance_id).await;
+    assert_eq!(first_runs.len(), 1, "expected initial promotion run");
+    let first_run = &first_runs[0]["run"];
+    let run_id = first_run["id"].as_i64().unwrap();
+    assert_eq!(
+        first_run["automation_payload"]["attempt"].as_i64(),
+        Some(1),
+        "initial automation payload should be recorded",
+    );
+
+    let first_workspace_version = first_envelope["workspace"]["version"].as_i64().unwrap();
+
+    let refreshed_plan = json!({
+        "playbooks": ["vm.promotion.refresh"],
+        "targets": [{
+            "runtime_vm_instance_id": harness.vm_instance_id,
+            "playbook": "vm.promotion.refresh",
+            "automation_payload": {"kind": "refreshed", "attempt": 2},
+        }],
+    });
+    let refreshed_revision_version: i64 = sqlx::query_scalar(
+        "UPDATE runtime_vm_remediation_workspace_revisions \
+         SET plan = $1, version = version + 1 \
+         WHERE id = $2 RETURNING version",
+    )
+    .bind(refreshed_plan)
+    .bind(revision_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let refreshed_gate_context = json!({"lane": "refresh", "stage": "promotion"});
+    apply_workspace_promotion(
+        &app,
+        &token,
+        workspace_id,
+        revision_id,
+        json!({
+            "promotion_status": "approved",
+            "gate_context": refreshed_gate_context,
+            "notes": ["refreshed"],
+            "expected_workspace_version": first_workspace_version,
+            "expected_revision_version": refreshed_revision_version,
+        }),
+    )
+    .await;
+
+    let refreshed_runs = list_runs_for_instance(&app, &token, harness.vm_instance_id).await;
+    assert_eq!(
+        refreshed_runs.len(),
+        1,
+        "promotion refresh should reuse run"
+    );
+    let refreshed_run = &refreshed_runs[0]["run"];
+    assert_eq!(refreshed_run["id"].as_i64(), Some(run_id));
+    assert_eq!(
+        refreshed_run["automation_payload"]["attempt"].as_i64(),
+        Some(2),
+        "automation payload should reflect refreshed target",
+    );
+    assert_eq!(
+        refreshed_run["automation_payload"]["kind"].as_str(),
+        Some("refreshed"),
+    );
+    assert_eq!(
+        refreshed_run["promotion_gate_context"]["lane"].as_str(),
+        Some("refresh"),
+        "promotion gate context should update during refresh",
+    );
+    assert_eq!(
+        refreshed_run["metadata"]["target"]["automation_payload"]["attempt"].as_i64(),
+        Some(2),
+    );
+
+    let previous_metadata = refreshed_run["metadata"]["previous_metadata"].clone();
+    assert_eq!(
+        previous_metadata["target"]["automation_payload"]["attempt"].as_i64(),
+        Some(1),
+        "previous metadata should capture initial promotion payload",
+    );
+    assert_eq!(
+        refreshed_run["metadata"]["promotion"]["notes"]
+            .as_array()
+            .and_then(|notes| notes.first())
+            .and_then(|value| value.as_str()),
+        Some("refreshed"),
+    );
+}
+
 // key: validation -> remediation-stream:workspace-context
 #[sqlx::test]
 #[ignore = "requires DATABASE_URL with Postgres server"]
@@ -1541,6 +1749,7 @@ async fn remediation_workspace_promotion_stream_includes_workspace_context(pool:
             "veto_reasons": [],
             "gate_context": {"stage": "policy"},
             "metadata": {"ticket": "SSE-1"},
+            "expected_workspace_version": workspace_version,
             "expected_revision_version": revision_version,
         }),
     )

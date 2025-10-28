@@ -358,6 +358,7 @@ async fn update_run_workspace_linkage_merges_json_metadata(pool: PgPool) {
         workspace_id,
         revision_id,
         &gate_context,
+        None,
         Some(&merged_metadata),
     )
     .await

@@ -694,6 +694,7 @@ async fn stage_workspace_promotion_runs(
                         workspace.id,
                         revision.id,
                         gate_context,
+                        automation_payload_value.as_ref(),
                         Some(&merged_metadata),
                     )
                     .await?
