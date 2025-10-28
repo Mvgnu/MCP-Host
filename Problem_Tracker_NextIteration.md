@@ -267,3 +267,10 @@
   Hypothesis: Extending harness manifests with degraded/mixed/policy-veto accelerators, emitting structured `policy_gate` payloads in SSE messages, and teaching the CLI/tests to assert gating hooks will align verification with runtime governance signals.
   Log:
     - 2025-12-02 10:00:00 UTC: Introduced expanded accelerator harness manifest coverage, added `policy_gate` extraction in remediation stream messages, updated CLI rendering/tests, tightened backend SSE assertions, and refreshed README guidance to document the closed-loop gating signals.
+- ID: BE-REMED-WORKSPACE
+  Status: IN_PROGRESS
+  Task: Implement remediation workspace lifecycle fabric.
+  Hypothesis: Introducing workspace schemas, lifecycle APIs, CLI orchestration, and verification coverage will close the remediation policy loop and expose promotion posture to operators.
+  Log:
+    - 2025-12-02 16:00:00 UTC: Initiated remediation workspace lifecycle implementation; auditing existing remediation control plane schema and API surfaces to design workspace normalization.
+    - 2025-12-02 20:30:00 UTC: Added workspace lifecycle migration, SQLx data access layer, REST handlers, CLI surfaces, and documentation updates; recorded follow-up actions for integration tests, harness coverage, and policy gate verification.

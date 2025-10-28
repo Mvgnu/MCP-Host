@@ -93,6 +93,51 @@ Operators should consult the remediation API/CLI roadmap before enabling automat
     and gating reasons in a single feed.
 - **CLI (`mcpctl remediation`):** new subcommands mirror the REST surface (`playbooks list`, `runs list|get|enqueue|approve|artifacts`, `watch`) with JSON output toggles and structured table rendering to simplify operator workflows. The `watch` renderer now surfaces policy feedback, remediation gates, and accelerator posture summaries alongside status transitions so operators see governance context without parsing raw JSON.
 
+### Remediation workspace lifecycle
+
+Migration `0036_remediation_workspace_lifecycle.sql` introduces four normalized tables that capture
+governed remediation drafts and their validation artifacts:
+
+- `runtime_vm_remediation_workspaces` stores high-level metadata (display name, owner, lifecycle
+  state, lineage tags, active revision pointer, optimistic locking version).
+- `runtime_vm_remediation_workspace_revisions` persists each plan iteration with schema/policy/
+  simulation/promotion gate status, lineage labels, validator timestamps, and structured metadata.
+- `runtime_vm_remediation_workspace_sandbox_executions` records sandbox simulations (requested by,
+  simulator kind, diff snapshot, gate context, lifecycle timestamps, execution outcome).
+- `runtime_vm_remediation_workspace_validation_snapshots` captures schema/policy/promotion snapshots
+  with recorded notes so operators have an immutable audit trail across gate evaluations.
+
+The Axum API layers these tables into workspace lifecycle endpoints that parallel the remediation
+run gate metadata already exposed via SSE:
+
+- `GET /api/trust/remediation/workspaces` and `GET /api/trust/remediation/workspaces/:id` return
+  `WorkspaceEnvelope` structures containing the workspace, revision envelopes, gate summaries,
+  sandbox executions, and validation snapshots.
+- `POST /api/trust/remediation/workspaces` creates a draft workspace, seeding revision `1` and
+  activating optimistic locking tokens for subsequent updates.
+- `POST /api/trust/remediation/workspaces/:id/revisions` appends a revision, enforcing the caller's
+  expected workspace version to guard against concurrent edits.
+- `POST /api/trust/remediation/workspaces/:id/revisions/:revision_id/schema` records schema
+  validation output with validator gate context and error vectors.
+- `POST /api/trust/remediation/workspaces/:id/revisions/:revision_id/policy` captures policy
+  feedback/veto metadata and mirrors gate context into validation snapshots.
+- `POST /api/trust/remediation/workspaces/:id/revisions/:revision_id/simulation` persists sandbox
+  orchestration results (including diff snapshots) so operators can replay simulations before
+  promotion.
+- `POST /api/trust/remediation/workspaces/:id/revisions/:revision_id/promotion` applies promotion
+  status and appends audit notes; optimistic locking covers both the workspace and targeted
+  revision.
+
+CLI parity arrives via `mcpctl remediation workspaces` subcommands for listing, retrieving detailed
+gate state, creating drafts, creating revisions (with lineage labels/expected versions), recording
+schema/policy feedback, capturing sandbox simulations, diffing the latest sandbox payload, and
+issuing promotion status updates. Each command accepts `--json` for raw payload emission so harness
+automation and dashboards can consume identical artefacts.
+
+Integration and harness coverage is queued: backend integration tests will exercise the new REST
+surface, while the remediation harness will stitch lifecycle API calls into the existing chaos
+matrix once policy/promotion verification scenarios are finalized.
+
 ### Validation harness (`validation: remediation_flow`)
 
 An end-to-end SQLx integration test (`backend/tests/remediation_flow.rs`) now validates the

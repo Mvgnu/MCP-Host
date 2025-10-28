@@ -152,6 +152,105 @@ def test_governance_start_parses_context() -> None:
     assert payload["context"] == {"initiator": "ops"}
 
 
+def test_remediation_workspace_list_outputs_summary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    envelope = {
+        "workspace": {
+            "id": 5,
+            "workspace_key": "trust-hardening",
+            "lifecycle_state": "draft",
+            "active_revision_id": 12,
+            "version": 2,
+            "owner_id": 7,
+        },
+        "revisions": [
+            {
+                "revision": {
+                    "id": 12,
+                    "revision_number": 3,
+                    "updated_at": "2025-12-02T00:00:00Z",
+                },
+                "gate_summary": {
+                    "schema_status": "succeeded",
+                    "policy_status": "approved",
+                    "simulation_status": "succeeded",
+                    "promotion_status": "pending",
+                    "policy_veto_reasons": [],
+                },
+                "sandbox_executions": [],
+                "validation_snapshots": [],
+            }
+        ],
+    }
+
+    FakeClient.responses[("GET", "/api/trust/remediation/workspaces")] = [envelope]
+
+    cli_module.main(["remediation", "workspaces", "list"])
+    output = capsys.readouterr().out
+    assert "trust-hardening" in output
+    assert "succeeded" in output
+    assert FakeClient.calls[-1] == ("GET", "/api/trust/remediation/workspaces", {})
+
+
+def test_remediation_workspace_revision_diff_json(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    envelope = {
+        "workspace": {
+            "id": 5,
+            "workspace_key": "trust-hardening",
+            "lifecycle_state": "draft",
+            "active_revision_id": 12,
+            "version": 2,
+            "owner_id": 7,
+        },
+        "revisions": [
+            {
+                "revision": {
+                    "id": 12,
+                    "revision_number": 3,
+                    "updated_at": "2025-12-02T00:00:00Z",
+                },
+                "gate_summary": {
+                    "schema_status": "succeeded",
+                    "policy_status": "approved",
+                    "simulation_status": "succeeded",
+                    "promotion_status": "pending",
+                    "policy_veto_reasons": [],
+                },
+                "sandbox_executions": [
+                    {
+                        "id": 90,
+                        "simulator_kind": "staging",
+                        "execution_state": "succeeded",
+                        "diff_snapshot": {"delta": "ok"},
+                    }
+                ],
+                "validation_snapshots": [],
+            }
+        ],
+    }
+
+    FakeClient.responses[("GET", "/api/trust/remediation/workspaces/5")] = envelope
+
+    cli_module.main(
+        [
+            "remediation",
+            "workspaces",
+            "revision",
+            "diff",
+            "5",
+            "12",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["simulator_kind"] == "staging"
+    assert payload["execution_state"] == "succeeded"
+    assert FakeClient.calls[-1] == ("GET", "/api/trust/remediation/workspaces/5", {})
+
+
 def test_policy_intelligence_displays_scores(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

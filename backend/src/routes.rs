@@ -156,6 +156,35 @@ pub fn api_routes() -> Router {
                 .delete(remediation_api::delete_playbook_handler),
         )
         .route(
+            "/api/trust/remediation/workspaces",
+            get(remediation_api::list_workspaces_handler)
+                .post(remediation_api::create_workspace_handler),
+        )
+        .route(
+            "/api/trust/remediation/workspaces/:workspace_id",
+            get(remediation_api::get_workspace_handler),
+        )
+        .route(
+            "/api/trust/remediation/workspaces/:workspace_id/revisions",
+            post(remediation_api::create_workspace_revision_handler),
+        )
+        .route(
+            "/api/trust/remediation/workspaces/:workspace_id/revisions/:revision_id/schema",
+            post(remediation_api::apply_workspace_schema_validation_handler),
+        )
+        .route(
+            "/api/trust/remediation/workspaces/:workspace_id/revisions/:revision_id/policy",
+            post(remediation_api::apply_workspace_policy_feedback_handler),
+        )
+        .route(
+            "/api/trust/remediation/workspaces/:workspace_id/revisions/:revision_id/simulation",
+            post(remediation_api::apply_workspace_simulation_handler),
+        )
+        .route(
+            "/api/trust/remediation/workspaces/:workspace_id/revisions/:revision_id/promotion",
+            post(remediation_api::apply_workspace_promotion_handler),
+        )
+        .route(
             "/api/trust/remediation/runs",
             get(remediation_api::list_runs_handler).post(remediation_api::enqueue_run_handler),
         )
