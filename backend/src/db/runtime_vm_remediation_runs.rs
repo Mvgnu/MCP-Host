@@ -380,6 +380,7 @@ pub async fn update_run_workspace_linkage<'c, E>(
     workspace_id: i64,
     workspace_revision_id: i64,
     promotion_gate_context: &Value,
+    automation_payload: Option<&Value>,
     metadata: Option<&Value>,
 ) -> Result<Option<RuntimeVmRemediationRun>, sqlx::Error>
 where
@@ -392,9 +393,13 @@ where
             workspace_id = $2,
             workspace_revision_id = $3,
             promotion_gate_context = $4,
+            automation_payload = CASE
+                WHEN $5 IS NULL THEN automation_payload
+                ELSE $5::jsonb
+            END,
             metadata = CASE
-                WHEN $5 IS NULL THEN metadata
-                ELSE COALESCE(metadata, '{}'::jsonb) || $5::jsonb
+                WHEN $6 IS NULL THEN metadata
+                ELSE COALESCE(metadata, '{}'::jsonb) || $6::jsonb
             END,
             version = version + 1,
             updated_at = NOW()
@@ -430,6 +435,7 @@ where
     .bind(workspace_id)
     .bind(workspace_revision_id)
     .bind(promotion_gate_context)
+    .bind(automation_payload)
     .bind(metadata)
     .fetch_optional(executor)
     .await?;
