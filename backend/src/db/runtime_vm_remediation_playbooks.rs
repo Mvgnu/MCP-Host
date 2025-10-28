@@ -1,9 +1,10 @@
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use serde_json::Value;
 use sqlx::{Executor, PgPool, Postgres};
 
 // key: remediation-db -> playbook-catalog
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct RuntimeVmRemediationPlaybook {
     pub id: i64,
     pub playbook_key: String,
@@ -17,6 +18,108 @@ pub struct RuntimeVmRemediationPlaybook {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub version: i64,
+}
+
+pub async fn list_playbooks(
+    pool: &PgPool,
+) -> Result<Vec<RuntimeVmRemediationPlaybook>, sqlx::Error> {
+    sqlx::query_as::<_, RuntimeVmRemediationPlaybook>(
+        r#"
+        SELECT
+            id,
+            playbook_key,
+            display_name,
+            description,
+            executor_type,
+            owner_id,
+            approval_required,
+            sla_duration_seconds,
+            metadata,
+            created_at,
+            updated_at,
+            version
+        FROM runtime_vm_remediation_playbooks
+        ORDER BY playbook_key
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub struct CreateRuntimeVmRemediationPlaybook<'a> {
+    pub playbook_key: &'a str,
+    pub display_name: &'a str,
+    pub description: Option<&'a str>,
+    pub executor_type: &'a str,
+    pub owner_id: i32,
+    pub approval_required: bool,
+    pub sla_duration_seconds: Option<i32>,
+    pub metadata: &'a Value,
+}
+
+pub async fn create_playbook<'c, E>(
+    executor: E,
+    input: CreateRuntimeVmRemediationPlaybook<'_>,
+) -> Result<RuntimeVmRemediationPlaybook, sqlx::Error>
+where
+    E: Executor<'c, Database = Postgres>,
+{
+    sqlx::query_as::<_, RuntimeVmRemediationPlaybook>(
+        r#"
+        INSERT INTO runtime_vm_remediation_playbooks (
+            playbook_key,
+            display_name,
+            description,
+            executor_type,
+            owner_id,
+            approval_required,
+            sla_duration_seconds,
+            metadata
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING
+            id,
+            playbook_key,
+            display_name,
+            description,
+            executor_type,
+            owner_id,
+            approval_required,
+            sla_duration_seconds,
+            metadata,
+            created_at,
+            updated_at,
+            version
+        "#,
+    )
+    .bind(input.playbook_key)
+    .bind(input.display_name)
+    .bind(input.description)
+    .bind(input.executor_type)
+    .bind(input.owner_id)
+    .bind(input.approval_required)
+    .bind(input.sla_duration_seconds)
+    .bind(input.metadata)
+    .fetch_one(executor)
+    .await
+}
+
+pub async fn delete_playbook<'c, E>(executor: E, playbook_id: i64) -> Result<bool, sqlx::Error>
+where
+    E: Executor<'c, Database = Postgres>,
+{
+    let deleted = sqlx::query_scalar::<_, i64>(
+        r#"
+        DELETE FROM runtime_vm_remediation_playbooks
+        WHERE id = $1
+        RETURNING id
+        "#,
+    )
+    .bind(playbook_id)
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(deleted.is_some())
 }
 
 pub async fn get_by_key(

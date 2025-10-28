@@ -8,6 +8,9 @@ use sqlx::{PgPool, Row};
 use crate::db::runtime_vm_attestations::{
     insert_attestation, NewRuntimeVmAttestation, RuntimeVmAttestationRecord,
 };
+use crate::db::runtime_vm_remediation_runs::{
+    get_active_run_for_instance, RuntimeVmRemediationRun,
+};
 use crate::db::runtime_vm_trust_history::{
     insert_trust_event, NewRuntimeVmTrustEvent, RuntimeVmTrustEvent,
 };
@@ -15,6 +18,7 @@ use crate::db::runtime_vm_trust_registry::{
     get_state as get_registry_state, upsert_state as upsert_registry_state,
     UpsertRuntimeVmTrustRegistryState,
 };
+use crate::remediation::{RemediationFailureClassification, RemediationFailureReason};
 use crate::runtime::vm::attestation::{AttestationOutcome, AttestationStatus};
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,6 +60,20 @@ impl TrustPlacementGate {
             "pending-remediation"
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct RemediationFailureSummary {
+    reason: RemediationFailureReason,
+    classification: RemediationFailureClassification,
+    completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+struct RemediationGateContext {
+    active_run: Option<RuntimeVmRemediationRun>,
+    awaiting_approval: bool,
+    last_failure: Option<RemediationFailureSummary>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,6 +393,47 @@ pub async fn evaluate_placement_gate(
         notes.push(format!("trust:provenance:{provenance}"));
     }
 
+    if let Some(context) = remediation_gate_for_instance(pool, vm_instance_id).await? {
+        if let Some(active_run) = context.active_run.as_ref() {
+            blocked = true;
+            let status = active_run.status.as_str();
+            notes.push(format!(
+                "policy_hook:remediation_gate=active-run:{}:{}",
+                active_run.id, status
+            ));
+            if context.awaiting_approval {
+                notes.push(format!("remediation:awaiting-approval:{}", active_run.id));
+            }
+        } else if context.awaiting_approval {
+            blocked = true;
+            notes.push("policy_hook:remediation_gate=awaiting-approval".to_string());
+        }
+
+        if let Some(summary) = context.last_failure {
+            let classification = summary.classification.as_str();
+            notes.push(format!(
+                "policy_hook:remediation_gate=failure:{}:{}",
+                summary.reason.as_str(),
+                classification
+            ));
+            if let Some(timestamp) = summary.completed_at {
+                notes.push(format!(
+                    "remediation:last-failure-at:{}:{}",
+                    summary.reason.as_str(),
+                    timestamp.to_rfc3339()
+                ));
+            }
+
+            match summary.classification {
+                RemediationFailureClassification::Structural
+                | RemediationFailureClassification::Transient => {
+                    blocked = true;
+                }
+                RemediationFailureClassification::Cancelled => {}
+            }
+        }
+    }
+
     Ok(Some(TrustPlacementGate {
         vm_instance_id,
         attestation_status,
@@ -395,6 +454,72 @@ pub fn remediation_notes_for_status(status: AttestationStatus) -> Vec<String> {
         AttestationStatus::Unknown => vec!["remediation:monitor".to_string()],
         AttestationStatus::Untrusted => vec!["remediation:investigate".to_string()],
     }
+}
+
+// policy_hook: remediation_gate -> placement veto enrichment
+async fn remediation_gate_for_instance(
+    pool: &PgPool,
+    vm_instance_id: i64,
+) -> Result<Option<RemediationGateContext>, sqlx::Error> {
+    let active_run = get_active_run_for_instance(pool, vm_instance_id).await?;
+    let awaiting_approval = active_run
+        .as_ref()
+        .map(|run| run.approval_required && run.approval_state == "pending")
+        .unwrap_or(false);
+
+    let row = sqlx::query(
+        r#"
+        SELECT
+            id,
+            status,
+            failure_reason,
+            completed_at
+        FROM runtime_vm_remediation_runs
+        WHERE runtime_vm_instance_id = $1
+        ORDER BY started_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(vm_instance_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let last_failure = row.and_then(|row| {
+        let status: String = row.get("status");
+        let completed_at: Option<DateTime<Utc>> = row.try_get("completed_at").unwrap_or(None);
+        match status.as_str() {
+            "failed" => {
+                let reason = row
+                    .try_get::<Option<String>, _>("failure_reason")
+                    .unwrap_or(None)
+                    .and_then(|value| RemediationFailureReason::parse(value.as_str()));
+                reason.map(|reason| RemediationFailureSummary {
+                    classification: reason.classification(),
+                    reason,
+                    completed_at,
+                })
+            }
+            "cancelled" => {
+                let reason = RemediationFailureReason::Cancelled;
+                Some(RemediationFailureSummary {
+                    classification: reason.classification(),
+                    reason,
+                    completed_at,
+                })
+            }
+            _ => None,
+        }
+    });
+
+    if active_run.is_none() && !awaiting_approval && last_failure.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(RemediationGateContext {
+        active_run,
+        awaiting_approval,
+        last_failure,
+    }))
 }
 
 fn lifecycle_for_attestation(

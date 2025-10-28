@@ -5,8 +5,8 @@ use axum::{
 
 use crate::{
     auth, capabilities, domains, evaluation, file_store, governance, ingestion, intelligence,
-    invocations, marketplace, organizations, policy, promotions, secrets, servers, services, trust,
-    vector_dbs, workflows,
+    invocations, marketplace, organizations, policy, promotions, remediation_api, secrets, servers,
+    services, trust, vector_dbs, workflows,
 };
 
 pub fn api_routes() -> Router {
@@ -144,6 +144,36 @@ pub fn api_routes() -> Router {
         .route(
             "/api/trust/registry/:instance_id/transition",
             post(trust::transition_registry_state),
+        )
+        .route(
+            "/api/trust/remediation/playbooks",
+            get(remediation_api::list_all_playbooks).post(remediation_api::create_playbook_handler),
+        )
+        .route(
+            "/api/trust/remediation/playbooks/:playbook_id",
+            get(remediation_api::get_playbook_handler)
+                .patch(remediation_api::update_playbook_handler)
+                .delete(remediation_api::delete_playbook_handler),
+        )
+        .route(
+            "/api/trust/remediation/runs",
+            get(remediation_api::list_runs_handler).post(remediation_api::enqueue_run_handler),
+        )
+        .route(
+            "/api/trust/remediation/runs/:run_id",
+            get(remediation_api::get_run_handler),
+        )
+        .route(
+            "/api/trust/remediation/runs/:run_id/approval",
+            post(remediation_api::update_approval_handler),
+        )
+        .route(
+            "/api/trust/remediation/runs/:run_id/artifacts",
+            get(remediation_api::list_artifacts_handler),
+        )
+        .route(
+            "/api/trust/remediation/stream",
+            get(remediation_api::stream_remediation_events),
         )
         .route("/api/policy/stream", get(policy::stream_policy_events))
         .merge(governance::routes())

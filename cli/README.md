@@ -51,6 +51,15 @@ Lists marketplace artifacts and their active status. Pass `--json` to receive ra
 * `mcpctl trust transition VM_INSTANCE_ID --status STATUS --lifecycle STATE [options]` – submit a guarded lifecycle transition. Supply `--expected-version` to honour optimistic locking tokens.
 * `mcpctl trust watch [--server-id ID] [--lifecycle STATE] [--status STATUS]` – stream live trust registry transitions via SSE.
 
+### Remediation control plane
+
+* `mcpctl remediation playbooks list` – enumerate remediation playbooks, their executor types, and approval/SLA metadata.
+* `mcpctl remediation runs list [--instance-id ID] [--status STATUS]` – inspect remediation runs across instances.
+* `mcpctl remediation runs enqueue INSTANCE_ID PLAYBOOK [--metadata JSON] [--payload JSON] [--owner USER_ID]` – queue a remediation attempt using the catalogued playbook.
+* `mcpctl remediation runs approve RUN_ID --state approved|rejected --version VERSION [--notes TEXT]` – record an approval decision using optimistic locking tokens.
+* `mcpctl remediation runs artifacts RUN_ID` – list persisted remediation artifacts (logs, evidence bundles).
+* `mcpctl remediation watch [--run-id RUN_ID]` – stream remediation log and status events via SSE.
+
 ### Scaffolding helpers
 
 The legacy scaffolding commands remain available under the `scaffold` group:

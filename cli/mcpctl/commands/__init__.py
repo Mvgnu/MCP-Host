@@ -12,6 +12,7 @@ import sys
 from ..client import APIClient
 from ..renderers import dumps_json, render_table
 from . import evaluations as evaluations_commands
+from . import remediation as remediation_commands
 
 _RESET = "\033[0m"
 _GREEN = "\033[32m"
@@ -127,6 +128,10 @@ def install_trust(subparsers: _SubParsersAction[ArgumentParser]) -> None:
     watch_parser.add_argument("--status", dest="attestation_status")
     watch_parser.set_defaults(handler=_trust_watch)
     _add_common_arguments(watch_parser)
+
+
+def install_remediation(subparsers: _SubParsersAction[ArgumentParser]) -> None:
+    remediation_commands.install(subparsers, _add_common_arguments)
 
 
 def install_promotions(subparsers: _SubParsersAction[ArgumentParser]) -> None:

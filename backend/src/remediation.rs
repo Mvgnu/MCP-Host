@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::{PgPool, Postgres, Transaction};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -30,6 +31,18 @@ use crate::trust::{subscribe_registry_events, TrustRegistryEvent};
 
 const DEFAULT_PLAYBOOK: &str = "default-vm-remediation";
 const REMEDIATION_STREAM_BUFFER: usize = 64;
+const REMEDIATION_BROADCAST_BUFFER: usize = 128;
+
+// key: remediation_surface -> stream-channel
+static REMEDIATION_EVENT_CHANNEL: Lazy<broadcast::Sender<RemediationStreamMessage>> =
+    Lazy::new(|| {
+        let (tx, _rx) = broadcast::channel(REMEDIATION_BROADCAST_BUFFER);
+        tx
+    });
+
+pub fn subscribe_remediation_events() -> broadcast::Receiver<RemediationStreamMessage> {
+    REMEDIATION_EVENT_CHANNEL.subscribe()
+}
 
 // key: remediation-orchestrator -> execution-engine
 pub fn spawn(pool: PgPool) {
@@ -184,67 +197,91 @@ async fn execute_run(
             let mut collected_logs = Vec::new();
             while let Some(event) = log_rx.recv().await {
                 collected_logs.push(event.clone());
+                broadcast_log(&run, &event);
             }
 
             match completion.await {
                 Ok(Ok(status)) if status.code == 0 => {
-                    if let Err(err) = finalize_success(&pool, run, collected_logs, status).await {
+                    let message = status.message.clone();
+                    if let Err(err) =
+                        finalize_success(&pool, run.clone(), collected_logs, status).await
+                    {
                         error!(?err, "failed to persist remediation success");
+                    } else {
+                        broadcast_status(&run, "completed", None, message);
                     }
                 }
                 Ok(Ok(status)) => {
                     let reason = status
                         .failure_reason
                         .unwrap_or(RemediationFailureReason::ExecutionFailure);
+                    let message = status
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "remediation executor returned non-zero exit".into());
                     if let Err(err) = finalize_failure(
                         &pool,
-                        run,
+                        run.clone(),
                         reason,
-                        status.message.unwrap_or_else(|| {
-                            "remediation executor returned non-zero exit".into()
-                        }),
+                        message.clone(),
                         Some(collected_logs),
                     )
                     .await
                     {
                         error!(?err, "failed to persist remediation failure");
+                    } else {
+                        broadcast_status(&run, "failed", Some(reason), Some(message));
                     }
                 }
                 Ok(Err(err)) => {
                     let failure_reason = err.failure_reason();
+                    let message = err.to_string();
                     if let Err(inner) = finalize_failure(
                         &pool,
-                        run,
+                        run.clone(),
                         failure_reason,
-                        err.to_string(),
+                        message.clone(),
                         Some(collected_logs),
                     )
                     .await
                     {
                         error!(?inner, "failed to persist remediation error outcome");
+                    } else {
+                        broadcast_status(&run, "failed", Some(failure_reason), Some(message));
                     }
                 }
                 Err(join_err) => {
+                    let message = join_err.to_string();
                     if let Err(inner) = finalize_failure(
                         &pool,
-                        run,
+                        run.clone(),
                         RemediationFailureReason::TransientInfrastructure,
-                        join_err.to_string(),
+                        message.clone(),
                         Some(collected_logs),
                     )
                     .await
                     {
                         error!(?inner, "failed to persist remediation join failure");
+                    } else {
+                        broadcast_status(
+                            &run,
+                            "failed",
+                            Some(RemediationFailureReason::TransientInfrastructure),
+                            Some(message),
+                        );
                     }
                 }
             }
         }
         Err(err) => {
             let failure_reason = err.failure_reason();
+            let message = err.to_string();
             if let Err(inner) =
-                finalize_failure(&pool, run, failure_reason, err.to_string(), None).await
+                finalize_failure(&pool, run.clone(), failure_reason, message.clone(), None).await
             {
                 error!(?inner, "failed to persist remediation spawn error");
+            } else {
+                broadcast_status(&run, "failed", Some(failure_reason), Some(message));
             }
         }
     }
@@ -464,9 +501,11 @@ async fn finalize_failure(
                 RemediationFailureReason::Cancelled => "remediation:automation-cancelled",
                 RemediationFailureReason::ExecutorUnavailable => "remediation:executor-unavailable",
                 RemediationFailureReason::ExecutionFailure => "remediation:automation-failed",
-                RemediationFailureReason::TransientInfrastructure => {
-                    "remediation:transient-failure"
-                }
+                RemediationFailureReason::TransientInfrastructure
+                | RemediationFailureReason::DependencyUnavailable
+                | RemediationFailureReason::Timeout => "remediation:transient-failure",
+                RemediationFailureReason::PolicyDenied => "remediation:policy-denied",
+                RemediationFailureReason::PlaybookBug => "remediation:playbook-bug",
             },
         )
         .await?;
@@ -509,6 +548,7 @@ pub struct RemediationExecutionRequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RemediationLogStream {
     Stdout,
     Stderr,
@@ -520,6 +560,66 @@ pub struct RemediationLogEvent {
     pub timestamp: DateTime<Utc>,
     pub stream: RemediationLogStream,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum RemediationStreamEvent {
+    Log {
+        timestamp: DateTime<Utc>,
+        stream: RemediationLogStream,
+        message: String,
+    },
+    Status {
+        status: String,
+        failure_reason: Option<String>,
+        message: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RemediationStreamMessage {
+    pub run_id: i64,
+    pub instance_id: i64,
+    pub playbook: String,
+    pub event: RemediationStreamEvent,
+}
+
+fn broadcast_event(run: &RuntimeVmRemediationRun, event: RemediationStreamEvent) {
+    let message = RemediationStreamMessage {
+        run_id: run.id,
+        instance_id: run.runtime_vm_instance_id,
+        playbook: run.playbook.clone(),
+        event,
+    };
+    let _ = REMEDIATION_EVENT_CHANNEL.send(message);
+}
+
+fn broadcast_log(run: &RuntimeVmRemediationRun, entry: &RemediationLogEvent) {
+    broadcast_event(
+        run,
+        RemediationStreamEvent::Log {
+            timestamp: entry.timestamp,
+            stream: entry.stream.clone(),
+            message: entry.message.clone(),
+        },
+    );
+}
+
+fn broadcast_status(
+    run: &RuntimeVmRemediationRun,
+    status: &str,
+    failure_reason: Option<RemediationFailureReason>,
+    message: Option<String>,
+) {
+    broadcast_event(
+        run,
+        RemediationStreamEvent::Status {
+            status: status.to_string(),
+            failure_reason: failure_reason.map(|reason| reason.as_str().to_string()),
+            message,
+        },
+    );
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -535,6 +635,27 @@ pub enum RemediationFailureReason {
     TransientInfrastructure,
     Cancelled,
     ExecutorUnavailable,
+    PolicyDenied,
+    PlaybookBug,
+    DependencyUnavailable,
+    Timeout,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum RemediationFailureClassification {
+    Structural,
+    Transient,
+    Cancelled,
+}
+
+impl RemediationFailureClassification {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RemediationFailureClassification::Structural => "structural",
+            RemediationFailureClassification::Transient => "transient",
+            RemediationFailureClassification::Cancelled => "cancelled",
+        }
+    }
 }
 
 impl RemediationFailureReason {
@@ -544,6 +665,39 @@ impl RemediationFailureReason {
             RemediationFailureReason::TransientInfrastructure => "transient-infrastructure",
             RemediationFailureReason::Cancelled => "cancelled",
             RemediationFailureReason::ExecutorUnavailable => "executor-unavailable",
+            RemediationFailureReason::PolicyDenied => "policy-denied",
+            RemediationFailureReason::PlaybookBug => "playbook-bug",
+            RemediationFailureReason::DependencyUnavailable => "dependency-unavailable",
+            RemediationFailureReason::Timeout => "timeout",
+        }
+    }
+
+    pub fn classification(&self) -> RemediationFailureClassification {
+        match self {
+            RemediationFailureReason::ExecutionFailure
+            | RemediationFailureReason::PolicyDenied
+            | RemediationFailureReason::PlaybookBug => RemediationFailureClassification::Structural,
+            RemediationFailureReason::TransientInfrastructure
+            | RemediationFailureReason::ExecutorUnavailable
+            | RemediationFailureReason::DependencyUnavailable
+            | RemediationFailureReason::Timeout => RemediationFailureClassification::Transient,
+            RemediationFailureReason::Cancelled => RemediationFailureClassification::Cancelled,
+        }
+    }
+}
+
+impl RemediationFailureReason {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "execution-failure" => Some(RemediationFailureReason::ExecutionFailure),
+            "transient-infrastructure" => Some(RemediationFailureReason::TransientInfrastructure),
+            "cancelled" => Some(RemediationFailureReason::Cancelled),
+            "executor-unavailable" => Some(RemediationFailureReason::ExecutorUnavailable),
+            "policy-denied" => Some(RemediationFailureReason::PolicyDenied),
+            "playbook-bug" => Some(RemediationFailureReason::PlaybookBug),
+            "dependency-unavailable" => Some(RemediationFailureReason::DependencyUnavailable),
+            "timeout" => Some(RemediationFailureReason::Timeout),
+            _ => None,
         }
     }
 }

@@ -35,9 +35,9 @@ The VM runtime now persists posture transitions in a dedicated `runtime_vm_trust
 
 Key integration points:
 
-- **Scheduler:** `evaluations::scheduler` now promotes distrusted instances into the `remediating` lifecycle state while cancelling refresh jobs, preserving fallback timestamps, and keeping optimistic registry versions in sync. Trusted states resume the cadence automatically when restored.
+- **Scheduler:** `evaluations::scheduler` now promotes distrusted instances into the `remediating` lifecycle state while cancelling refresh jobs, preserving fallback timestamps, and keeping optimistic registry versions in sync. Trusted states resume the cadence automatically when restored. The refresh loop also reuses the placement gate (see below) so certification jobs respect `policy_hook:remediation_gate=*` vetoes before dispatching new work.
 - **Trust notifications:** `trust::spawn_trust_listener` subscribes to the `runtime_vm_trust_transition` channel, recalculates evaluation plans in real time, forwards lifecycle/provenance metadata to SSE clients, and triggers intelligence recomputes whenever posture changes arrive from Postgres.
-- **Policy engine:** placement decisions hydrate the latest trust event via `runtime_vm_trust_history`, emit `vm:trust-*` notes for lifecycle, remediation counts, and provenance, and rely on registry snapshots when determining backend overrides.
+- **Policy engine:** placement decisions hydrate the latest trust event via `runtime_vm_trust_history`, emit `vm:trust-*` notes for lifecycle, remediation counts, and provenance, and rely on registry snapshots when determining backend overrides. The remediation-aware placement gate annotates notes such as `policy_hook:remediation_gate=active-run:*` and classifies failures as `structural`, `transient`, or `cancelled` so downstream schedulers and operators have unambiguous veto reasons.
 - **Runtime orchestrator:** placement launches now consult `runtime_vm_trust_registry` and block deployments when lifecycles are `quarantined` or remediation windows are stale, flipping servers into `pending-remediation`/`pending-attestation` until evidence is refreshed.
 - **Operator tooling:** `/api/servers/:id/vm`, `/api/evaluations`, and the CLI now expose lifecycle badges, remediation attempt counts, freshness deadlines, and provenance references so consoles can highlight blocked evidence and remediation activity without manual SQL queries.
 - **Intelligence scoring:** scoring logic folds lifecycle state, remediation attempts, freshness deadlines, and provenance hints into capability notes and evidence payloads. Servers with degraded posture incur score penalties proportional to remediation churn and stale evidence windows.
@@ -65,8 +65,19 @@ Remediation is now a first-class control plane built on top of three persistent 
 
 The orchestrator (`backend/src/remediation.rs`) wires these tables into a stateful execution engine:
 
-- `RemediationExecutor` is a pluggable trait with default shell, Ansible, and cloud API adapters. Each executor streams `RemediationLogEvent` structures (stdout/stderr/system), supports cancellation tokens, and returns structured `RemediationExitStatus` values annotated with a `RemediationFailureReason`.
+- `RemediationExecutor` is a pluggable trait with default shell, Ansible, and cloud API adapters. Each executor streams `RemediationLogEvent` structures (stdout/stderr/system), supports cancellation tokens, and returns structured `RemediationExitStatus` values annotated with a `RemediationFailureReason`. The failure taxonomy now differentiates policy denials, playbook bugs, dependency outages, timeouts, executor availability issues, and other transient vs. structural causes so policy consumers can respond accordingly.
 - A queue worker (`dispatch_next_run`) dequeues approved `runtime_vm_remediation_runs`, flips the trust registry into `remediation:automation-running`, and launches executors asynchronously. Execution results checkpoint run status, persist logs as artifacts, and write typed remediation states (`automation-complete`, `automation-failed`, `transient-failure`, etc.) back into `runtime_vm_trust_registry` using optimistic locking.
 - The quarantine event listener now materializes playbook-backed runs with provenance metadata, owner assignment, and SLA deadlines, distinguishing between approval-gated and automation-ready lifecycles.
 
 Operators should consult the remediation API/CLI roadmap before enabling automated playbooks in production. The data contracts documented above are considered stable for downstream integrations, and telemetry should consume the high-signal log artifacts rather than raw executor stdout.
+
+### Remediation API & CLI Surfaces
+
+- **REST:**
+  - `GET/POST /api/trust/remediation/playbooks` for catalog listing and creation with optimistic locking metadata (`remediation_surface: playbook-catalog`).
+  - `GET/PATCH/DELETE /api/trust/remediation/playbooks/:id` for retrieval, edits, and cleanup guarded by the `version` token.
+  - `GET/POST /api/trust/remediation/runs` to inspect lifecycle state and enqueue automation (400 on unknown playbooks, 409 on active runs).
+  - `GET /api/trust/remediation/runs/:id` and `POST /api/trust/remediation/runs/:id/approval` to drive approval workflows and examine run metadata.
+  - `GET /api/trust/remediation/runs/:id/artifacts` to fetch structured evidence bundles.
+  - `GET /api/trust/remediation/stream` for SSE log/status streaming filtered by `run_id`.
+- **CLI (`mcpctl remediation`):** new subcommands mirror the REST surface (`playbooks list`, `runs list|get|enqueue|approve|artifacts`, `watch`) with JSON output toggles and structured table rendering to simplify operator workflows.

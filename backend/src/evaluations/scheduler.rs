@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Utc};
@@ -11,6 +12,7 @@ use crate::db::runtime_vm_trust_registry::{
     UpsertRuntimeVmTrustRegistryState,
 };
 use crate::job_queue::{enqueue_job, Job};
+use crate::policy::trust::{evaluate_placement_gate, TrustPlacementGate};
 
 const SCAN_INTERVAL_SECS: u64 = 60;
 const LOOKAHEAD_MINUTES: i64 = 60;
@@ -92,7 +94,8 @@ pub async fn handle_trust_transition(
                 let attempts: i32 = row.try_get("remediation_attempts").unwrap_or(0);
                 let fallback_launched_at: Option<DateTime<Utc>> =
                     row.try_get("fallback_launched_at").unwrap_or(None);
-                record_trust_block(pool, certification_id, attempts, fallback_launched_at).await?;
+                record_trust_block(pool, certification_id, attempts, fallback_launched_at, None)
+                    .await?;
                 certification_ids.push(certification_id);
             }
 
@@ -162,12 +165,18 @@ async fn ensure_remediation_lifecycle(
 async fn scan_and_schedule(pool: &PgPool, job_tx: &Sender<Job>) -> Result<(), sqlx::Error> {
     let rows = sqlx::query(
         r#"
-        SELECT id, last_attestation_status, fallback_launched_at, remediation_attempts
-        FROM evaluation_certifications
-        WHERE next_refresh_at IS NOT NULL
-          AND next_refresh_at <= NOW() + make_interval(mins => $1::double precision)
-          AND status <> 'pending'
-        ORDER BY next_refresh_at ASC
+        SELECT
+            ec.id,
+            ec.last_attestation_status,
+            ec.fallback_launched_at,
+            ec.remediation_attempts,
+            bar.server_id
+        FROM evaluation_certifications ec
+        JOIN build_artifact_runs bar ON ec.build_artifact_run_id = bar.id
+        WHERE ec.next_refresh_at IS NOT NULL
+          AND ec.next_refresh_at <= NOW() + make_interval(mins => $1::double precision)
+          AND ec.status <> 'pending'
+        ORDER BY ec.next_refresh_at ASC
         LIMIT $2
         "#,
     )
@@ -176,22 +185,57 @@ async fn scan_and_schedule(pool: &PgPool, job_tx: &Sender<Job>) -> Result<(), sq
     .fetch_all(pool)
     .await?;
 
+    let mut placement_cache: HashMap<i32, Option<TrustPlacementGate>> = HashMap::new();
+
     for row in rows {
         let certification_id: i32 = row.get("id");
         let last_attestation_status: Option<String> =
             row.try_get("last_attestation_status").unwrap_or(None);
+        let fallback_launched_at: Option<DateTime<Utc>> =
+            row.try_get("fallback_launched_at").unwrap_or(None);
+        let remediation_attempts: i32 = row.try_get("remediation_attempts").unwrap_or(0);
+        let server_id: i32 = row.get("server_id");
+
         if matches!(last_attestation_status.as_deref(), Some("untrusted")) {
-            let fallback_launched_at: Option<DateTime<Utc>> =
-                row.try_get("fallback_launched_at").unwrap_or(None);
             record_trust_block(
                 pool,
                 certification_id,
-                row.try_get("remediation_attempts").unwrap_or(0),
+                remediation_attempts,
                 fallback_launched_at,
+                Some("trust:attestation:untrusted"),
             )
             .await?;
             continue;
         }
+
+        let gate = if let Some(existing) = placement_cache.get(&server_id) {
+            existing.clone()
+        } else {
+            let gate = evaluate_placement_gate(pool, server_id).await?;
+            placement_cache.insert(server_id, gate.clone());
+            gate
+        };
+
+        if let Some(ref gate) = gate {
+            if gate.blocked {
+                let reason = gate
+                    .notes
+                    .iter()
+                    .find(|note| note.starts_with("policy_hook:remediation_gate"))
+                    .cloned()
+                    .unwrap_or_else(|| gate.blocked_status().to_string());
+                record_trust_block(
+                    pool,
+                    certification_id,
+                    remediation_attempts,
+                    fallback_launched_at,
+                    Some(&reason),
+                )
+                .await?;
+                continue;
+            }
+        }
+
         schedule_refresh(pool, job_tx, certification_id).await?;
     }
 
@@ -267,12 +311,17 @@ pub(crate) async fn record_trust_block(
     certification_id: i32,
     attempts: i32,
     fallback_launched_at: Option<DateTime<Utc>>,
+    reason: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    let note = format!(
+    let mut note = format!(
         "{} trust block maintained after {} remediation attempts",
         Utc::now().to_rfc3339(),
         attempts
     );
+    if let Some(reason) = reason {
+        note.push_str(" | policy_hook:remediation_gate=");
+        note.push_str(reason);
+    }
     sqlx::query(
         r#"
         UPDATE evaluation_certifications

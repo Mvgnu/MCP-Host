@@ -2,6 +2,7 @@ pub mod db;
 pub mod error;
 pub mod intelligence;
 pub mod policy;
+pub mod remediation;
 pub mod runtime;
 pub mod telemetry;
 pub mod trust;
