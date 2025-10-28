@@ -7,8 +7,18 @@ scenarios:
     tenants:
       - accelerator-lab
     metadata:
+      scenario_case: quarantined-single
       policy_feedback:
-        - policy_hook:accelerator_gate=awaiting-attestation
+        - policy_hook:remediation_gate=accelerator-awaiting-attestation
+      policy_gate:
+        remediation_hooks:
+          - policy_hook:remediation_gate=accelerator-awaiting-attestation
+        accelerator_gates:
+          - accelerator_id: accel-lab-01
+            hooks:
+              - policy_hook:accelerator_gate=awaiting-attestation
+            reasons:
+              - "accelerator attestation required before remediation"
       accelerators:
         - id: accel-lab-01
           kind: nvidia-h100
@@ -19,3 +29,112 @@ scenarios:
           metadata:
             origin: accelerator-posture-fixture
             remediation_hint: reseat-nvlink
+            gating_reasons:
+              - "attestation still pending"
+              - "policy veto requires remediation gate"
+  - name: accelerator-posture-degraded
+    tag: validation:accelerator-degraded
+    kind: executor-outage-resumption
+    tenants:
+      - accelerator-lab
+    metadata:
+      scenario_case: degraded
+      policy_feedback:
+        - policy_hook:remediation_gate=accelerator-degraded-health
+      policy_gate:
+        remediation_hooks:
+          - policy_hook:remediation_gate=accelerator-degraded-health
+        accelerator_gates:
+          - accelerator_id: accel-lab-02
+            hooks:
+              - policy_hook:accelerator_gate=degraded-health
+            reasons:
+              - "temperature excursions detected"
+              - "awaiting cooling remediation"
+      accelerators:
+        - id: accel-lab-02
+          kind: nvidia-h100
+          posture: degraded
+          policy_feedback:
+            - accelerator:thermal-unstable
+            - accelerator:requires-maintenance
+          metadata:
+            origin: accelerator-posture-fixture
+            remediation_hint: flush-liquid-cooling
+            gating_reasons:
+              - "sensor threshold breach"
+  - name: accelerator-posture-mixed
+    tag: validation:accelerator-mixed
+    kind: executor-outage-resumption
+    tenants:
+      - accelerator-lab
+    metadata:
+      scenario_case: mixed
+      policy_feedback:
+        - policy_hook:remediation_gate=accelerator-partial-block
+      policy_gate:
+        remediation_hooks:
+          - policy_hook:remediation_gate=accelerator-partial-block
+        accelerator_gates:
+          - accelerator_id: accel-lab-03
+            hooks:
+              - policy_hook:accelerator_gate=awaiting-attestation
+            reasons:
+              - "attestation expired"
+          - accelerator_id: accel-lab-04
+            hooks:
+              - policy_hook:accelerator_gate=healthy
+            reasons: []
+      accelerators:
+        - id: accel-lab-03
+          kind: nvidia-h100
+          posture: quarantined
+          policy_feedback:
+            - accelerator:requires-attestation
+          metadata:
+            origin: accelerator-posture-fixture
+            remediation_hint: rerun-attestation
+            gating_reasons:
+              - "attestation token expired"
+        - id: accel-lab-04
+          kind: nvidia-h100
+          posture: attested
+          policy_feedback: []
+          metadata:
+            origin: accelerator-posture-fixture
+            remediation_hint: none
+            gating_reasons: []
+  - name: accelerator-policy-veto
+    tag: validation:accelerator-policy-veto
+    kind: executor-outage-resumption
+    tenants:
+      - accelerator-governance
+    metadata:
+      scenario_case: policy-veto
+      policy_feedback:
+        - policy_hook:remediation_gate=policy-veto
+        - policy_hook:remediation_gate=intelligence-block
+      policy_gate:
+        remediation_hooks:
+          - policy_hook:remediation_gate=policy-veto
+          - policy_hook:remediation_gate=intelligence-block
+        accelerator_gates:
+          - accelerator_id: accel-gov-01
+            hooks:
+              - policy_hook:accelerator_gate=vetoed
+              - policy_hook:intelligence_gate=anomaly-detected
+            reasons:
+              - "intelligence anomaly flagged recent remediation failure streak"
+              - "policy requires manual override"
+      accelerators:
+        - id: accel-gov-01
+          kind: nvidia-l40
+          posture: quarantined
+          policy_feedback:
+            - accelerator:intelligence-anomaly
+            - accelerator:requires-manual-approval
+          metadata:
+            origin: accelerator-posture-fixture
+            remediation_hint: manual-inspection
+            gating_reasons:
+              - "policy veto triggered by governance"

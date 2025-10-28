@@ -1513,9 +1513,58 @@ async fn remediation_stream_includes_policy_feedback(pool: PgPool) {
         .and_then(|value| value.as_array())
         .cloned()
         .unwrap_or_default();
-    assert!(policy_feedback
+    assert!(policy_feedback.iter().any(|entry| entry.as_str()
+        == Some("policy_hook:remediation_gate=accelerator-awaiting-attestation")));
+
+    let policy_gate = status_event
+        .get("policy_gate")
+        .and_then(|value| value.as_object())
+        .expect("policy gate should be present");
+    let remediation_hooks = policy_gate
+        .get("remediation_hooks")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(remediation_hooks.iter().any(|entry| {
+        entry
+            .as_str()
+            .map(|value| value == "policy_hook:remediation_gate=accelerator-awaiting-attestation")
+            .unwrap_or(false)
+    }));
+
+    let accelerator_gates = policy_gate
+        .get("accelerator_gates")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let gate_entry = accelerator_gates
         .iter()
-        .any(|entry| entry.as_str() == Some("policy_hook:accelerator_gate=awaiting-attestation")));
+        .find(|entry| {
+            entry.get("accelerator_id").and_then(|value| value.as_str()) == Some("accel-lab-01")
+        })
+        .expect("accelerator gate expected");
+    let gate_hooks = gate_entry
+        .get("hooks")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(gate_hooks.iter().any(|entry| {
+        entry
+            .as_str()
+            .map(|value| value == "policy_hook:accelerator_gate=awaiting-attestation")
+            .unwrap_or(false)
+    }));
+    let gate_reasons = gate_entry
+        .get("reasons")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(gate_reasons.iter().any(|entry| {
+        entry
+            .as_str()
+            .map(|value| value.contains("attestation"))
+            .unwrap_or(false)
+    }));
 
     let accelerators = status_event
         .get("accelerators")
@@ -1533,6 +1582,196 @@ async fn remediation_stream_includes_policy_feedback(pool: PgPool) {
                 feedback
                     .iter()
                     .any(|item| item.as_str() == Some("accelerator:pending-remediation"))
+            })
+            .unwrap_or(false)
+    }));
+}
+
+// key: validation -> remediation-stream:policy-veto-gates
+#[sqlx::test]
+#[ignore = "requires DATABASE_URL with Postgres server"]
+async fn remediation_stream_exposes_policy_veto_gates(pool: PgPool) {
+    let harness = bootstrap_remediation_harness(&pool).await;
+    let manifest_root = resolve_manifest_root();
+    let executions = load_manifest_directory(&manifest_root)
+        .with_context(|| format!("loading scenarios from {}", manifest_root.display()))
+        .unwrap();
+
+    let policy_veto_execution = executions
+        .into_iter()
+        .find(|execution| {
+            execution
+                .definition
+                .metadata
+                .get("scenario_case")
+                .and_then(|value| value.as_str())
+                == Some("policy-veto")
+        })
+        .expect("policy veto scenario manifest should exist");
+
+    let scenario = policy_veto_execution.definition;
+    let tenant = policy_veto_execution.tenant;
+    let scenario_tag = format!("{}::{}", scenario.tag, tenant);
+    let playbook_key = format!("remediation.accelerator.{}.{}", scenario.tag, tenant);
+
+    let mut playbook_metadata = json!({
+        "scenario": scenario_tag.clone(),
+        "harness": "accelerator-policy-veto"
+    });
+    merge_metadata_fields(&mut playbook_metadata, &scenario.metadata);
+    let playbook_payload = json!({
+        "playbook_key": playbook_key,
+        "display_name": format!("Policy veto validation {tenant}"),
+        "description": "Accelerator policy veto validation",
+        "executor_type": "shell",
+        "approval_required": true,
+        "metadata": playbook_metadata
+    });
+    let playbook = create_playbook(&harness.app, &harness.token, playbook_payload).await;
+    let playbook_id = playbook["id"].as_i64().unwrap();
+
+    let mut metadata = json!({
+        "scenario": scenario_tag.clone(),
+        "manifest_tag": scenario.tag,
+        "tenant": tenant,
+        "playbook_id": playbook_id
+    });
+    merge_metadata_fields(&mut metadata, &scenario.metadata);
+
+    let run_request = json!({
+        "runtime_vm_instance_id": harness.vm_instance_id,
+        "playbook": playbook_key,
+        "metadata": metadata,
+        "automation_payload": {
+            "scenario": "accelerator-policy-veto",
+            "origin": "chaos-fabric"
+        }
+    });
+
+    let run_response = enqueue_run(&harness.app, &harness.token, run_request).await;
+    assert_eq!(run_response["created"], true);
+    let run = run_response["run"].clone();
+    let run_id = run["id"].as_i64().unwrap();
+    let run_version = run["version"].as_i64().unwrap();
+
+    let stream_task = tokio::spawn(collect_stream_events(
+        harness.app.clone(),
+        harness.token.clone(),
+        run_id,
+    ));
+
+    let approval_payload = json!({
+        "new_state": "approved",
+        "expected_version": run_version
+    });
+    let approval_response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/trust/remediation/runs/{run_id}/approval"))
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", harness.token))
+                .body(Body::from(approval_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approval_response.status(), StatusCode::OK);
+
+    let events = stream_task.await.expect("stream collection failed");
+    assert!(!events.is_empty(), "expected remediation SSE events");
+
+    let status_event = events
+        .iter()
+        .find(|event| {
+            event
+                .get("event")
+                .and_then(|entry| entry.get("event"))
+                .and_then(|entry| entry.as_str())
+                == Some("status")
+        })
+        .expect("status event expected");
+
+    let policy_gate = status_event
+        .get("policy_gate")
+        .and_then(|value| value.as_object())
+        .expect("policy gate expected");
+    let remediation_hooks = policy_gate
+        .get("remediation_hooks")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(remediation_hooks.iter().any(|entry| {
+        entry
+            .as_str()
+            .map(|value| value == "policy_hook:remediation_gate=policy-veto")
+            .unwrap_or(false)
+    }));
+    assert!(remediation_hooks.iter().any(|entry| {
+        entry
+            .as_str()
+            .map(|value| value == "policy_hook:remediation_gate=intelligence-block")
+            .unwrap_or(false)
+    }));
+
+    let accelerator_gates = policy_gate
+        .get("accelerator_gates")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let veto_gate = accelerator_gates
+        .iter()
+        .find(|entry| {
+            entry.get("accelerator_id").and_then(|value| value.as_str()) == Some("accel-gov-01")
+        })
+        .expect("accelerator gate expected");
+    let veto_hooks = veto_gate
+        .get("hooks")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(veto_hooks.iter().any(|entry| {
+        entry
+            .as_str()
+            .map(|value| value == "policy_hook:accelerator_gate=vetoed")
+            .unwrap_or(false)
+    }));
+    assert!(veto_hooks.iter().any(|entry| {
+        entry
+            .as_str()
+            .map(|value| value == "policy_hook:intelligence_gate=anomaly-detected")
+            .unwrap_or(false)
+    }));
+    let veto_reasons = veto_gate
+        .get("reasons")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(veto_reasons.iter().any(|entry| {
+        entry
+            .as_str()
+            .map(|value| value.contains("manual override"))
+            .unwrap_or(false)
+    }));
+
+    let accelerators = status_event
+        .get("accelerators")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(accelerators.iter().any(|entry| {
+        entry.get("accelerator_id").and_then(|value| value.as_str()) == Some("accel-gov-01")
+    }));
+    assert!(accelerators.iter().any(|entry| {
+        entry
+            .get("policy_feedback")
+            .and_then(|value| value.as_array())
+            .map(|feedback| {
+                feedback
+                    .iter()
+                    .any(|item| item.as_str() == Some("accelerator:intelligence-anomaly"))
             })
             .unwrap_or(false)
     }));

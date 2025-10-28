@@ -588,6 +588,8 @@ pub struct RemediationStreamMessage {
     pub manifest_metadata: Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub policy_feedback: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_gate: Option<RemediationPolicyGate>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accelerators: Vec<RemediationAcceleratorPosture>,
     pub event: RemediationStreamEvent,
@@ -604,10 +606,28 @@ pub struct RemediationAcceleratorPosture {
     pub metadata: Option<Value>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct RemediationPolicyGate {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remediation_hooks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accelerator_gates: Vec<RemediationAcceleratorGate>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RemediationAcceleratorGate {
+    pub accelerator_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+}
+
 fn broadcast_event(run: &RuntimeVmRemediationRun, event: RemediationStreamEvent) {
     let manifest_tags = manifest_tags_from_metadata(&run.metadata);
     let policy_feedback = policy_feedback_from_metadata(&run.metadata);
     let accelerators = accelerators_from_metadata(&run.metadata);
+    let policy_gate = policy_gate_from_metadata(&run.metadata);
     let message = RemediationStreamMessage {
         run_id: run.id,
         instance_id: run.runtime_vm_instance_id,
@@ -615,6 +635,7 @@ fn broadcast_event(run: &RuntimeVmRemediationRun, event: RemediationStreamEvent)
         manifest_tags,
         manifest_metadata: run.metadata.clone(),
         policy_feedback,
+        policy_gate,
         accelerators,
         event,
     };
@@ -670,6 +691,86 @@ fn policy_feedback_from_metadata(metadata: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn policy_gate_from_metadata(metadata: &Value) -> Option<RemediationPolicyGate> {
+    let gate = metadata.get("policy_gate")?.as_object()?;
+    let remediation_hooks = gate
+        .get("remediation_hooks")
+        .and_then(|value| value.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(|value| value.trim().to_string()))
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let accelerator_gates = gate
+        .get("accelerator_gates")
+        .and_then(|value| value.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let accelerator_id = entry
+                        .get("accelerator_id")
+                        .and_then(|value| value.as_str())?
+                        .trim()
+                        .to_string();
+                    if accelerator_id.is_empty() {
+                        return None;
+                    }
+                    let hooks = entry
+                        .get("hooks")
+                        .and_then(|value| value.as_array())
+                        .map(|hooks| {
+                            hooks
+                                .iter()
+                                .filter_map(|item| {
+                                    item.as_str().map(|value| value.trim().to_string())
+                                })
+                                .filter(|value| !value.is_empty())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let reasons = entry
+                        .get("reasons")
+                        .and_then(|value| value.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| {
+                                    item.as_str().map(|value| value.trim().to_string())
+                                })
+                                .filter(|value| !value.is_empty())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+
+                    if hooks.is_empty() && reasons.is_empty() {
+                        return None;
+                    }
+
+                    Some(RemediationAcceleratorGate {
+                        accelerator_id,
+                        hooks,
+                        reasons,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if remediation_hooks.is_empty() && accelerator_gates.is_empty() {
+        None
+    } else {
+        Some(RemediationPolicyGate {
+            remediation_hooks,
+            accelerator_gates,
+        })
+    }
 }
 
 fn accelerators_from_metadata(metadata: &Value) -> Vec<RemediationAcceleratorPosture> {

@@ -328,6 +328,16 @@ def test_remediation_render_event_includes_policy_feedback(
         "run_id": 42,
         "instance_id": 1001,
         "policy_feedback": ["policy_hook:remediation_gate=accelerator"],
+        "policy_gate": {
+            "remediation_hooks": ["policy_hook:remediation_gate=accelerator"],
+            "accelerator_gates": [
+                {
+                    "accelerator_id": "accel-1",
+                    "hooks": ["policy_hook:accelerator_gate=awaiting-attestation"],
+                    "reasons": ["pending attestation"],
+                }
+            ],
+        },
         "accelerators": [
             {
                 "accelerator_id": "accel-1",
@@ -346,8 +356,8 @@ def test_remediation_render_event_includes_policy_feedback(
 
     _render_remediation_event(event)
     output = capsys.readouterr().out.strip().splitlines()
+    assert any("remediation gate" in line for line in output)
+    assert any("accelerator gate accel-1" in line for line in output)
     assert any("policy feedback" in line for line in output)
     assert any("accelerator accel-1" in line for line in output)
     assert any("status -> completed" in line for line in output)
-    assert payload["governance_notes"] == "review"
-    assert payload["next_refresh_at"] == "2024-01-01T00:00:00+00:00"

@@ -261,3 +261,9 @@
     - 2025-11-30 12:40:00 UTC: Landed manifest loader for remediation chaos harness, scenario index aggregation, and documentation updates. Follow-ups required for CLI SSE verification, accelerator posture ingestion, and policy feedback loops.
     - 2025-12-01 09:10:00 UTC: Resuming iteration to implement accelerator posture ingestion, policy feedback wiring, SSE/CLI enhancements, and validation harness coverage.
     - 2025-12-01 15:45:00 UTC: Added accelerator posture schema/ingestion, enriched remediation SSE payloads with policy feedback + accelerator summaries, updated CLI/watch rendering, expanded harness docs/manifests, and extended integration/CLI tests.
+- ID: BE-REM-VER-ACCEL-GATES
+  Status: IN_PROGRESS
+  Task: Close accelerator policy gate visibility across harness scenarios, SSE payloads, CLI surfaces, and backend tests.
+  Hypothesis: Extending harness manifests with degraded/mixed/policy-veto accelerators, emitting structured `policy_gate` payloads in SSE messages, and teaching the CLI/tests to assert gating hooks will align verification with runtime governance signals.
+  Log:
+    - 2025-12-02 10:00:00 UTC: Introduced expanded accelerator harness manifest coverage, added `policy_gate` extraction in remediation stream messages, updated CLI rendering/tests, tightened backend SSE assertions, and refreshed README guidance to document the closed-loop gating signals.
