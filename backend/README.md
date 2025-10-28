@@ -153,6 +153,35 @@ tokens surfaced by the REST handlers.
 targets, verifying per-target playbook selection, promotion gate context propagation, and the
 resulting automation metadata for each runtime VM instance.
 
+### Lifecycle console aggregation surface
+
+To connect remediation lifecycle data with trust posture, intelligence scoring, and marketplace
+readiness, the backend now exposes a typed aggregation module in
+`backend/src/lifecycle_console/mod.rs`. The new `GET /api/console/lifecycle` route returns a
+`LifecycleConsolePage` structure that bundles workspaces, active revisions (including recorded gate
+snapshots), recent remediation runs, trust registry posture, intelligence score overviews, and the
+latest marketplace readiness status keyed by server. Pagination cursors and optional filters
+(`lifecycle_state`, `owner_id`, `workspace_key`) keep the response scoped for large tenants while
+`run_limit` bounds per-workspace automation detail.
+
+The aggregator stitches together data from `runtime_vm_remediation_workspaces`,
+`runtime_vm_remediation_runs`, `runtime_vm_trust_registry`, `capability_intelligence_scores`, and
+`build_artifact_runs` using windowed SQLx queries so UI consumers receive normalized payloads without
+duplicating join logic. Dedicated helper functions encapsulate the per-table lookups, keeping the
+module testable and ready for SSE streaming expansion. See
+`backend/tests/lifecycle_console.rs` for an integration scenario that seeds a workspace, trust state,
+intelligence score, and marketplace artifact before exercising the new endpoint.
+
+### Backend crate structure
+
+To avoid the duplicate-type compilation failures that occurred when both the library and binary
+targets privately re-declared modules, the binary now consumes modules through the library surface.
+`src/main.rs` imports from the `backend` crate (`backend::routes::api_routes`,
+`backend::job_queue::start_worker`, `backend::runtime::{...}`) instead of `mod` declarations, and the
+library exposes the supporting modules (`auth`, `domains`, `ingestion`, `routes`, etc.). With this
+layout `cargo check --locked --all-targets` succeeds without the previous `RuntimeVmRemediationRun`
+type mismatches, and future binaries should follow the same pattern when pulling in shared modules.
+
 ### Validation harness (`validation: remediation_flow`)
 
 An end-to-end SQLx integration test (`backend/tests/remediation_flow.rs`) now validates the

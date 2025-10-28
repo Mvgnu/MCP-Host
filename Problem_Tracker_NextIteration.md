@@ -295,3 +295,17 @@
   Log:
     - 2025-12-04 09:05:00 UTC: Auditing promotion apply handler, remediation run linkage helpers, SSE builders, CLI renderers, and harness coverage to scope deterministic refresh updates and visibility gaps.
     - 2025-12-04 12:40:00 UTC: Updated promotion orchestration to re-link remediation runs deterministically, broadcast refresh events, expose `promotion_runs` via REST/SSE, refreshed CLI automation tables, expanded integration + CLI tests, and documented the new harness scenario + operator workflow.
+
+- ID: BE-LIFECYCLE-001
+  Status: DONE
+  Task: Stand up lifecycle console aggregation route stitching remediation workspaces, trust posture, intelligence scoring, and marketplace readiness.
+  Hypothesis: Exposing a normalized `/api/console/lifecycle` payload backed by SQLx joins will let the frontend/CLI render holistic lifecycle views without bespoke queries while anchoring future SSE streams.
+  Log:
+    - 2025-12-05 10:15:00 UTC: Added `backend/src/lifecycle_console/mod.rs` with paginated workspace aggregation helpers, wired the new REST handler, documented the data plane, and seeded SQLx coverage in `backend/tests/lifecycle_console.rs`.
+
+- ID: BE-CORE-001
+  Status: DONE
+  Task: Collapse duplicate backend module declarations so the binary consumes the shared library surface without type mismatches.
+  Hypothesis: Centralizing module exposure through `backend/src/lib.rs` will prevent the `RuntimeVmRemediationRun` duplication seen when `main.rs` privately declared modules, allowing full `cargo check --locked --all-targets` runs to pass.
+  Log:
+    - 2025-12-05 13:55:00 UTC: Re-exported backend modules from the library, updated `main.rs` to import via `backend::...`, refreshed the README crate-structure notes, and verified the fix with `cargo check --locked --all-targets`.

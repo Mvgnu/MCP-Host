@@ -1,55 +1,33 @@
-mod artifacts;
-mod auth;
-mod db;
-mod docker;
-mod extractor;
-mod governance;
-mod remediation_api;
-mod runtime;
-mod servers;
-mod telemetry;
-use crate::routes::api_routes;
-mod build;
-mod capabilities;
-mod config;
-mod domains;
-mod error;
-mod evaluation;
-mod evaluations;
-mod file_store;
-mod ingestion;
-mod intelligence;
-mod invocations;
-mod job_queue;
-mod marketplace;
-mod organizations;
-mod policy;
-mod promotions;
-mod proxy;
-mod routes;
-mod secrets;
-mod services;
-mod trust;
-mod vault;
-mod vector_dbs;
-mod workflows;
-
 use axum::{routing::get, Extension, Router};
 use axum_prometheus::PrometheusMetricLayer;
-use backend::remediation;
 use base64::engine::general_purpose::STANDARD as Base64Engine;
 use base64::Engine;
-use ed25519_dalek::PublicKey;
-use job_queue::start_worker;
-use policy::{RuntimeBackend, RuntimePolicyEngine};
-#[cfg(feature = "libvirt-executor")]
-use runtime::vm::libvirt::LibvirtVmProvisioner;
-#[cfg(feature = "libvirt-executor")]
-use runtime::RealLibvirtDriver;
-use runtime::{
-    ContainerRuntime, DockerRuntime, HttpHypervisorProvisioner, KubernetesRuntime,
-    RuntimeOrchestrator, TpmAttestationVerifier, VirtualMachineExecutor,
+use backend::{
+    config,
+    evaluations,
+    governance,
+    ingestion,
+    job_queue::start_worker,
+    policy::{RuntimeBackend, RuntimePolicyEngine},
+    remediation,
+    routes::api_routes,
+    runtime::{
+        self,
+        ContainerRuntime,
+        DockerRuntime,
+        HttpHypervisorProvisioner,
+        KubernetesRuntime,
+        RuntimeOrchestrator,
+        TpmAttestationVerifier,
+        VirtualMachineExecutor,
+    },
+    trust,
 };
+#[cfg(feature = "libvirt-executor")]
+use backend::runtime::vm::libvirt::LibvirtVmProvisioner;
+#[cfg(feature = "libvirt-executor")]
+use backend::runtime::RealLibvirtDriver;
+use ed25519_dalek::PublicKey;
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use std::sync::Arc;
