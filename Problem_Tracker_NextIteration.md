@@ -198,10 +198,19 @@
   Status: IN_PROGRESS
   Task: Expose trust registry control plane APIs and event mesh.
   Hypothesis: Shipping authenticated REST endpoints with optimistic concurrency tokens plus broadcast trust lifecycle events will unlock operator tooling, remediation services, and downstream consumers without direct database access.
+
   Log:
     - 2025-11-22 09:05:00 UTC: Scoped registry queries, mutation guardrails, and event streaming requirements after reviewing existing listener implementation.
     - 2025-11-22 17:45:00 UTC: Documented REST/SSE contracts, added registry filter/unit coverage, and tightened CLI rendering for streamed trust transitions.
     - 2025-11-23 22:31:00 UTC: Restored Axum handler visibility for tests by re-exporting trust routes, keeping transition endpoints buildable ahead of full integration coverage.
+
+- ID: BE-REMED-021
+  Status: IN_PROGRESS
+  Task: Deepen remediation validation harness automation coverage.
+  Hypothesis: Extending the SQLx-backed remediation flow tests with concurrency and future multi-tenant scenarios will surface lifecycle regressions (approval dedupe, gating) immediately while we continue to automate SSE validation.
+  Log:
+    - 2025-11-25 09:30:00 UTC: Added reusable harness bootstrapper and concurrent enqueue regression (`validation: remediation-concurrency`) verifying duplicate requests collapse into a single pending run; documentation now advertises the scenario for future orchestration work.
+  
 - ID: BE-TRUST-003
   Status: IN_PROGRESS
   Task: Extend policy and scheduler layers to preempt placements targeting distrusted infrastructure before queue admission.
