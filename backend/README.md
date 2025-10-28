@@ -57,11 +57,16 @@ The remediation orchestrator listens to the in-process broadcast channel, starti
 
 ## Remediation Control Plane & Execution Engine
 
-Remediation is now a first-class control plane built on top of three persistent tables introduced in migration `0034_remediation_control_plane.sql`:
+Remediation is now a first-class control plane built on top of persistent tables introduced in
+`0034_remediation_control_plane.sql` and extended by `0035_remediation_accelerator_posture.sql`:
 
 - `runtime_vm_remediation_playbooks` stores catalog metadata for each playbook (`playbook_key`, executor type, owner assignment, `approval_required`, `sla_duration_seconds`, version column for optimistic locking, and arbitrary JSONB metadata). Updates must supply the prior `version` to avoid stomping concurrent edits. The Axum control plane and CLI surface both use this table to render catalog listings and enforce ownership.
 - `runtime_vm_remediation_runs` represents individual automation attempts. New runs start in `status = 'pending'` with `approval_state` seeded to `pending` or `auto-approved` depending on the playbook. Additional columns track assigned owner, SLA deadline, cancellation fields, structured metadata, and a `failure_reason` enum string so policy consumers can distinguish transient vs. structural failures.
 - `runtime_vm_remediation_artifacts` captures log bundles, evidence attachments, and automation outputs with JSON metadata so downstream policy engines can ingest remediation intelligence.
+- `runtime_vm_accelerator_posture` stores accelerator inventory posture (`accelerator_id`, hardware
+  `kind`, `posture` tag, policy feedback signals, and opaque metadata) keyed by VM instance. The
+  remediation API ingests this table whenever scenario metadata supplies accelerator fixtures so
+  placement policy, telemetry, and SSE payloads share a consistent view of accelerator governance.
 
 The orchestrator (`backend/src/remediation.rs`) wires these tables into a stateful execution engine:
 
@@ -80,9 +85,10 @@ Operators should consult the remediation API/CLI roadmap before enabling automat
   - `GET /api/trust/remediation/runs/:id` and `POST /api/trust/remediation/runs/:id/approval` to drive approval workflows and examine run metadata.
   - `GET /api/trust/remediation/runs/:id/artifacts` to fetch structured evidence bundles.
   - `GET /api/trust/remediation/stream` for SSE log/status streaming filtered by `run_id`. Stream
-    payloads now include `manifest_tags` (derived from playbook/run metadata) so dashboards can
-    correlate chaos-manifest fingerprints with live execution telemetry.
-- **CLI (`mcpctl remediation`):** new subcommands mirror the REST surface (`playbooks list`, `runs list|get|enqueue|approve|artifacts`, `watch`) with JSON output toggles and structured table rendering to simplify operator workflows.
+    payloads now include `manifest_tags` (derived from playbook/run metadata), aggregated
+    `policy_feedback` hooks, and structured `accelerators` arrays so dashboards can correlate
+    chaos-manifest fingerprints, placement veto notes, and accelerator posture in a single feed.
+- **CLI (`mcpctl remediation`):** new subcommands mirror the REST surface (`playbooks list`, `runs list|get|enqueue|approve|artifacts`, `watch`) with JSON output toggles and structured table rendering to simplify operator workflows. The `watch` renderer now surfaces policy feedback and accelerator posture summaries alongside status transitions so operators see governance context without parsing raw JSON.
 
 ### Validation harness (`validation: remediation_flow`)
 

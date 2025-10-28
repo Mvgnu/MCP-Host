@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use axum::{
-    body::Body,
+    body::{Body, Bytes, HttpBody},
     http::{Method, Request, StatusCode},
     response::Response,
     routing::{get, post},
@@ -10,8 +10,8 @@ use backend::db::runtime_vm_remediation_artifacts::insert_artifact;
 use backend::db::runtime_vm_remediation_runs::{mark_run_completed, mark_run_failed};
 use backend::db::runtime_vm_trust_registry::{upsert_state, UpsertRuntimeVmTrustRegistryState};
 use backend::policy::trust::evaluate_placement_gate;
-use chrono::{Duration, Utc};
-use futures_util::{future::join_all, StreamExt};
+use chrono::{Duration as ChronoDuration, Utc};
+use futures_util::future::join_all;
 use hyper::body;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use serde::Deserialize;
@@ -21,10 +21,10 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    time::Duration,
+    time::Duration as StdDuration,
 };
-use tower::ServiceExt;
 use tokio::time::timeout;
+use tower::ServiceExt;
 
 #[derive(Clone)]
 struct RemediationHarness {
@@ -37,7 +37,7 @@ struct RemediationHarness {
 }
 
 fn generate_operator_token(operator_id: i32) -> String {
-    let exp = (Utc::now() + Duration::hours(1)).timestamp();
+    let exp = (Utc::now() + ChronoDuration::hours(1)).timestamp();
     let claims = json!({"sub": operator_id, "role": "operator", "exp": exp});
     encode(
         &Header::default(),
@@ -184,18 +184,27 @@ impl RemediationHarness {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScenarioKind {
     TenantIsolation,
     ConcurrentApprovals,
     ExecutorOutageResumption,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ScenarioDefinition {
     name: String,
     tag: String,
     kind: ScenarioKind,
+    metadata: Value,
+}
+
+fn merge_metadata_fields(target: &mut Value, extras: &Value) {
+    if let (Some(target_map), Some(extra_map)) = (target.as_object_mut(), extras.as_object()) {
+        for (key, value) in extra_map {
+            target_map.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,6 +221,8 @@ struct ScenarioManifestEntry {
     kind: ScenarioManifestKind,
     #[serde(default)]
     tenants: BTreeSet<String>,
+    #[serde(default)]
+    metadata: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,6 +312,7 @@ fn load_manifest_file(path: &Path) -> Result<Vec<ScenarioExecution>> {
             name: entry.name.clone(),
             tag: entry.tag.clone(),
             kind: scenario_kind_from_manifest(entry.kind),
+            metadata: entry.metadata.clone(),
         };
 
         let tenants = if entry.tenants.is_empty() {
@@ -541,6 +553,8 @@ async fn scenario_executor_outage_resumption(
     let app = harness.app.clone();
     let playbook_key = format!("vm.executor.{}.{}", scenario.name, tenant);
     let scenario_tag = format!("{}::{}", scenario.tag, tenant);
+    let mut playbook_metadata = json!({"scenario": scenario_tag.clone()});
+    merge_metadata_fields(&mut playbook_metadata, &scenario.metadata);
     let playbook_payload = json!({
         "playbook_key": playbook_key,
         "display_name": "Executor Outage",
@@ -548,14 +562,19 @@ async fn scenario_executor_outage_resumption(
         "executor_type": "shell",
         "approval_required": false,
         "sla_duration_seconds": 300,
-        "metadata": {"scenario": scenario_tag.clone()}
+        "metadata": playbook_metadata
     });
 
     create_playbook(&app, &harness.token, playbook_payload).await;
+    let mut initial_metadata = json!({
+        "scenario": scenario_tag.clone(),
+        "phase": "initial"
+    });
+    merge_metadata_fields(&mut initial_metadata, &scenario.metadata);
     let enqueue_payload = json!({
         "runtime_vm_instance_id": harness.vm_instance_id,
         "playbook": playbook_key,
-        "metadata": {"scenario": scenario_tag.clone(), "phase": "initial"},
+        "metadata": initial_metadata,
         "automation_payload": null
     });
     let run = enqueue_run(&app, &harness.token, enqueue_payload).await;
@@ -611,10 +630,15 @@ async fn scenario_executor_outage_resumption(
         .iter()
         .any(|note| note.contains("executor-outage")));
 
+    let mut retry_metadata = json!({
+        "scenario": scenario_tag.clone(),
+        "phase": "retry"
+    });
+    merge_metadata_fields(&mut retry_metadata, &scenario.metadata);
     let retry_payload = json!({
         "runtime_vm_instance_id": harness.vm_instance_id,
         "playbook": playbook_key,
-        "metadata": {"scenario": scenario_tag.clone(), "phase": "retry"},
+        "metadata": retry_metadata,
         "automation_payload": null
     });
     let retry_run = enqueue_run(&app, &harness.token, retry_payload).await;
@@ -780,7 +804,7 @@ async fn post_json(app: &Router, token: &str, uri: &str, payload: String) -> Res
 
 async fn collect_stream_events(app: Router, token: String, run_id: i64) -> Vec<Value> {
     let uri = format!("/api/trust/remediation/stream?run_id={run_id}");
-    let mut response = app
+    let response = app
         .oneshot(
             Request::builder()
                 .method(Method::GET)
@@ -795,12 +819,15 @@ async fn collect_stream_events(app: Router, token: String, run_id: i64) -> Vec<V
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body();
-    timeout(Duration::from_secs(30), read_sse_stream(body, run_id))
+    timeout(StdDuration::from_secs(30), read_sse_stream(body, run_id))
         .await
         .expect("timed out waiting for remediation SSE")
 }
 
-async fn read_sse_stream(mut body: Body, run_id: i64) -> Vec<Value> {
+async fn read_sse_stream<B>(mut body: B, run_id: i64) -> Vec<Value>
+where
+    B: HttpBody<Data = Bytes, Error = axum::Error> + Unpin,
+{
     let mut buffer = String::new();
     let mut events = Vec::new();
 
@@ -1244,15 +1271,17 @@ async fn remediation_stream_captures_manifest_metadata(pool: PgPool) {
     let playbook = create_playbook(&app, &token, playbook_payload).await;
     let playbook_id = playbook["id"].as_i64().unwrap();
 
+    let mut metadata = json!({
+        "scenario": scenario_tag.clone(),
+        "manifest_tag": scenario.tag,
+        "tenant": tenant,
+        "playbook_id": playbook_id
+    });
+    merge_metadata_fields(&mut metadata, &scenario.metadata);
     let run_request = json!({
         "runtime_vm_instance_id": harness.vm_instance_id,
         "playbook": playbook_key,
-        "metadata": {
-            "scenario": scenario_tag.clone(),
-            "manifest_tag": scenario.tag,
-            "tenant": tenant,
-            "playbook_id": playbook_id
-        },
+        "metadata": metadata,
         "automation_payload": {
             "scenario": "sse-validation",
             "origin": "chaos-fabric"
@@ -1302,17 +1331,29 @@ async fn remediation_stream_captures_manifest_metadata(pool: PgPool) {
         .last()
         .and_then(|event| event.get("event"))
         .expect("expected terminal remediation event");
-    assert_eq!(last.get("event").and_then(|entry| entry.as_str()), Some("status"));
-    assert_eq!(last.get("status").and_then(|entry| entry.as_str()), Some("completed"));
+    assert_eq!(
+        last.get("event").and_then(|entry| entry.as_str()),
+        Some("status")
+    );
+    assert_eq!(
+        last.get("status").and_then(|entry| entry.as_str()),
+        Some("completed")
+    );
 
     let tag_presence = events.iter().all(|event| {
         event
             .get("manifest_tags")
             .and_then(|value| value.as_array())
-            .map(|tags| tags.iter().any(|entry| entry.as_str() == Some(&scenario_tag)))
+            .map(|tags| {
+                tags.iter()
+                    .any(|entry| entry.as_str() == Some(&scenario_tag))
+            })
             .unwrap_or(false)
     });
-    assert!(tag_presence, "expected manifest tags to include chaos scenario tag");
+    assert!(
+        tag_presence,
+        "expected manifest tags to include chaos scenario tag"
+    );
 
     let log_events: Vec<&Value> = events
         .iter()
@@ -1324,7 +1365,10 @@ async fn remediation_stream_captures_manifest_metadata(pool: PgPool) {
                 == Some("log")
         })
         .collect();
-    assert!(!log_events.is_empty(), "expected remediation log events to be streamed");
+    assert!(
+        !log_events.is_empty(),
+        "expected remediation log events to be streamed"
+    );
 
     let mut tick_values = Vec::new();
     for event in &log_events {
@@ -1358,7 +1402,140 @@ async fn remediation_stream_captures_manifest_metadata(pool: PgPool) {
             .map(|message| message.contains(&scenario_tag))
             .unwrap_or(false)
     });
-    assert!(metadata_event.is_some(), "expected metadata log to reference manifest tag");
+    assert!(
+        metadata_event.is_some(),
+        "expected metadata log to reference manifest tag"
+    );
+}
+
+// key: validation -> remediation-stream:accelerator-policy-feedback
+#[sqlx::test]
+#[ignore = "requires DATABASE_URL with Postgres server"]
+async fn remediation_stream_includes_policy_feedback(pool: PgPool) {
+    let harness = bootstrap_remediation_harness(&pool).await;
+    let manifest_root = resolve_manifest_root();
+    let executions = load_manifest_directory(&manifest_root)
+        .with_context(|| format!("loading scenarios from {}", manifest_root.display()))
+        .unwrap();
+
+    let accelerator_execution = executions
+        .into_iter()
+        .find(|execution| execution.definition.metadata.get("accelerators").is_some())
+        .expect("accelerator scenario manifest should exist");
+
+    let scenario = accelerator_execution.definition;
+    let tenant = accelerator_execution.tenant;
+    let scenario_tag = format!("{}::{}", scenario.tag, tenant);
+    let playbook_key = format!("remediation.accelerator.{}.{}", scenario.tag, tenant);
+
+    let mut playbook_metadata = json!({
+        "scenario": scenario_tag.clone(),
+        "harness": "accelerator-policy"
+    });
+    merge_metadata_fields(&mut playbook_metadata, &scenario.metadata);
+    let playbook_payload = json!({
+        "playbook_key": playbook_key,
+        "display_name": format!("Accelerator validation {tenant}"),
+        "description": "Accelerator remediation validation",
+        "executor_type": "shell",
+        "approval_required": true,
+        "metadata": playbook_metadata
+    });
+    let playbook = create_playbook(&harness.app, &harness.token, playbook_payload).await;
+    let playbook_id = playbook["id"].as_i64().unwrap();
+
+    let mut metadata = json!({
+        "scenario": scenario_tag.clone(),
+        "manifest_tag": scenario.tag,
+        "tenant": tenant,
+        "playbook_id": playbook_id
+    });
+    merge_metadata_fields(&mut metadata, &scenario.metadata);
+
+    let run_request = json!({
+        "runtime_vm_instance_id": harness.vm_instance_id,
+        "playbook": playbook_key,
+        "metadata": metadata,
+        "automation_payload": {
+            "scenario": "accelerator-validation",
+            "origin": "chaos-fabric"
+        }
+    });
+
+    let run_response = enqueue_run(&harness.app, &harness.token, run_request).await;
+    assert_eq!(run_response["created"], true);
+    let run = run_response["run"].clone();
+    let run_id = run["id"].as_i64().unwrap();
+    let run_version = run["version"].as_i64().unwrap();
+
+    let stream_task = tokio::spawn(collect_stream_events(
+        harness.app.clone(),
+        harness.token.clone(),
+        run_id,
+    ));
+
+    let approval_payload = json!({
+        "new_state": "approved",
+        "expected_version": run_version
+    });
+    let approval_response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/trust/remediation/runs/{run_id}/approval"))
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", harness.token))
+                .body(Body::from(approval_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(approval_response.status(), StatusCode::OK);
+
+    let events = stream_task.await.expect("stream collection failed");
+    assert!(!events.is_empty(), "expected remediation SSE events");
+
+    let status_event = events
+        .iter()
+        .find(|event| {
+            event
+                .get("event")
+                .and_then(|entry| entry.get("event"))
+                .and_then(|entry| entry.as_str())
+                == Some("status")
+        })
+        .expect("status event expected");
+
+    let policy_feedback = status_event
+        .get("policy_feedback")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(policy_feedback
+        .iter()
+        .any(|entry| entry.as_str() == Some("policy_hook:accelerator_gate=awaiting-attestation")));
+
+    let accelerators = status_event
+        .get("accelerators")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(accelerators.iter().any(|entry| {
+        entry.get("accelerator_id").and_then(|value| value.as_str()) == Some("accel-lab-01")
+    }));
+    assert!(accelerators.iter().any(|entry| {
+        entry
+            .get("policy_feedback")
+            .and_then(|value| value.as_array())
+            .map(|feedback| {
+                feedback
+                    .iter()
+                    .any(|item| item.as_str() == Some("accelerator:pending-remediation"))
+            })
+            .unwrap_or(false)
+    }));
 }
 
 // key: validation -> remediation-chaos-matrix

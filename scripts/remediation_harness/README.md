@@ -90,8 +90,28 @@ orchestrated harness and direct `cargo test` execution stay aligned.
 
 Author new scenario manifests under `scripts/remediation_harness/scenarios/` to extend the fabric.
 Each document accepts `name`, `tag`, `kind`, and `tenants` keys; YAML and JSON formats are both
-supported. The backend integration suite fails fast when the directory is empty so operators know to
-check out the latest manifests before executing the harness.
+supported. Optional `metadata` blocks are merged into remediation run metadata, enabling rich SSE
+payload validation. The backend integration suite fails fast when the directory is empty so operators
+know to check out the latest manifests before executing the harness.
+
+### Scenario metadata schema extensions
+
+`metadata` entries now support structured accelerator posture ingestion and policy feedback wiring:
+
+* `policy_feedback`: array of string tags (for example
+  `policy_hook:accelerator_gate=awaiting-attestation`). Values propagate into remediation SSE
+  payloads and CLI summaries so operators immediately see which governance hooks fired.
+* `accelerators`: array of accelerator descriptors with the following fields:
+  * `id`: accelerator inventory identifier stored in the new
+    `runtime_vm_accelerator_posture` table.
+  * `kind`: hardware class (e.g. `nvidia-h100`).
+  * `posture`: current remediation posture tag (`trusted`, `quarantined`, etc.).
+  * `policy_feedback`: optional string array mirroring placement/policy hooks for the accelerator.
+  * `metadata`: arbitrary JSON surfaced through SSE payloads and persisted alongside the posture
+    record.
+
+The accelerator scenario (`accelerator-posture.yaml`) demonstrates the new fields and drives the
+`validation:accelerator-remediation` harness coverage.
 
 ## SSE and Scheduler Checks
 

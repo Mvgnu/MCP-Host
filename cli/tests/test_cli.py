@@ -32,6 +32,7 @@ import pytest
 
 from mcpctl import cli as cli_module
 from mcpctl.commands import _render_trust_event
+from mcpctl.commands.remediation import _render_event as _render_remediation_event
 
 
 class FakeClient:
@@ -318,5 +319,35 @@ def test_evaluations_plan_overrides_payload() -> None:
     assert method == "PATCH"
     assert path == "/api/evaluations/42/status"
     assert payload["refresh_cadence_seconds"] == 3600
+
+
+def test_remediation_render_event_includes_policy_feedback(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    event = {
+        "run_id": 42,
+        "instance_id": 1001,
+        "policy_feedback": ["policy_hook:remediation_gate=accelerator"],
+        "accelerators": [
+            {
+                "accelerator_id": "accel-1",
+                "accelerator_type": "nvidia-h100",
+                "posture": "quarantined",
+                "policy_feedback": ["accelerator:requires-attestation"],
+            }
+        ],
+        "event": {
+            "event": "status",
+            "status": "completed",
+            "failure_reason": None,
+            "message": "automation completed",
+        },
+    }
+
+    _render_remediation_event(event)
+    output = capsys.readouterr().out.strip().splitlines()
+    assert any("policy feedback" in line for line in output)
+    assert any("accelerator accel-1" in line for line in output)
+    assert any("status -> completed" in line for line in output)
     assert payload["governance_notes"] == "review"
     assert payload["next_refresh_at"] == "2024-01-01T00:00:00+00:00"

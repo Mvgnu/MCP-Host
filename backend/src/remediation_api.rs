@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use tokio_stream::wrappers::BroadcastStream;
 
+use crate::db::runtime_vm_accelerator_posture::{replace_instance_posture, NewAcceleratorPosture};
 use crate::db::runtime_vm_remediation_artifacts::{
     list_artifacts as list_run_artifacts, RuntimeVmRemediationArtifact,
 };
@@ -248,10 +249,101 @@ pub async fn enqueue_run_handler(
         ));
     }
 
+    if let Some(run) = created.as_ref() {
+        ingest_accelerator_posture(&pool, run.runtime_vm_instance_id, &request.metadata).await?;
+    }
+
     Ok(Json(RunEnqueueResponse {
         created: true,
         run: created,
     }))
+}
+
+#[derive(Debug, Clone)]
+struct AcceleratorSpec {
+    accelerator_id: String,
+    accelerator_type: String,
+    posture: String,
+    policy_feedback: Vec<String>,
+    metadata: Value,
+}
+
+fn extract_accelerator_specs(metadata: &Value) -> Vec<AcceleratorSpec> {
+    let mut specs = Vec::new();
+    let Some(entries) = metadata
+        .get("accelerators")
+        .and_then(|value| value.as_array())
+    else {
+        return specs;
+    };
+
+    for entry in entries {
+        let Some(accelerator_id) = entry.get("id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let accelerator_type = entry
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let posture = entry
+            .get("posture")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let policy_feedback = entry
+            .get("policy_feedback")
+            .and_then(|value| value.as_array())
+            .map(|feedback| {
+                feedback
+                    .iter()
+                    .filter_map(|item| item.as_str().map(|value| value.trim().to_string()))
+                    .filter(|value| !value.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let metadata_payload = entry
+            .get("metadata")
+            .cloned()
+            .unwrap_or_else(|| entry.clone());
+
+        specs.push(AcceleratorSpec {
+            accelerator_id: accelerator_id.to_string(),
+            accelerator_type: accelerator_type.to_string(),
+            posture: posture.to_string(),
+            policy_feedback,
+            metadata: metadata_payload,
+        });
+    }
+
+    specs
+}
+
+async fn ingest_accelerator_posture(
+    pool: &PgPool,
+    runtime_vm_instance_id: i64,
+    metadata: &Value,
+) -> AppResult<()> {
+    let specs = extract_accelerator_specs(metadata);
+    if specs.is_empty() {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+    let upserts: Vec<NewAcceleratorPosture> = specs
+        .iter()
+        .map(|spec| NewAcceleratorPosture {
+            runtime_vm_instance_id,
+            accelerator_id: spec.accelerator_id.as_str(),
+            accelerator_type: spec.accelerator_type.as_str(),
+            posture: spec.posture.as_str(),
+            policy_feedback: spec.policy_feedback.as_slice(),
+            metadata: &spec.metadata,
+        })
+        .collect();
+
+    replace_instance_posture(&mut tx, runtime_vm_instance_id, &upserts).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 pub async fn update_approval_handler(
