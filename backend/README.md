@@ -86,9 +86,17 @@ Operators should consult the remediation API/CLI roadmap before enabling automat
 
 An end-to-end SQLx integration test (`backend/tests/remediation_flow.rs`) now validates the
 remediation lifecycle: playbook creation/edit/version guards, queued runs with duplicate protection,
-approval transitions, placement gate veto notes, and artifact retrieval. A companion concurrency
-scenario (`validation: remediation-concurrency`) stress-tests duplicate enqueue races to ensure
-only a single pending run survives simultaneous submissions.
+approval transitions, placement gate veto notes, and artifact retrieval. The suite now includes a
+multi-tenant chaos matrix (`validation: remediation-chaos-matrix`) that exercises:
+
+- `validation:tenant-isolation` – per-tenant run scoping, trust registry tagging, and placement gate
+  separation across distinct operators/servers.
+- `validation:concurrent-approvals` – approval version races to ensure stale writes are rejected.
+- `validation:executor-outage` – executor unavailability, trust registry failure tagging, and
+  scheduler resumption via successful retries.
+
+A companion concurrency scenario (`validation: remediation-concurrency`) continues to stress-test
+duplicate enqueue races so only a single pending run survives simultaneous submissions.
 
 Execute the harness via:
 
@@ -99,5 +107,6 @@ cargo test --test remediation_flow -- --ignored --nocapture
 ```
 
 For a fully orchestrated run—including ephemeral Postgres and backend bootstrapping—use the shell
-script under `scripts/remediation_harness/` (documented in the harness README). The script tags
-results with `validation: remediation_flow` so future rollups can track regression coverage.
+script under `scripts/remediation_harness/` (documented in the harness README). The harness now
+emits a JSON manifest enumerating the executed validation tags so dashboards can ingest
+`validation:remediation_flow`, `validation:remediation-concurrency`, and the chaos matrix lineage.

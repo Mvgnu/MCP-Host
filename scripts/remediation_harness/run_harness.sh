@@ -11,6 +11,7 @@ HARNESS_PORT="${HARNESS_PORT:-38080}"
 JWT_SECRET="${HARNESS_JWT_SECRET:-integration-secret}"
 DATABASE_URL="postgres://postgres:remediation@127.0.0.1:${POSTGRES_PORT}/mcp"
 BACKEND_LOG="${HARNESS_DIR}/backend.log"
+MANIFEST_PATH="${HARNESS_MANIFEST_PATH:-${HARNESS_DIR}/remediation_harness_manifest.json}"
 
 cleanup() {
     set +e
@@ -87,5 +88,33 @@ echo "[harness] executing remediation lifecycle integration test" >&2
     JWT_SECRET="${JWT_SECRET}" \
     cargo test --test remediation_flow -- --ignored --nocapture
 )
+
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+cat >"${MANIFEST_PATH}" <<EOF
+{
+  "generated_at": "${TIMESTAMP}",
+  "database_url": "${DATABASE_URL}",
+  "scenarios": [
+    {
+      "test": "remediation_lifecycle_harness",
+      "tags": ["validation:remediation_flow"]
+    },
+    {
+      "test": "remediation_concurrent_enqueue_dedupe",
+      "tags": ["validation:remediation-concurrency"]
+    },
+    {
+      "test": "remediation_multi_tenant_chaos_matrix",
+      "tags": [
+        "validation:remediation-chaos-matrix",
+        "validation:tenant-isolation",
+        "validation:concurrent-approvals",
+        "validation:executor-outage"
+      ]
+    }
+  ]
+}
+EOF
+echo "[harness] wrote manifest to ${MANIFEST_PATH}" >&2
 
 echo "[harness] complete" >&2
