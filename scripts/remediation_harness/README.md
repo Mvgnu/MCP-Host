@@ -132,8 +132,10 @@ The harness now spawns an operator token, streams `/api/trust/remediation/stream
 `mcpctl remediation watch --json`, and writes the transcript to
 `scripts/remediation_harness/remediation_stream.jsonl`. The integration suite verifies approval
 gating (`validation:remediation_flow`), duplicate suppression (`validation:remediation-concurrency`),
-manifest-driven chaos scenarios, and SSE ordering/manifest metadata propagation
-(`validation:remediation-stream:sse-ordering`). Review the transcript to confirm log sequencing,
+manifest-driven chaos scenarios, SSE ordering/manifest metadata propagation
+(`validation:remediation-stream:sse-ordering`), and workspace-aware SSE payloads that surface
+promotion gate context (`validation:remediation-stream:workspace-context`). Review the transcript to
+confirm log sequencing,
 status transitions, and manifest tags for accelerator and tenant-focused scenarios without running
 additional manual commands.
 
@@ -167,6 +169,6 @@ During a harness run the workspace fabric validation performs:
 
 The harness manifest now lists all executed validation tags (`validation:remediation_flow`,
 `validation:remediation-concurrency`, `validation:remediation-chaos-matrix`,
-`validation:remediation-workspace-draft`, `validation:remediation-workspace-promotion`, and
-`validation:remediation-workspace-cli`) so dashboards and drift detectors can reason about coverage
-without re-running the suite.
+`validation:remediation-stream:workspace-context`, `validation:remediation-workspace-draft`,
+`validation:remediation-workspace-promotion`, and `validation:remediation-workspace-cli`) so
+dashboards and drift detectors can reason about coverage without re-running the suite.

@@ -201,6 +201,8 @@ def install(
 
     runs_list = runs_sub.add_parser("list", help="List remediation runs")
     runs_list.add_argument("--instance-id", dest="runtime_vm_instance_id", type=int)
+    runs_list.add_argument("--workspace-id", dest="workspace_id", type=int)
+    runs_list.add_argument("--revision-id", dest="workspace_revision_id", type=int)
     runs_list.add_argument("--status", dest="status")
     runs_list.set_defaults(handler=_runs_list)
     add_common_arguments(runs_list)
@@ -519,6 +521,10 @@ def _runs_list(client: APIClient, as_json: bool, args: Dict[str, object]) -> Non
         params["runtime_vm_instance_id"] = args["runtime_vm_instance_id"]
     if args.get("status"):
         params["status"] = args["status"]
+    if args.get("workspace_id") is not None:
+        params["workspace_id"] = args["workspace_id"]
+    if args.get("workspace_revision_id") is not None:
+        params["workspace_revision_id"] = args["workspace_revision_id"]
     records = client.get("/api/trust/remediation/runs", params=params or None)
     if as_json:
         print(dumps_json(records))
@@ -527,27 +533,34 @@ def _runs_list(client: APIClient, as_json: bool, args: Dict[str, object]) -> Non
     for item in records:
         if not isinstance(item, dict):
             continue
+        gate_context = item.get("promotion_gate_context")
         rows.append(
             {
                 "id": item.get("id"),
                 "instance": item.get("runtime_vm_instance_id"),
+                "workspace": item.get("workspace_id"),
+                "revision": item.get("workspace_revision_id"),
                 "playbook": item.get("playbook"),
                 "status": item.get("status"),
                 "approval": item.get("approval_state"),
                 "owner": item.get("assigned_owner_id"),
                 "sla_deadline": item.get("sla_deadline"),
                 "updated_at": item.get("updated_at"),
+                "gate": dumps_json(gate_context) if gate_context else "",
             }
         )
     columns = [
         "id",
         "instance",
+        "workspace",
+        "revision",
         "playbook",
         "status",
         "approval",
         "owner",
         "sla_deadline",
         "updated_at",
+        "gate",
     ]
     print(render_table(rows, columns))
 
@@ -560,6 +573,8 @@ def _runs_get(client: APIClient, as_json: bool, args: Dict[str, object]) -> None
     columns = [
         "id",
         "runtime_vm_instance_id",
+        "workspace_id",
+        "workspace_revision_id",
         "playbook",
         "status",
         "approval_state",
@@ -568,6 +583,7 @@ def _runs_get(client: APIClient, as_json: bool, args: Dict[str, object]) -> None
         "started_at",
         "completed_at",
         "failure_reason",
+        "promotion_gate_context",
         "updated_at",
     ]
     print(render_table([run], columns))

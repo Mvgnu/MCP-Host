@@ -320,6 +320,9 @@ async fn handle_quarantine_event(
         sla_duration_seconds: playbook
             .as_ref()
             .and_then(|record| record.sla_duration_seconds),
+        workspace_id: None,
+        workspace_revision_id: None,
+        promotion_gate_context: None,
     };
 
     if ensure_remediation_run(&mut *tx, request).await?.is_none() {
@@ -582,6 +585,10 @@ pub struct RemediationStreamMessage {
     pub run_id: i64,
     pub instance_id: i64,
     pub playbook: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_revision_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub manifest_tags: Vec<String>,
     #[serde(default)]
@@ -592,6 +599,8 @@ pub struct RemediationStreamMessage {
     pub policy_gate: Option<RemediationPolicyGate>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accelerators: Vec<RemediationAcceleratorPosture>,
+    #[serde(default, skip_serializing_if = "is_empty_value")]
+    pub promotion_gate_context: Value,
     pub event: RemediationStreamEvent,
 }
 
@@ -632,14 +641,26 @@ fn broadcast_event(run: &RuntimeVmRemediationRun, event: RemediationStreamEvent)
         run_id: run.id,
         instance_id: run.runtime_vm_instance_id,
         playbook: run.playbook.clone(),
+        workspace_id: run.workspace_id,
+        workspace_revision_id: run.workspace_revision_id,
         manifest_tags,
         manifest_metadata: run.metadata.clone(),
         policy_feedback,
         policy_gate,
         accelerators,
+        promotion_gate_context: run.promotion_gate_context.clone(),
         event,
     };
     let _ = REMEDIATION_EVENT_CHANNEL.send(message);
+}
+
+fn is_empty_value(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+        Value::Array(entries) => entries.is_empty(),
+        Value::Object(map) => map.is_empty(),
+    }
 }
 
 fn manifest_tags_from_metadata(metadata: &Value) -> Vec<String> {

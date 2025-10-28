@@ -39,7 +39,7 @@ use crate::db::runtime_vm_remediation_workspaces::{
 use crate::error::{AppError, AppResult};
 use crate::extractor::AuthUser;
 use crate::remediation::subscribe_remediation_events;
-use tracing::{error, trace, warn};
+use tracing::{trace, warn};
 
 // key: remediation_surface -> http-handlers
 #[derive(Debug, Deserialize)]
@@ -854,6 +854,7 @@ pub async fn apply_workspace_policy_feedback_handler(
 
     let envelope =
         map_workspace_update_result(&pool, workspace_id, Some(revision_id), result).await?;
+
     Ok(Json(envelope))
 }
 
@@ -881,6 +882,7 @@ pub async fn apply_workspace_simulation_handler(
 
     let envelope =
         map_workspace_update_result(&pool, workspace_id, Some(revision_id), result).await?;
+
     Ok(Json(envelope))
 }
 
@@ -900,15 +902,52 @@ pub async fn apply_workspace_promotion_handler(
             requested_by: user.user_id,
             promotion_status: &request.promotion_status,
             notes: &notes,
-            gate_context: &request.gate_context,
             expected_workspace_version: request.expected_workspace_version,
             expected_revision_version: request.expected_revision_version,
         },
     )
     .await?;
 
-    let envelope =
+    let mut envelope =
         map_workspace_update_result(&pool, workspace_id, Some(revision_id), result).await?;
+
+    if matches!(request.promotion_status.as_str(), "approved" | "completed") {
+        if let Some(revision_envelope) = envelope
+            .revisions
+            .iter()
+            .find(|entry| entry.revision.id == revision_id)
+        {
+            let runs = stage_workspace_promotion_runs(
+                &pool,
+                &envelope.workspace,
+                &revision_envelope.revision,
+                &request.gate_context,
+                &request.notes,
+                user.user_id,
+            )
+            .await?;
+            if runs.is_empty() {
+                trace!(
+                    workspace_id,
+                    revision_id,
+                    "promotion completed without remediation targets"
+                );
+            } else {
+                trace!(
+                    workspace_id,
+                    revision_id,
+                    run_count = runs.len(),
+                    "promotion triggered remediation orchestration"
+                );
+            }
+        } else {
+            warn!(
+                workspace_id,
+                revision_id, "promotion staging skipped because revision was missing from envelope"
+            );
+        }
+    }
+
     Ok(Json(envelope))
 }
 
