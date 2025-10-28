@@ -5,13 +5,17 @@ use axum::{
 
 use crate::{
     auth, capabilities, domains, evaluation, file_store, governance, ingestion, intelligence,
-    invocations, marketplace, organizations, policy, promotions, remediation_api, secrets, servers,
-    services, trust, vector_dbs, workflows,
+    invocations, lifecycle_console, marketplace, organizations, policy, promotions,
+    remediation_api, secrets, servers, services, trust, vector_dbs, workflows,
 };
 
 pub fn api_routes() -> Router {
     Router::new()
         .route("/api/marketplace", get(marketplace::list_marketplace))
+        .route(
+            "/api/console/lifecycle",
+            get(lifecycle_console::list_snapshots),
+        )
         .route("/api/register", post(auth::register_user))
         .route("/api/login", post(auth::login_user))
         .route("/api/logout", post(auth::logout_user))
