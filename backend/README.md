@@ -86,7 +86,11 @@ Operators should consult the remediation API/CLI roadmap before enabling automat
 
 An end-to-end SQLx integration test (`backend/tests/remediation_flow.rs`) now validates the
 remediation lifecycle: playbook creation/edit/version guards, queued runs with duplicate protection,
-approval transitions, placement gate veto notes, and artifact retrieval. Execute the harness via:
+approval transitions, placement gate veto notes, and artifact retrieval. A companion concurrency
+scenario (`validation: remediation-concurrency`) stress-tests duplicate enqueue races to ensure
+only a single pending run survives simultaneous submissions.
+
+Execute the harness via:
 
 ```bash
 DATABASE_URL=postgres://postgres:password@localhost/mcp \
