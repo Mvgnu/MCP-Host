@@ -38,6 +38,12 @@ pub struct LifecycleConsoleQuery {
     #[serde(default)]
     pub workspace_key: Option<String>,
     #[serde(default)]
+    pub workspace_search: Option<String>,
+    #[serde(default)]
+    pub promotion_lane: Option<String>,
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
     pub run_limit: Option<u32>,
 }
 
@@ -49,6 +55,9 @@ impl Default for LifecycleConsoleQuery {
             lifecycle_state: None,
             owner_id: None,
             workspace_key: None,
+            workspace_search: None,
+            promotion_lane: None,
+            severity: None,
             run_limit: None,
         }
     }
@@ -80,6 +89,8 @@ pub struct LifecycleConsoleEventEnvelope {
     pub page: Option<LifecycleConsolePage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<LifecycleDelta>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,6 +126,42 @@ pub struct LifecycleRunSnapshot {
     pub intelligence: Vec<IntelligenceScoreOverview>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub marketplace: Option<MarketplaceReadiness>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecycleDelta {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<LifecycleWorkspaceDelta>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecycleWorkspaceDelta {
+    pub workspace_id: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_deltas: Vec<LifecycleRunDelta>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_run_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecycleRunDelta {
+    pub run_id: i64,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trust_changes: Vec<LifecycleFieldChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intelligence_changes: Vec<LifecycleFieldChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marketplace_changes: Vec<LifecycleFieldChange>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecycleFieldChange {
+    pub field: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -206,6 +253,7 @@ pub async fn stream_snapshots(
         let mut cursor = query.cursor;
         let mut interval = tokio::time::interval(poll_interval);
         let mut initial = true;
+        let mut last_snapshots: HashMap<i64, LifecycleWorkspaceSnapshot> = HashMap::new();
         loop {
             if initial {
                 initial = false;
@@ -225,6 +273,7 @@ pub async fn stream_snapshots(
                             cursor,
                             page: None,
                             error: None,
+                            delta: None,
                         };
                         match Event::default()
                             .event("lifecycle-heartbeat")
@@ -247,12 +296,17 @@ pub async fn stream_snapshots(
                         .last()
                         .map(|snapshot| snapshot.workspace.id)
                         .or(cursor);
+                    let delta = compute_delta(&last_snapshots, &page);
+                    for snapshot in &page.workspaces {
+                        last_snapshots.insert(snapshot.workspace.id, snapshot.clone());
+                    }
                     let envelope = LifecycleConsoleEventEnvelope {
                         event_type: LifecycleConsoleEventType::Snapshot,
                         emitted_at: Utc::now(),
                         cursor: event_cursor,
                         page: Some(page.clone()),
                         error: None,
+                        delta,
                     };
 
                     match Event::default()
@@ -280,6 +334,7 @@ pub async fn stream_snapshots(
                         cursor,
                         page: None,
                         error: Some(err.to_string()),
+                        delta: None,
                     };
                     match Event::default()
                         .event("lifecycle-error")
@@ -344,6 +399,39 @@ pub async fn fetch_page(
             " WHERE workspace_key = "
         });
         builder.push_bind(key);
+        has_where = true;
+    }
+
+    if let Some(search) = query.workspace_search.as_ref() {
+        builder.push(if has_where {
+            " AND (workspace_key ILIKE "
+        } else {
+            " WHERE (workspace_key ILIKE "
+        });
+        builder.push_bind(format!("%{}%", search));
+        builder.push(" OR display_name ILIKE ");
+        builder.push_bind(format!("%{}%", search));
+        builder.push(")");
+        has_where = true;
+    }
+
+    if let Some(lane) = query.promotion_lane.as_ref() {
+        builder.push(if has_where {
+            " AND metadata->>'promotion_lane' = "
+        } else {
+            " WHERE metadata->>'promotion_lane' = "
+        });
+        builder.push_bind(lane);
+        has_where = true;
+    }
+
+    if let Some(severity) = query.severity.as_ref() {
+        builder.push(if has_where {
+            " AND metadata->>'severity' = "
+        } else {
+            " WHERE metadata->>'severity' = "
+        });
+        builder.push_bind(severity);
         has_where = true;
     }
 
@@ -641,6 +729,493 @@ async fn load_trust_states(
             )
         })
         .collect())
+}
+
+fn compute_delta(
+    previous: &HashMap<i64, LifecycleWorkspaceSnapshot>,
+    page: &LifecycleConsolePage,
+) -> Option<LifecycleDelta> {
+    let mut workspaces = Vec::new();
+    let mut seen = HashSet::new();
+
+    for snapshot in &page.workspaces {
+        let workspace_id = snapshot.workspace.id;
+        seen.insert(workspace_id);
+        let previous_runs = previous
+            .get(&workspace_id)
+            .map(|s| s.recent_runs.as_slice())
+            .unwrap_or(&[]);
+        let (run_deltas, removed_run_ids) = diff_runs(previous_runs, &snapshot.recent_runs);
+        if !run_deltas.is_empty()
+            || !removed_run_ids.is_empty()
+            || !previous.contains_key(&workspace_id)
+        {
+            workspaces.push(LifecycleWorkspaceDelta {
+                workspace_id,
+                run_deltas,
+                removed_run_ids,
+            });
+        }
+    }
+
+    for (workspace_id, prev_snapshot) in previous {
+        if !seen.contains(workspace_id) {
+            let removed_run_ids = prev_snapshot
+                .recent_runs
+                .iter()
+                .map(|run| run.run.id)
+                .collect::<Vec<_>>();
+            workspaces.push(LifecycleWorkspaceDelta {
+                workspace_id: *workspace_id,
+                run_deltas: Vec::new(),
+                removed_run_ids,
+            });
+        }
+    }
+
+    if workspaces.is_empty() {
+        None
+    } else {
+        Some(LifecycleDelta { workspaces })
+    }
+}
+
+fn diff_runs(
+    previous: &[LifecycleRunSnapshot],
+    current: &[LifecycleRunSnapshot],
+) -> (Vec<LifecycleRunDelta>, Vec<i64>) {
+    let mut previous_map: HashMap<i64, &LifecycleRunSnapshot> = HashMap::new();
+    for snapshot in previous {
+        previous_map.insert(snapshot.run.id, snapshot);
+    }
+
+    let mut deltas = Vec::new();
+    for run in current {
+        let run_id = run.run.id;
+        let previous_snapshot = previous_map.remove(&run_id);
+        let status = run.run.status.clone();
+        let trust_changes = diff_trust(
+            previous_snapshot.and_then(|s| s.trust.as_ref()),
+            run.trust.as_ref(),
+        );
+        let intelligence_changes = diff_intelligence(
+            previous_snapshot
+                .map(|s| s.intelligence.as_slice())
+                .unwrap_or(&[]),
+            &run.intelligence,
+        );
+        let marketplace_changes = diff_marketplace(
+            previous_snapshot.and_then(|s| s.marketplace.as_ref()),
+            run.marketplace.as_ref(),
+        );
+        let previous_status = previous_snapshot.map(|s| s.run.status.clone());
+        let has_changes = previous_snapshot.is_none()
+            || previous_status.as_ref() != Some(&status)
+            || !trust_changes.is_empty()
+            || !intelligence_changes.is_empty()
+            || !marketplace_changes.is_empty();
+
+        if has_changes {
+            deltas.push(LifecycleRunDelta {
+                run_id,
+                status,
+                trust_changes,
+                intelligence_changes,
+                marketplace_changes,
+            });
+        }
+    }
+
+    let removed_run_ids = previous_map.into_keys().collect::<Vec<_>>();
+    (deltas, removed_run_ids)
+}
+
+fn diff_trust(
+    previous: Option<&RuntimeVmTrustRegistryState>,
+    current: Option<&RuntimeVmTrustRegistryState>,
+) -> Vec<LifecycleFieldChange> {
+    let mut changes = Vec::new();
+    match (previous, current) {
+        (None, None) => {}
+        (None, Some(curr)) => {
+            push_change(
+                &mut changes,
+                "trust.attestation_status",
+                None,
+                Some(curr.attestation_status.clone()),
+            );
+            push_change(
+                &mut changes,
+                "trust.lifecycle_state",
+                None,
+                Some(curr.lifecycle_state.clone()),
+            );
+            push_change(
+                &mut changes,
+                "trust.remediation_state",
+                None,
+                curr.remediation_state.clone(),
+            );
+            push_change(
+                &mut changes,
+                "trust.remediation_attempts",
+                None,
+                Some(curr.remediation_attempts.to_string()),
+            );
+            push_change(
+                &mut changes,
+                "trust.freshness_deadline",
+                None,
+                curr.freshness_deadline.map(|d| d.to_rfc3339()),
+            );
+            push_change(
+                &mut changes,
+                "trust.provenance_ref",
+                None,
+                curr.provenance_ref.clone(),
+            );
+            push_change(
+                &mut changes,
+                "trust.provenance",
+                None,
+                curr.provenance.as_ref().map(|value| value.to_string()),
+            );
+            push_change(
+                &mut changes,
+                "trust.version",
+                None,
+                Some(curr.version.to_string()),
+            );
+            push_change(
+                &mut changes,
+                "trust.updated_at",
+                None,
+                Some(curr.updated_at.to_rfc3339()),
+            );
+        }
+        (Some(prev), Some(curr)) => {
+            push_change(
+                &mut changes,
+                "trust.attestation_status",
+                Some(prev.attestation_status.clone()),
+                Some(curr.attestation_status.clone()),
+            );
+            push_change(
+                &mut changes,
+                "trust.lifecycle_state",
+                Some(prev.lifecycle_state.clone()),
+                Some(curr.lifecycle_state.clone()),
+            );
+            push_change(
+                &mut changes,
+                "trust.remediation_state",
+                prev.remediation_state.clone(),
+                curr.remediation_state.clone(),
+            );
+            push_change(
+                &mut changes,
+                "trust.remediation_attempts",
+                Some(prev.remediation_attempts.to_string()),
+                Some(curr.remediation_attempts.to_string()),
+            );
+            push_change(
+                &mut changes,
+                "trust.freshness_deadline",
+                prev.freshness_deadline.map(|d| d.to_rfc3339()),
+                curr.freshness_deadline.map(|d| d.to_rfc3339()),
+            );
+            push_change(
+                &mut changes,
+                "trust.provenance_ref",
+                prev.provenance_ref.clone(),
+                curr.provenance_ref.clone(),
+            );
+            push_change(
+                &mut changes,
+                "trust.provenance",
+                prev.provenance.as_ref().map(|value| value.to_string()),
+                curr.provenance.as_ref().map(|value| value.to_string()),
+            );
+            push_change(
+                &mut changes,
+                "trust.version",
+                Some(prev.version.to_string()),
+                Some(curr.version.to_string()),
+            );
+            push_change(
+                &mut changes,
+                "trust.updated_at",
+                Some(prev.updated_at.to_rfc3339()),
+                Some(curr.updated_at.to_rfc3339()),
+            );
+        }
+        (Some(prev), None) => {
+            push_change(
+                &mut changes,
+                "trust.attestation_status",
+                Some(prev.attestation_status.clone()),
+                None,
+            );
+            push_change(
+                &mut changes,
+                "trust.lifecycle_state",
+                Some(prev.lifecycle_state.clone()),
+                None,
+            );
+            push_change(
+                &mut changes,
+                "trust.remediation_state",
+                prev.remediation_state.clone(),
+                None,
+            );
+            push_change(
+                &mut changes,
+                "trust.remediation_attempts",
+                Some(prev.remediation_attempts.to_string()),
+                None,
+            );
+            push_change(
+                &mut changes,
+                "trust.freshness_deadline",
+                prev.freshness_deadline.map(|d| d.to_rfc3339()),
+                None,
+            );
+            push_change(
+                &mut changes,
+                "trust.provenance_ref",
+                prev.provenance_ref.clone(),
+                None,
+            );
+            push_change(
+                &mut changes,
+                "trust.provenance",
+                prev.provenance.as_ref().map(|value| value.to_string()),
+                None,
+            );
+            push_change(
+                &mut changes,
+                "trust.version",
+                Some(prev.version.to_string()),
+                None,
+            );
+            push_change(
+                &mut changes,
+                "trust.updated_at",
+                Some(prev.updated_at.to_rfc3339()),
+                None,
+            );
+        }
+    }
+
+    changes
+}
+
+fn diff_intelligence(
+    previous: &[IntelligenceScoreOverview],
+    current: &[IntelligenceScoreOverview],
+) -> Vec<LifecycleFieldChange> {
+    let mut changes = Vec::new();
+    let mut previous_map: HashMap<String, &IntelligenceScoreOverview> = HashMap::new();
+    for score in previous {
+        previous_map.insert(score.capability.clone(), score);
+    }
+
+    for score in current {
+        let previous_score = previous_map.remove(&score.capability);
+        let capability_prefix = format!("intelligence.{}", score.capability);
+        match previous_score {
+            None => {
+                push_change(
+                    &mut changes,
+                    &format!("{}.status", capability_prefix),
+                    None,
+                    Some(score.status.clone()),
+                );
+                push_change(
+                    &mut changes,
+                    &format!("{}.tier", capability_prefix),
+                    None,
+                    score.tier.clone(),
+                );
+                push_change(
+                    &mut changes,
+                    &format!("{}.backend", capability_prefix),
+                    None,
+                    score.backend.clone(),
+                );
+                push_change(
+                    &mut changes,
+                    &format!("{}.score", capability_prefix),
+                    None,
+                    Some(format_float(score.score)),
+                );
+                push_change(
+                    &mut changes,
+                    &format!("{}.confidence", capability_prefix),
+                    None,
+                    Some(format_float(score.confidence)),
+                );
+                push_change(
+                    &mut changes,
+                    &format!("{}.last_observed_at", capability_prefix),
+                    None,
+                    Some(score.last_observed_at.to_rfc3339()),
+                );
+            }
+            Some(prev) => {
+                push_change(
+                    &mut changes,
+                    &format!("{}.status", capability_prefix),
+                    Some(prev.status.clone()),
+                    Some(score.status.clone()),
+                );
+                push_change(
+                    &mut changes,
+                    &format!("{}.tier", capability_prefix),
+                    prev.tier.clone(),
+                    score.tier.clone(),
+                );
+                push_change(
+                    &mut changes,
+                    &format!("{}.backend", capability_prefix),
+                    prev.backend.clone(),
+                    score.backend.clone(),
+                );
+                push_change(
+                    &mut changes,
+                    &format!("{}.score", capability_prefix),
+                    Some(format_float(prev.score)),
+                    Some(format_float(score.score)),
+                );
+                push_change(
+                    &mut changes,
+                    &format!("{}.confidence", capability_prefix),
+                    Some(format_float(prev.confidence)),
+                    Some(format_float(score.confidence)),
+                );
+                push_change(
+                    &mut changes,
+                    &format!("{}.last_observed_at", capability_prefix),
+                    Some(prev.last_observed_at.to_rfc3339()),
+                    Some(score.last_observed_at.to_rfc3339()),
+                );
+            }
+        }
+    }
+
+    for (capability, prev) in previous_map {
+        let capability_prefix = format!("intelligence.{}", capability);
+        push_change(
+            &mut changes,
+            &format!("{}.status", capability_prefix),
+            Some(prev.status.clone()),
+            None,
+        );
+        push_change(
+            &mut changes,
+            &format!("{}.tier", capability_prefix),
+            prev.tier.clone(),
+            None,
+        );
+        push_change(
+            &mut changes,
+            &format!("{}.backend", capability_prefix),
+            prev.backend.clone(),
+            None,
+        );
+        push_change(
+            &mut changes,
+            &format!("{}.score", capability_prefix),
+            Some(format_float(prev.score)),
+            None,
+        );
+        push_change(
+            &mut changes,
+            &format!("{}.confidence", capability_prefix),
+            Some(format_float(prev.confidence)),
+            None,
+        );
+        push_change(
+            &mut changes,
+            &format!("{}.last_observed_at", capability_prefix),
+            Some(prev.last_observed_at.to_rfc3339()),
+            None,
+        );
+    }
+
+    changes
+}
+
+fn diff_marketplace(
+    previous: Option<&MarketplaceReadiness>,
+    current: Option<&MarketplaceReadiness>,
+) -> Vec<LifecycleFieldChange> {
+    let mut changes = Vec::new();
+    match (previous, current) {
+        (None, None) => {}
+        (None, Some(curr)) => {
+            push_change(
+                &mut changes,
+                "marketplace.status",
+                None,
+                Some(curr.status.clone()),
+            );
+            push_change(
+                &mut changes,
+                "marketplace.last_completed_at",
+                None,
+                curr.last_completed_at.map(|dt| dt.to_rfc3339()),
+            );
+        }
+        (Some(prev), Some(curr)) => {
+            push_change(
+                &mut changes,
+                "marketplace.status",
+                Some(prev.status.clone()),
+                Some(curr.status.clone()),
+            );
+            push_change(
+                &mut changes,
+                "marketplace.last_completed_at",
+                prev.last_completed_at.map(|dt| dt.to_rfc3339()),
+                curr.last_completed_at.map(|dt| dt.to_rfc3339()),
+            );
+        }
+        (Some(prev), None) => {
+            push_change(
+                &mut changes,
+                "marketplace.status",
+                Some(prev.status.clone()),
+                None,
+            );
+            push_change(
+                &mut changes,
+                "marketplace.last_completed_at",
+                prev.last_completed_at.map(|dt| dt.to_rfc3339()),
+                None,
+            );
+        }
+    }
+    changes
+}
+
+fn push_change(
+    changes: &mut Vec<LifecycleFieldChange>,
+    field: &str,
+    previous: Option<String>,
+    current: Option<String>,
+) {
+    if previous != current {
+        changes.push(LifecycleFieldChange {
+            field: field.to_string(),
+            previous,
+            current,
+        });
+    }
+}
+
+fn format_float(value: f32) -> String {
+    format!("{value:.4}")
 }
 
 async fn load_intelligence_scores(

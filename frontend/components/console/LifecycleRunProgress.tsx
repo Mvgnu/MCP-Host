@@ -5,6 +5,7 @@ import { LifecycleRunSnapshot } from '../../lib/lifecycle-console';
 // key: lifecycle-console-ui -> run-progress
 interface Props {
   run: LifecycleRunSnapshot;
+  onSelect?: (run: LifecycleRunSnapshot) => void;
 }
 
 function formatDuration(startedAt: string, completedAt?: string | null) {
@@ -18,7 +19,7 @@ function formatDuration(startedAt: string, completedAt?: string | null) {
   return `${minutes}m ${seconds}s`;
 }
 
-export default function LifecycleRunProgress({ run }: Props) {
+export default function LifecycleRunProgress({ run, onSelect }: Props) {
   const statusBadge = useMemo(() => {
     const status = run.run.status;
     const base = 'px-2 py-1 rounded text-xs font-semibold';
@@ -36,7 +37,7 @@ export default function LifecycleRunProgress({ run }: Props) {
 
   return (
     <div className="border border-slate-200 rounded p-3 bg-white shadow-sm">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-2">
         <div>
           <p className="text-sm font-semibold">Run #{run.run.id}</p>
           <p className="text-xs text-slate-500">
@@ -44,6 +45,15 @@ export default function LifecycleRunProgress({ run }: Props) {
           </p>
         </div>
         <span className={statusBadge}>{run.run.status}</span>
+        {onSelect && (
+          <button
+            type="button"
+            className="px-2 py-1 text-xs font-medium rounded border border-slate-200 text-slate-600 hover:bg-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500"
+            onClick={() => onSelect(run)}
+          >
+            View details
+          </button>
+        )}
       </div>
       {run.run.failure_reason && (
         <p className="mt-2 text-xs text-rose-600">
