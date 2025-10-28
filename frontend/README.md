@@ -22,10 +22,15 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to see the
   stream exposed at `/api/console/lifecycle/stream`, reconnecting automatically with cursor resumption metadata.
 - Snapshot events drive workspace cards that surface promotion gate verdicts, recent remediation runs, trust registry states,
   capability intelligence scores, and marketplace readiness in a single view.
-- When streaming is unavailable the UI falls back to a 15s REST polling loop and surfaces connection errors inline. Cursor state
-  is preserved across reconnects to avoid duplicate records.
-- Playwright smoke coverage for the lifecycle console lives in `e2e/console.spec.ts`; run `npx playwright test e2e/console.spec.ts`
-  against a running development server to capture updated screenshots and contract behaviour.
+- Filter controls (workspace search, promotion lane, severity) feed the backend query parameters and persist to local storage,
+  enabling scoped investigations and shared context between browser sessions.
+- Snapshot envelopes include delta metadata. The UI renders recent trust/intelligence/marketplace changes on each run and opens a
+  drill-down modal with threaded timelines, metadata, and replay context.
+- When streaming is unavailable or the browser goes offline the UI falls back to a 15s REST polling loop. Cursor state, filters,
+  recent snapshots, and run deltas hydrate from local storage so operators can resume where they left off once connectivity
+  returns.
+- Playwright regression coverage for filters, offline resume, and SSE replay semantics lives in `e2e/console.spec.ts`; run
+  `npx playwright test e2e/console.spec.ts` against a running development server to capture updated expectations.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 

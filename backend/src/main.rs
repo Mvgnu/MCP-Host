@@ -1,32 +1,23 @@
 use axum::{routing::get, Extension, Router};
 use axum_prometheus::PrometheusMetricLayer;
-use base64::engine::general_purpose::STANDARD as Base64Engine;
-use base64::Engine;
+#[cfg(feature = "libvirt-executor")]
+use backend::runtime::vm::libvirt::LibvirtVmProvisioner;
+#[cfg(feature = "libvirt-executor")]
+use backend::runtime::RealLibvirtDriver;
 use backend::{
-    config,
-    evaluations,
-    governance,
-    ingestion,
+    config, evaluations, governance, ingestion,
     job_queue::start_worker,
     policy::{RuntimeBackend, RuntimePolicyEngine},
     remediation,
     routes::api_routes,
     runtime::{
-        self,
-        ContainerRuntime,
-        DockerRuntime,
-        HttpHypervisorProvisioner,
-        KubernetesRuntime,
-        RuntimeOrchestrator,
-        TpmAttestationVerifier,
-        VirtualMachineExecutor,
+        self, ContainerRuntime, DockerRuntime, HttpHypervisorProvisioner, KubernetesRuntime,
+        RuntimeOrchestrator, TpmAttestationVerifier, VirtualMachineExecutor,
     },
     trust,
 };
-#[cfg(feature = "libvirt-executor")]
-use backend::runtime::vm::libvirt::LibvirtVmProvisioner;
-#[cfg(feature = "libvirt-executor")]
-use backend::runtime::RealLibvirtDriver;
+use base64::engine::general_purpose::STANDARD as Base64Engine;
+use base64::Engine;
 use ed25519_dalek::PublicKey;
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;

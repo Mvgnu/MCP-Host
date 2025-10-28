@@ -23,15 +23,15 @@ pub use config::{
 pub use job_queue::Job;
 
 mod docker;
+mod domains;
 mod evaluation;
 pub mod evaluations;
 mod extractor;
-pub mod governance;
-mod invocations;
-pub mod ingestion;
-pub mod job_queue;
-mod domains;
 mod file_store;
+pub mod governance;
+pub mod ingestion;
+mod invocations;
+pub mod job_queue;
 mod marketplace;
 mod organizations;
 mod promotions;
@@ -40,6 +40,6 @@ pub mod routes;
 mod secrets;
 mod servers;
 mod services;
+mod vault;
 mod vector_dbs;
 mod workflows;
-mod vault;

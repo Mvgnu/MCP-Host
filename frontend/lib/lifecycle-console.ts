@@ -43,6 +43,31 @@ export interface LifecycleConsoleEventEnvelope {
   cursor?: number | null;
   page?: LifecycleConsolePage;
   error?: string;
+  delta?: LifecycleDelta;
+}
+
+export interface LifecycleDelta {
+  workspaces: LifecycleWorkspaceDelta[];
+}
+
+export interface LifecycleWorkspaceDelta {
+  workspace_id: number;
+  run_deltas: LifecycleRunDelta[];
+  removed_run_ids: number[];
+}
+
+export interface LifecycleRunDelta {
+  run_id: number;
+  status: string;
+  trust_changes: LifecycleFieldChange[];
+  intelligence_changes: LifecycleFieldChange[];
+  marketplace_changes: LifecycleFieldChange[];
+}
+
+export interface LifecycleFieldChange {
+  field: string;
+  previous?: string | null;
+  current?: string | null;
 }
 
 export interface RemediationWorkspace {

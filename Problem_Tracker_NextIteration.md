@@ -317,3 +317,11 @@
   Hypothesis: Centralizing module exposure through `backend/src/lib.rs` will prevent the `RuntimeVmRemediationRun` duplication seen when `main.rs` privately declared modules, allowing full `cargo check --locked --all-targets` runs to pass.
   Log:
     - 2025-12-05 13:55:00 UTC: Re-exported backend modules from the library, updated `main.rs` to import via `backend::...`, refreshed the README crate-structure notes, and verified the fix with `cargo check --locked --all-targets`.
+
+- ID: BE-LIFE-RESIL-001
+  Status: IN_PROGRESS
+  Task: Deepen lifecycle console filters, replay payloads, and SSE delta metadata.
+  Hypothesis: Extending backend query filters, delta envelopes, and replay semantics should unlock scoped console experiences and resilient resume logic for operators.
+  Log:
+    - 2025-12-07 09:00:00 UTC: Initiated lifecycle console resilience iteration, auditing backend queries, SSE envelopes, and frontend persistence gaps.
+    - 2025-12-07 12:30:00 UTC: Added workspace/promotion/severity filters, SSE delta envelopes with trust/intel replay, offline cache hydration, and drill-down UI surfaces with Playwright coverage.
