@@ -12,6 +12,7 @@ JWT_SECRET="${HARNESS_JWT_SECRET:-integration-secret}"
 DATABASE_URL="postgres://postgres:remediation@127.0.0.1:${POSTGRES_PORT}/mcp"
 BACKEND_LOG="${HARNESS_DIR}/backend.log"
 MANIFEST_PATH="${HARNESS_MANIFEST_PATH:-${HARNESS_DIR}/remediation_harness_manifest.json}"
+SCENARIO_ROOT="${HARNESS_SCENARIO_ROOT:-${HARNESS_DIR}/scenarios}"
 
 cleanup() {
     set +e
@@ -90,31 +91,62 @@ echo "[harness] executing remediation lifecycle integration test" >&2
 )
 
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-cat >"${MANIFEST_PATH}" <<EOF
-{
-  "generated_at": "${TIMESTAMP}",
-  "database_url": "${DATABASE_URL}",
-  "scenarios": [
-    {
-      "test": "remediation_lifecycle_harness",
-      "tags": ["validation:remediation_flow"]
-    },
-    {
-      "test": "remediation_concurrent_enqueue_dedupe",
-      "tags": ["validation:remediation-concurrency"]
-    },
-    {
-      "test": "remediation_multi_tenant_chaos_matrix",
-      "tags": [
-        "validation:remediation-chaos-matrix",
-        "validation:tenant-isolation",
-        "validation:concurrent-approvals",
-        "validation:executor-outage"
-      ]
-    }
-  ]
+python3 - <<'PY' "${SCENARIO_ROOT}" "${MANIFEST_PATH}" "${DATABASE_URL}" "${TIMESTAMP}"
+import json
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+scenario_root = Path(sys.argv[1])
+manifest_path = Path(sys.argv[2])
+database_url = sys.argv[3]
+timestamp = sys.argv[4]
+
+records = []
+if scenario_root.exists():
+    for candidate in sorted(scenario_root.rglob('*')):
+        if not candidate.is_file():
+            continue
+        extension = candidate.suffix.lower()
+        if extension not in {'.json', '.yaml', '.yml'}:
+            continue
+        raw = candidate.read_bytes()
+        checksum = hashlib.sha256(raw).hexdigest()
+        text = raw.decode('utf-8', 'ignore')
+        description = ""
+        if extension == '.json':
+            try:
+                payload = json.loads(text)
+                description = payload.get('description', "")
+            except json.JSONDecodeError:
+                description = ""
+        else:
+            for line in text.splitlines():
+                stripped = line.strip()
+                if stripped.startswith('description:'):
+                    description = stripped.split(':', 1)[1].strip().strip('"')
+                    break
+
+        records.append({
+            "path": str(candidate.relative_to(scenario_root)),
+            "absolute_path": str(candidate),
+            "sha256": checksum,
+            "format": extension.lstrip('.'),
+            "description": description,
+        })
+else:
+    os.makedirs(scenario_root, exist_ok=True)
+
+manifest = {
+    "generated_at": timestamp,
+    "database_url": database_url,
+    "scenario_root": str(scenario_root),
+    "scenarios": records,
 }
-EOF
-echo "[harness] wrote manifest to ${MANIFEST_PATH}" >&2
+
+manifest_path.write_text(json.dumps(manifest, indent=2))
+PY
+echo "[harness] wrote manifest to ${MANIFEST_PATH} (scenarios: ${SCENARIO_ROOT})" >&2
 
 echo "[harness] complete" >&2

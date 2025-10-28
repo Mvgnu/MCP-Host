@@ -1,3 +1,4 @@
+use anyhow::{bail, Context, Result};
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
@@ -13,8 +14,14 @@ use chrono::{Duration, Utc};
 use futures_util::future::join_all;
 use hyper::body;
 use jsonwebtoken::{encode, EncodingKey, Header};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+};
 use tower::ServiceExt;
 
 #[derive(Clone)]
@@ -169,25 +176,143 @@ impl RemediationHarness {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum ScenarioKind {
     TenantIsolation,
     ConcurrentApprovals,
     ExecutorOutageResumption,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct ScenarioDefinition {
-    name: &'static str,
-    tag: &'static str,
+    name: String,
+    tag: String,
     kind: ScenarioKind,
 }
 
-async fn run_scenario(
-    harness: &RemediationHarness,
-    scenario: ScenarioDefinition,
-    tenant: &str,
-) {
+#[derive(Debug, Deserialize)]
+struct ScenarioManifestDocument {
+    #[serde(default)]
+    description: Option<String>,
+    scenarios: Vec<ScenarioManifestEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScenarioManifestEntry {
+    name: String,
+    tag: String,
+    kind: ScenarioManifestKind,
+    #[serde(default)]
+    tenants: BTreeSet<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ScenarioManifestKind {
+    TenantIsolation,
+    ConcurrentApprovals,
+    ExecutorOutageResumption,
+}
+
+#[derive(Clone, Debug)]
+struct ScenarioExecution {
+    definition: ScenarioDefinition,
+    tenant: String,
+}
+
+const SCENARIO_DIR_ENV: &str = "REM_FABRIC_SCENARIO_DIR";
+const DEFAULT_SCENARIO_DIR: &str = "../scripts/remediation_harness/scenarios";
+
+// key: verification -> remediation-fabric:manifest-loader
+fn scenario_kind_from_manifest(kind: ScenarioManifestKind) -> ScenarioKind {
+    match kind {
+        ScenarioManifestKind::TenantIsolation => ScenarioKind::TenantIsolation,
+        ScenarioManifestKind::ConcurrentApprovals => ScenarioKind::ConcurrentApprovals,
+        ScenarioManifestKind::ExecutorOutageResumption => ScenarioKind::ExecutorOutageResumption,
+    }
+}
+
+fn resolve_manifest_root() -> PathBuf {
+    std::env::var(SCENARIO_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_SCENARIO_DIR))
+}
+
+fn load_manifest_directory(path: &Path) -> Result<Vec<ScenarioExecution>> {
+    if !path.exists() {
+        bail!("scenario manifest directory missing: {}", path.display());
+    }
+
+    let mut manifest_paths: Vec<PathBuf> = fs::read_dir(path)
+        .with_context(|| format!("reading scenario manifest directory {}", path.display()))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|candidate| candidate.is_file())
+        .collect();
+    manifest_paths.sort();
+
+    let mut executions = Vec::new();
+    for manifest_path in manifest_paths {
+        executions.extend(load_manifest_file(&manifest_path)?);
+    }
+
+    if executions.is_empty() {
+        bail!(
+            "no scenarios discovered in manifest directory {}",
+            path.display()
+        );
+    }
+
+    Ok(executions)
+}
+
+fn load_manifest_file(path: &Path) -> Result<Vec<ScenarioExecution>> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("reading scenario manifest {}", path.display()))?;
+
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let document: ScenarioManifestDocument = match extension.as_str() {
+        "json" => serde_json::from_str(&raw)
+            .with_context(|| format!("parsing JSON manifest {}", path.display()))?,
+        "yaml" | "yml" => serde_yaml::from_str(&raw)
+            .with_context(|| format!("parsing YAML manifest {}", path.display()))?,
+        other => bail!(
+            "unsupported manifest extension {} for {}",
+            other,
+            path.display()
+        ),
+    };
+
+    let mut executions = Vec::new();
+    for entry in document.scenarios {
+        let definition = ScenarioDefinition {
+            name: entry.name.clone(),
+            tag: entry.tag.clone(),
+            kind: scenario_kind_from_manifest(entry.kind),
+        };
+
+        let tenants = if entry.tenants.is_empty() {
+            vec!["default".to_string()]
+        } else {
+            entry.tenants.into_iter().collect()
+        };
+
+        for tenant in tenants {
+            executions.push(ScenarioExecution {
+                definition: definition.clone(),
+                tenant,
+            });
+        }
+    }
+
+    Ok(executions)
+}
+
+async fn run_scenario(harness: &RemediationHarness, scenario: &ScenarioDefinition, tenant: &str) {
     eprintln!(
         "[remediation-chaos] executing scenario {} ({})",
         scenario.name, scenario.tag
@@ -195,15 +320,15 @@ async fn run_scenario(
     match scenario.kind {
         ScenarioKind::TenantIsolation => {
             // key: validation -> remediation-matrix:tenant-isolation
-            scenario_tenant_isolation(harness, &scenario, tenant).await;
+            scenario_tenant_isolation(harness, scenario, tenant).await;
         }
         ScenarioKind::ConcurrentApprovals => {
             // key: validation -> remediation-matrix:concurrent-approvals
-            scenario_concurrent_approvals(harness, &scenario, tenant).await;
+            scenario_concurrent_approvals(harness, scenario, tenant).await;
         }
         ScenarioKind::ExecutorOutageResumption => {
             // key: validation -> remediation-matrix:executor-outage
-            scenario_executor_outage_resumption(harness, &scenario, tenant).await;
+            scenario_executor_outage_resumption(harness, scenario, tenant).await;
         }
     }
 }
@@ -449,10 +574,7 @@ async fn scenario_executor_outage_resumption(
     .await
     .unwrap();
 
-    let outage_state = format!(
-        "remediation:executor-outage:{}:{}",
-        scenario.name, tenant
-    );
+    let outage_state = format!("remediation:executor-outage:{}:{}", scenario.name, tenant);
 
     let registry_state = upsert_state(
         harness.pool(),
@@ -534,22 +656,20 @@ async fn scenario_executor_outage_resumption(
     .await
     .unwrap();
 
-    let failed_status: (String,) = sqlx::query_as(
-        "SELECT status FROM runtime_vm_remediation_runs WHERE id = $1",
-    )
-    .bind(run_id)
-    .fetch_one(harness.pool())
-    .await
-    .unwrap();
+    let failed_status: (String,) =
+        sqlx::query_as("SELECT status FROM runtime_vm_remediation_runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_one(harness.pool())
+            .await
+            .unwrap();
     assert_eq!(failed_status.0, "failed");
 
-    let completed_status: (String,) = sqlx::query_as(
-        "SELECT status FROM runtime_vm_remediation_runs WHERE id = $1",
-    )
-    .bind(retry_run_id)
-    .fetch_one(harness.pool())
-    .await
-    .unwrap();
+    let completed_status: (String,) =
+        sqlx::query_as("SELECT status FROM runtime_vm_remediation_runs WHERE id = $1")
+            .bind(retry_run_id)
+            .fetch_one(harness.pool())
+            .await
+            .unwrap();
     assert_eq!(completed_status.0, "completed");
 
     let queued_count: (i64,) = sqlx::query_as(
@@ -1011,35 +1131,19 @@ async fn remediation_concurrent_enqueue_dedupe(pool: PgPool) {
 #[ignore = "requires DATABASE_URL with Postgres server"]
 async fn remediation_multi_tenant_chaos_matrix(pool: PgPool) {
     let harness = bootstrap_remediation_harness(&pool).await;
-    let scenarios = vec![
-        ScenarioDefinition {
-            name: "tenant-isolation",
-            tag: "validation:tenant-isolation",
-            kind: ScenarioKind::TenantIsolation,
-        },
-        ScenarioDefinition {
-            name: "concurrent-approvals",
-            tag: "validation:concurrent-approvals",
-            kind: ScenarioKind::ConcurrentApprovals,
-        },
-        ScenarioDefinition {
-            name: "executor-outage",
-            tag: "validation:executor-outage",
-            kind: ScenarioKind::ExecutorOutageResumption,
-        },
-    ];
-
-    let tenants = vec!["tenant-alpha", "tenant-bravo", "tenant-charlie"];
+    let manifest_root = resolve_manifest_root();
+    let executions = load_manifest_directory(&manifest_root)
+        .with_context(|| format!("loading scenarios from {}", manifest_root.display()))
+        .unwrap();
 
     let mut futures = Vec::new();
-    for tenant in tenants {
-        for scenario in scenarios.iter().copied() {
-            let harness_clone = harness.clone();
-            let tenant_label = tenant.to_string();
-            futures.push(async move {
-                run_scenario(&harness_clone, scenario, tenant_label.as_str()).await;
-            });
-        }
+    for execution in executions {
+        let harness_clone = harness.clone();
+        let definition = execution.definition.clone();
+        let tenant = execution.tenant.clone();
+        futures.push(async move {
+            run_scenario(&harness_clone, &definition, tenant.as_str()).await;
+        });
     }
 
     join_all(futures).await;

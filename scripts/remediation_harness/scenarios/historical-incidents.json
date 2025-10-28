@@ -1,0 +1,17 @@
+{
+  "description": "Historical incident regression manifest",
+  "scenarios": [
+    {
+      "name": "tenant-isolation",
+      "tag": "regression:tenant-isolation-2024-01",
+      "kind": "tenant-isolation",
+      "tenants": ["tenant-echo"]
+    },
+    {
+      "name": "executor-outage",
+      "tag": "regression:executor-outage-incident-4472",
+      "kind": "executor-outage-resumption",
+      "tenants": ["tenant-foxtrot", "tenant-golf"]
+    }
+  ]
+}

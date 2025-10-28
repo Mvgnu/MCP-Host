@@ -1,0 +1,22 @@
+# key: verification -> remediation-fabric:chaos-matrix
+description: "Baseline remediation chaos matrix"
+scenarios:
+  - name: tenant-isolation
+    tag: validation:tenant-isolation
+    kind: tenant-isolation
+    tenants:
+      - tenant-alpha
+      - tenant-bravo
+      - tenant-charlie
+  - name: concurrent-approvals
+    tag: validation:concurrent-approvals
+    kind: concurrent-approvals
+    tenants:
+      - tenant-alpha
+      - tenant-delta
+  - name: executor-outage
+    tag: validation:executor-outage
+    kind: executor-outage-resumption
+    tenants:
+      - tenant-alpha
+      - tenant-bravo
