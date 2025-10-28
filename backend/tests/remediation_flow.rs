@@ -1469,6 +1469,178 @@ async fn remediation_workspace_promotion_multiple_targets(pool: PgPool) {
     );
 }
 
+// key: validation -> remediation-stream:workspace-context
+#[sqlx::test]
+#[ignore = "requires DATABASE_URL with Postgres server"]
+async fn remediation_workspace_promotion_stream_includes_workspace_context(pool: PgPool) {
+    let harness = bootstrap_remediation_harness(&pool).await;
+    let app = harness.app.clone();
+    let token = harness.token.clone();
+
+    let playbook_payload = json!({
+        "playbook_key": "vm.workspace.sse",
+        "display_name": "Workspace SSE Playbook",
+        "description": "Ensures SSE payload carries workspace linkage",
+        "executor_type": "shell",
+        "approval_required": true,
+        "metadata": {"origin": "workspace-sse"},
+    });
+    create_playbook(&app, &token, playbook_payload).await;
+
+    let workspace_payload = json!({
+        "workspace_key": "workspace.sse",
+        "display_name": "Workspace SSE Coverage",
+        "description": "Covers SSE workspace context propagation",
+        "plan": {
+            "playbooks": ["vm.workspace.sse"],
+            "targets": [
+                {
+                    "runtime_vm_instance_id": harness.vm_instance_id,
+                    "playbook": "vm.workspace.sse",
+                    "automation_payload": {"scenario": "workspace-sse"},
+                }
+            ],
+        },
+        "metadata": {"channel": "sse"},
+        "lineage_tags": ["coverage"],
+        "lineage_labels": ["channel:sse"],
+    });
+    let workspace = create_workspace(&app, &token, workspace_payload).await;
+    let workspace_id = workspace["workspace"]["id"].as_i64().unwrap();
+    let mut workspace_version = workspace["workspace"]["version"].as_i64().unwrap();
+    let revision_id = workspace["workspace"]["active_revision_id"]
+        .as_i64()
+        .unwrap();
+    let revision_envelope = select_revision(&workspace, revision_id);
+    let mut revision_version = revision_envelope["revision"]["version"].as_i64().unwrap();
+
+    let schema_envelope = apply_workspace_schema(
+        &app,
+        &token,
+        workspace_id,
+        revision_id,
+        json!({
+            "result_status": "passed",
+            "errors": [],
+            "gate_context": {"stage": "schema"},
+            "metadata": {"validator": "workspace-sse"},
+            "expected_revision_version": revision_version,
+        }),
+    )
+    .await;
+    let schema_revision = select_revision(&schema_envelope, revision_id);
+    revision_version = schema_revision["revision"]["version"].as_i64().unwrap();
+
+    let policy_envelope = apply_workspace_policy(
+        &app,
+        &token,
+        workspace_id,
+        revision_id,
+        json!({
+            "policy_status": "approved",
+            "veto_reasons": [],
+            "gate_context": {"stage": "policy"},
+            "metadata": {"ticket": "SSE-1"},
+            "expected_revision_version": revision_version,
+        }),
+    )
+    .await;
+    workspace_version = policy_envelope["workspace"]["version"].as_i64().unwrap();
+    let policy_revision = select_revision(&policy_envelope, revision_id);
+    revision_version = policy_revision["revision"]["version"].as_i64().unwrap();
+
+    let simulation_envelope = apply_workspace_simulation(
+        &app,
+        &token,
+        workspace_id,
+        revision_id,
+        json!({
+            "simulator_kind": "workspace-sse",
+            "execution_state": "succeeded",
+            "gate_context": {"stage": "simulation"},
+            "metadata": {"diff": "clean"},
+            "expected_workspace_version": workspace_version,
+            "expected_revision_version": revision_version,
+        }),
+    )
+    .await;
+    workspace_version = simulation_envelope["workspace"]["version"]
+        .as_i64()
+        .unwrap();
+    let simulation_revision = select_revision(&simulation_envelope, revision_id);
+    revision_version = simulation_revision["revision"]["version"].as_i64().unwrap();
+
+    let promotion_gate_context = json!({"lane": "sse", "stage": "promotion"});
+    let _promotion_envelope = apply_workspace_promotion(
+        &app,
+        &token,
+        workspace_id,
+        revision_id,
+        json!({
+            "promotion_status": "completed",
+            "gate_context": promotion_gate_context,
+            "notes": ["workspace-sse"],
+            "expected_workspace_version": workspace_version,
+            "expected_revision_version": revision_version,
+        }),
+    )
+    .await;
+
+    tokio::time::sleep(StdDuration::from_millis(50)).await;
+
+    let runs = list_workspace_runs(&app, &token, workspace_id, revision_id).await;
+    assert_eq!(runs.len(), 1, "expected single promotion-triggered run");
+    let run = runs.into_iter().next().unwrap();
+    let run_id = run["id"].as_i64().unwrap();
+    let run_version = run["version"].as_i64().unwrap();
+
+    let stream_task = tokio::spawn(collect_stream_events(app.clone(), token.clone(), run_id));
+
+    let approval_payload = json!({
+        "new_state": "approved",
+        "expected_version": run_version,
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/trust/remediation/runs/{run_id}/approval"))
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(approval_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let events = stream_task
+        .await
+        .expect("stream collection failed for workspace remediation run");
+    assert!(
+        !events.is_empty(),
+        "expected remediation SSE events for workspace-linked run"
+    );
+
+    let first = events.first().unwrap();
+    assert_eq!(
+        first.get("workspace_id").and_then(Value::as_i64),
+        Some(workspace_id)
+    );
+    assert_eq!(
+        first.get("workspace_revision_id").and_then(Value::as_i64),
+        Some(revision_id)
+    );
+    assert_eq!(
+        first
+            .get("promotion_gate_context")
+            .and_then(|value| value.get("lane"))
+            .and_then(Value::as_str),
+        Some("sse")
+    );
+}
+
 async fn create_playbook(
     app: &Router,
     token: &str,
