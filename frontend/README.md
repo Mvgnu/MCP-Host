@@ -16,7 +16,16 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Lifecycle Console
+
+- Navigate to `/console/lifecycle` to view the remediation lifecycle console. The page orchestrates REST pagination with an SSE
+  stream exposed at `/api/console/lifecycle/stream`, reconnecting automatically with cursor resumption metadata.
+- Snapshot events drive workspace cards that surface promotion gate verdicts, recent remediation runs, trust registry states,
+  capability intelligence scores, and marketplace readiness in a single view.
+- When streaming is unavailable the UI falls back to a 15s REST polling loop and surfaces connection errors inline. Cursor state
+  is preserved across reconnects to avoid duplicate records.
+- Playwright smoke coverage for the lifecycle console lives in `e2e/console.spec.ts`; run `npx playwright test e2e/console.spec.ts`
+  against a running development server to capture updated screenshots and contract behaviour.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 

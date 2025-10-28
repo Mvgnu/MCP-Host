@@ -17,6 +17,7 @@ export default function Nav() {
       <Link href="/orgs">Orgs</Link>
       <Link href="/servers">Servers</Link>
       <Link href="/servers/new">New Server</Link>
+      <Link href="/console/lifecycle">Lifecycle Console</Link>
       {user ? (
         <>
           <Link href="/profile">Profile</Link>

@@ -303,6 +303,14 @@
   Log:
     - 2025-12-05 10:15:00 UTC: Added `backend/src/lifecycle_console/mod.rs` with paginated workspace aggregation helpers, wired the new REST handler, documented the data plane, and seeded SQLx coverage in `backend/tests/lifecycle_console.rs`.
 
+- ID: FE-LIFE-STREAM
+  Status: DONE
+  Task: Deliver lifecycle console streaming SSE endpoint and UI timeline.
+  Hypothesis: Pairing cursor-aware SSE with a console page that merges remediation, trust, intelligence, and marketplace signals will unlock live operator situational awareness without forcing polling loops or manual database spelunking.
+  Log:
+    - 2025-12-06 09:05:00 UTC: Scoped lifecycle SSE contract, introduced event envelopes with cursor metadata, and added SQLx-backed stream integration coverage.
+    - 2025-12-06 11:20:00 UTC: Landed Next.js lifecycle console page with SSE wiring, fallback polling, console components, Playwright smoke coverage, and README updates documenting the workflow.
+
 - ID: BE-CORE-001
   Status: DONE
   Task: Collapse duplicate backend module declarations so the binary consumes the shared library surface without type mismatches.

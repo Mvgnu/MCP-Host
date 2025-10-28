@@ -1,13 +1,19 @@
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 
 use axum::{
     extract::{Extension, Query},
+    http::HeaderMap,
+    response::sse::{Event, KeepAlive, Sse},
     Json,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{query_as, PgPool, QueryBuilder};
+use tokio::sync::mpsc;
+use tokio::time::Duration;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::db::runtime_vm_remediation_runs::RuntimeVmRemediationRun;
 use crate::db::runtime_vm_remediation_workspaces::{
@@ -53,6 +59,35 @@ pub struct LifecycleConsolePage {
     pub workspaces: Vec<LifecycleWorkspaceSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LifecycleConsoleEventType {
+    Snapshot,
+    Heartbeat,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecycleConsoleEventEnvelope {
+    #[serde(rename = "type")]
+    pub event_type: LifecycleConsoleEventType,
+    pub emitted_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<LifecycleConsolePage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LifecycleStreamQuery {
+    #[serde(flatten)]
+    pub query: LifecycleConsoleQuery,
+    #[serde(default)]
+    pub heartbeat_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -145,6 +180,131 @@ pub async fn list_snapshots(
 ) -> AppResult<Json<LifecycleConsolePage>> {
     let page = fetch_page(&pool, &query).await?;
     Ok(Json(page))
+}
+
+// key: lifecycle-console -> sse,streaming
+pub async fn stream_snapshots(
+    Extension(pool): Extension<PgPool>,
+    Query(params): Query<LifecycleStreamQuery>,
+    headers: HeaderMap,
+) -> AppResult<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>> {
+    let poll_ms = params.heartbeat_ms.unwrap_or(5_000).clamp(1_000, 60_000);
+    let poll_interval = Duration::from_millis(poll_ms);
+
+    let mut query = params.query;
+    if let Some(value) = headers.get("last-event-id") {
+        if let Ok(text) = value.to_str() {
+            if let Ok(cursor) = text.parse::<i64>() {
+                query.cursor = Some(cursor);
+            }
+        }
+    }
+
+    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(16);
+    let pool_clone = pool.clone();
+    tokio::spawn(async move {
+        let mut cursor = query.cursor;
+        let mut interval = tokio::time::interval(poll_interval);
+        let mut initial = true;
+        loop {
+            if initial {
+                initial = false;
+            } else {
+                interval.tick().await;
+            }
+
+            let mut request = query.clone();
+            request.cursor = cursor;
+
+            match fetch_page(&pool_clone, &request).await {
+                Ok(page) => {
+                    if page.workspaces.is_empty() {
+                        let envelope = LifecycleConsoleEventEnvelope {
+                            event_type: LifecycleConsoleEventType::Heartbeat,
+                            emitted_at: Utc::now(),
+                            cursor,
+                            page: None,
+                            error: None,
+                        };
+                        match Event::default()
+                            .event("lifecycle-heartbeat")
+                            .json_data(&envelope)
+                        {
+                            Ok(event) => {
+                                if tx.send(Ok(event)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                tracing::error!(?err, "failed to encode lifecycle heartbeat");
+                            }
+                        }
+                        continue;
+                    }
+
+                    let event_cursor = page
+                        .workspaces
+                        .last()
+                        .map(|snapshot| snapshot.workspace.id)
+                        .or(cursor);
+                    let envelope = LifecycleConsoleEventEnvelope {
+                        event_type: LifecycleConsoleEventType::Snapshot,
+                        emitted_at: Utc::now(),
+                        cursor: event_cursor,
+                        page: Some(page.clone()),
+                        error: None,
+                    };
+
+                    match Event::default()
+                        .event("lifecycle-snapshot")
+                        .json_data(&envelope)
+                    {
+                        Ok(mut event) => {
+                            if let Some(id) = event_cursor {
+                                event = event.id(id.to_string());
+                                cursor = Some(id);
+                            }
+                            if tx.send(Ok(event)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!(?err, "failed to encode lifecycle snapshot");
+                        }
+                    }
+                }
+                Err(err) => {
+                    let envelope = LifecycleConsoleEventEnvelope {
+                        event_type: LifecycleConsoleEventType::Error,
+                        emitted_at: Utc::now(),
+                        cursor,
+                        page: None,
+                        error: Some(err.to_string()),
+                    };
+                    match Event::default()
+                        .event("lifecycle-error")
+                        .json_data(&envelope)
+                    {
+                        Ok(event) => {
+                            if tx.send(Ok(event)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(encode_err) => {
+                            tracing::error!(?encode_err, "failed to encode lifecycle error");
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let stream = ReceiverStream::new(rx);
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(poll_interval)
+            .text(":keep-alive\n\n"),
+    ))
 }
 
 pub async fn fetch_page(
