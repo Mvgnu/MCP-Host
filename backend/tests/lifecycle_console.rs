@@ -2,24 +2,26 @@ use axum::{routing::get, Extension, Router};
 use backend::db::runtime_vm_remediation_runs::{
     ensure_remediation_run, EnsureRemediationRunRequest,
 };
-use backend::db::runtime_vm_remediation_workspaces::{create_workspace, CreateWorkspace};
+use backend::db::runtime_vm_remediation_workspaces::{
+    create_workspace, CreateWorkspace, WorkspaceDetails,
+};
 use backend::db::runtime_vm_trust_registry::{upsert_state, UpsertRuntimeVmTrustRegistryState};
 use chrono::Utc;
-use hyper::{Body, Request, StatusCode};
+use hyper::{body::HttpBody, Body, Request, StatusCode};
 use serde_json::json;
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-#[sqlx::test]
-#[ignore = "requires DATABASE_URL with Postgres server"]
-async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+struct LifecycleFixture {
+    workspace: WorkspaceDetails,
+}
 
+async fn seed_lifecycle_fixture(pool: &PgPool) -> LifecycleFixture {
     let owner_id: i32 =
         sqlx::query_scalar("INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id")
             .bind("console@example.com")
             .bind("hashed")
-            .fetch_one(&pool)
+            .fetch_one(pool)
             .await
             .unwrap();
 
@@ -31,7 +33,7 @@ async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
     .bind("virtual-machine")
     .bind("active")
     .bind("api-key")
-    .fetch_one(&pool)
+    .fetch_one(pool)
     .await
     .unwrap();
 
@@ -40,7 +42,7 @@ async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
     )
     .bind(server_id)
     .bind("vm-console-1")
-    .fetch_one(&pool)
+    .fetch_one(pool)
     .await
     .unwrap();
 
@@ -48,7 +50,7 @@ async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
     let metadata = json!({"targets": [{"runtime_vm_instance_id": vm_instance_id}]});
 
     let workspace = create_workspace(
-        &pool,
+        pool,
         CreateWorkspace {
             workspace_key: "console-workspace",
             display_name: "Lifecycle Console",
@@ -71,8 +73,8 @@ async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
         .clone();
 
     let run_metadata = json!({"workspace_id": workspace.workspace.id});
-    let _run = ensure_remediation_run(
-        &pool,
+    ensure_remediation_run(
+        pool,
         EnsureRemediationRunRequest {
             runtime_vm_instance_id: vm_instance_id,
             playbook_key: "shell:baseline",
@@ -92,7 +94,7 @@ async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
     .expect("remediation run inserted");
 
     upsert_state(
-        &pool,
+        pool,
         UpsertRuntimeVmTrustRegistryState {
             runtime_vm_instance_id: vm_instance_id,
             attestation_status: "trusted",
@@ -119,7 +121,7 @@ async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
     .bind("healthy")
     .bind(0.95_f64)
     .bind(Utc::now())
-    .execute(&pool)
+    .execute(pool)
     .await
     .unwrap();
 
@@ -144,9 +146,18 @@ async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
     .bind(false)
     .bind(false)
     .bind("healthy")
-    .execute(&pool)
+    .execute(pool)
     .await
     .unwrap();
+
+    LifecycleFixture { workspace }
+}
+
+#[sqlx::test]
+#[ignore = "requires DATABASE_URL with Postgres server"]
+async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let fixture = seed_lifecycle_fixture(&pool).await;
 
     let app = Router::new()
         .route(
@@ -181,7 +192,7 @@ async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
         .and_then(|value| value.get("id"))
         .and_then(|value| value.as_i64())
         .expect("workspace id");
-    assert_eq!(workspace_id, workspace.workspace.id);
+    assert_eq!(workspace_id, fixture.workspace.workspace.id);
 
     assert!(snapshot.get("active_revision").is_some());
 
@@ -198,4 +209,40 @@ async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
             .unwrap_or(false)
     }));
     assert!(runs.iter().any(|run| run.get("marketplace").is_some()));
+}
+
+#[sqlx::test]
+#[ignore = "requires DATABASE_URL with Postgres server"]
+async fn lifecycle_console_stream_emits_snapshot_event(pool: PgPool) {
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let fixture = seed_lifecycle_fixture(&pool).await;
+
+    let app = Router::new()
+        .route(
+            "/api/console/lifecycle/stream",
+            get(backend::lifecycle_console::stream_snapshots),
+        )
+        .layer(Extension(pool.clone()));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/console/lifecycle/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let mut collected = Vec::new();
+    if let Some(chunk) = body.data().await {
+        let bytes = chunk.unwrap();
+        collected.extend_from_slice(&bytes);
+    }
+
+    let payload = String::from_utf8(collected).expect("utf8");
+    assert!(payload.contains("event: lifecycle-snapshot"));
+    assert!(payload.contains(&fixture.workspace.workspace.id.to_string()));
 }

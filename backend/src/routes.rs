@@ -16,6 +16,10 @@ pub fn api_routes() -> Router {
             "/api/console/lifecycle",
             get(lifecycle_console::list_snapshots),
         )
+        .route(
+            "/api/console/lifecycle/stream",
+            get(lifecycle_console::stream_snapshots),
+        )
         .route("/api/register", post(auth::register_user))
         .route("/api/login", post(auth::login_user))
         .route("/api/logout", post(auth::logout_user))

@@ -12,6 +12,11 @@ This directory contains reusable UI components used across the MCP Host frontend
 - **MetricsEventList** – textual timeline surfacing registry telemetry metadata, including retry/auth context for registry pushes
 - **Spinner** – small loading indicator
 - **Alert** – error message display
+- **console/**
+  - **LifecycleTimeline** – renders remediation run timeline rows with trust/intelligence overlays
+  - **LifecycleRunProgress** – highlights run status, timing, and approval state metadata
+  - **LifecycleTrustOverlay** – surfaces trust registry, intelligence scores, and marketplace readiness for each run
+  - **LifecycleVerdictCard** – summarizes active revision gate snapshots and promotion verdicts
 
 These components follow the design principles in `../../design-vision.md` and
 include musikconnect tags for tooling.
