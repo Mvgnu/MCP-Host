@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from argparse import ArgumentParser, _SubParsersAction
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 
 from ..client import APIClient
 from ..renderers import dumps_json, render_table
@@ -253,15 +253,74 @@ def _render_event(event: Dict[str, Any]) -> None:
     else:
         kind = None
     prefix = f"run {run_id} (instance {instance})"
+    policy_feedback = _string_list(event.get("policy_feedback"))
+    accelerators = _accelerator_summaries(event.get("accelerators"))
     if isinstance(body, dict) and body.get("event") == "log":
         stream = body.get("stream")
         message = body.get("message")
         timestamp = body.get("timestamp")
         print(f"[{timestamp}] {prefix} [{stream}] {message}")
     elif isinstance(body, dict) and body.get("event") == "status":
+        if policy_feedback:
+            print(f"{prefix} policy feedback -> {', '.join(policy_feedback)}")
+        for accelerator in accelerators:
+            notes = (
+                f" notes={', '.join(accelerator.policy_feedback)}"
+                if accelerator.policy_feedback
+                else ""
+            )
+            print(
+                f"{prefix} accelerator {accelerator.accelerator_id}"
+                f" ({accelerator.accelerator_type}) posture {accelerator.posture}{notes}"
+            )
         status = body.get("status")
         failure = body.get("failure_reason") or "-"
         message = body.get("message") or ""
         print(f"{prefix} status -> {status} (failure {failure}) {message}")
     else:
         print(f"{prefix} event {kind or 'unknown'}: {body}")
+
+
+class _AcceleratorSummary:
+    __slots__ = ("accelerator_id", "accelerator_type", "posture", "policy_feedback")
+
+    def __init__(
+        self,
+        accelerator_id: str,
+        accelerator_type: str,
+        posture: str,
+        policy_feedback: Iterable[str],
+    ) -> None:
+        self.accelerator_id = accelerator_id
+        self.accelerator_type = accelerator_type
+        self.posture = posture
+        self.policy_feedback = list(policy_feedback)
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for entry in value:
+        if isinstance(entry, str):
+            normalized = entry.strip()
+            if normalized:
+                result.append(normalized)
+    return result
+
+
+def _accelerator_summaries(value: Any) -> list[_AcceleratorSummary]:
+    if not isinstance(value, list):
+        return []
+    summaries: list[_AcceleratorSummary] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        accelerator_id = str(entry.get("accelerator_id") or entry.get("id") or "unknown")
+        accelerator_type = str(entry.get("accelerator_type") or entry.get("kind") or "unknown")
+        posture = str(entry.get("posture") or "unknown")
+        feedback = _string_list(entry.get("policy_feedback"))
+        summaries.append(
+            _AcceleratorSummary(accelerator_id, accelerator_type, posture, feedback)
+        )
+    return summaries

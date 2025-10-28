@@ -1,5 +1,12 @@
 # Problem_Tracker_NextIteration
 
+- ID: BE-VERIFY-ACCEL
+  Status: DONE
+  Task: Capture accelerator posture ingestion harness regressions and verify backend test compilation after posture wiring.
+  Hypothesis: Cleaning up chrono/std duration conflicts and ensuring the SSE harness reads boxed Axum bodies keeps accelerator scenario coverage compiling while preserving streaming assertions.
+  Log:
+    - 2025-11-24 19:45:00 UTC: Reconciled duration imports in `backend/tests/remediation_flow.rs`, generalized the SSE reader to work with boxed bodies, and re-ran `cargo test --locked --no-run` to confirm the backend builds with only the known Bollard deprecation warnings.
+
 - ID: BE-TRUST-010
   Status: DONE
   Task: Enforce remediation-aware scheduling and policy gating with transparent veto metadata.
@@ -252,3 +259,5 @@
   Hypothesis: Wiring manifest-driven chaos execution into CLI SSE regression gates and marketplace timelines will let operators trust automation outcomes without manual log spelunking.
   Log:
     - 2025-11-30 12:40:00 UTC: Landed manifest loader for remediation chaos harness, scenario index aggregation, and documentation updates. Follow-ups required for CLI SSE verification, accelerator posture ingestion, and policy feedback loops.
+    - 2025-12-01 09:10:00 UTC: Resuming iteration to implement accelerator posture ingestion, policy feedback wiring, SSE/CLI enhancements, and validation harness coverage.
+    - 2025-12-01 15:45:00 UTC: Added accelerator posture schema/ingestion, enriched remediation SSE payloads with policy feedback + accelerator summaries, updated CLI/watch rendering, expanded harness docs/manifests, and extended integration/CLI tests.

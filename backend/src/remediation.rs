@@ -586,17 +586,36 @@ pub struct RemediationStreamMessage {
     pub manifest_tags: Vec<String>,
     #[serde(default)]
     pub manifest_metadata: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_feedback: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accelerators: Vec<RemediationAcceleratorPosture>,
     pub event: RemediationStreamEvent,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RemediationAcceleratorPosture {
+    pub accelerator_id: String,
+    pub accelerator_type: String,
+    pub posture: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_feedback: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
 }
 
 fn broadcast_event(run: &RuntimeVmRemediationRun, event: RemediationStreamEvent) {
     let manifest_tags = manifest_tags_from_metadata(&run.metadata);
+    let policy_feedback = policy_feedback_from_metadata(&run.metadata);
+    let accelerators = accelerators_from_metadata(&run.metadata);
     let message = RemediationStreamMessage {
         run_id: run.id,
         instance_id: run.runtime_vm_instance_id,
         playbook: run.playbook.clone(),
         manifest_tags,
         manifest_metadata: run.metadata.clone(),
+        policy_feedback,
+        accelerators,
         event,
     };
     let _ = REMEDIATION_EVENT_CHANNEL.send(message);
@@ -637,6 +656,69 @@ fn collect_manifest_tags(value: &Value, tags: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+fn policy_feedback_from_metadata(metadata: &Value) -> Vec<String> {
+    metadata
+        .get("policy_feedback")
+        .and_then(|value| value.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str().map(|value| value.trim().to_string()))
+                .filter(|value| !value.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn accelerators_from_metadata(metadata: &Value) -> Vec<RemediationAcceleratorPosture> {
+    let Some(entries) = metadata
+        .get("accelerators")
+        .and_then(|value| value.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut posture = Vec::new();
+    for entry in entries {
+        let Some(accelerator_id) = entry.get("id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let accelerator_type = entry
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let posture_state = entry
+            .get("posture")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let policy_feedback = entry
+            .get("policy_feedback")
+            .and_then(|value| value.as_array())
+            .map(|feedback| {
+                feedback
+                    .iter()
+                    .filter_map(|item| item.as_str().map(|value| value.trim().to_string()))
+                    .filter(|value| !value.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let metadata_payload = entry
+            .get("metadata")
+            .cloned()
+            .or_else(|| entry.as_object().map(|_| entry.clone()));
+
+        posture.push(RemediationAcceleratorPosture {
+            accelerator_id: accelerator_id.to_string(),
+            accelerator_type: accelerator_type.to_string(),
+            posture: posture_state.to_string(),
+            policy_feedback,
+            metadata: metadata_payload,
+        });
+    }
+
+    posture
 }
 
 fn broadcast_log(run: &RuntimeVmRemediationRun, entry: &RemediationLogEvent) {

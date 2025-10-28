@@ -1,3 +1,4 @@
+pub mod runtime_vm_accelerator_posture;
 pub mod runtime_vm_attestations;
 pub mod runtime_vm_remediation_artifacts;
 pub mod runtime_vm_remediation_playbooks;

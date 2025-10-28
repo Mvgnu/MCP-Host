@@ -6,3 +6,16 @@ scenarios:
     kind: executor-outage-resumption
     tenants:
       - accelerator-lab
+    metadata:
+      policy_feedback:
+        - policy_hook:accelerator_gate=awaiting-attestation
+      accelerators:
+        - id: accel-lab-01
+          kind: nvidia-h100
+          posture: quarantined
+          policy_feedback:
+            - accelerator:requires-attestation
+            - accelerator:pending-remediation
+          metadata:
+            origin: accelerator-posture-fixture
+            remediation_hint: reseat-nvlink
