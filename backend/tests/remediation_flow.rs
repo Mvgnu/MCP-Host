@@ -10,6 +10,7 @@ use backend::db::runtime_vm_remediation_runs::{mark_run_completed, mark_run_fail
 use backend::db::runtime_vm_trust_registry::{upsert_state, UpsertRuntimeVmTrustRegistryState};
 use backend::policy::trust::evaluate_placement_gate;
 use chrono::{Duration, Utc};
+use futures_util::future::join_all;
 use hyper::body;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use serde_json::{json, Value};
@@ -175,13 +176,18 @@ enum ScenarioKind {
     ExecutorOutageResumption,
 }
 
+#[derive(Clone, Copy)]
 struct ScenarioDefinition {
     name: &'static str,
     tag: &'static str,
     kind: ScenarioKind,
 }
 
-async fn run_scenario(harness: &RemediationHarness, scenario: ScenarioDefinition) {
+async fn run_scenario(
+    harness: &RemediationHarness,
+    scenario: ScenarioDefinition,
+    tenant: &str,
+) {
     eprintln!(
         "[remediation-chaos] executing scenario {} ({})",
         scenario.name, scenario.tag
@@ -189,44 +195,49 @@ async fn run_scenario(harness: &RemediationHarness, scenario: ScenarioDefinition
     match scenario.kind {
         ScenarioKind::TenantIsolation => {
             // key: validation -> remediation-matrix:tenant-isolation
-            scenario_tenant_isolation(harness, &scenario).await;
+            scenario_tenant_isolation(harness, &scenario, tenant).await;
         }
         ScenarioKind::ConcurrentApprovals => {
             // key: validation -> remediation-matrix:concurrent-approvals
-            scenario_concurrent_approvals(harness, &scenario).await;
+            scenario_concurrent_approvals(harness, &scenario, tenant).await;
         }
         ScenarioKind::ExecutorOutageResumption => {
             // key: validation -> remediation-matrix:executor-outage
-            scenario_executor_outage_resumption(harness, &scenario).await;
+            scenario_executor_outage_resumption(harness, &scenario, tenant).await;
         }
     }
 }
 
-async fn scenario_tenant_isolation(harness: &RemediationHarness, scenario: &ScenarioDefinition) {
+async fn scenario_tenant_isolation(
+    harness: &RemediationHarness,
+    scenario: &ScenarioDefinition,
+    tenant: &str,
+) {
     let app = harness.app.clone();
     let primary_token = harness.token.clone();
     let primary_vm = harness.vm_instance_id;
     let primary_server = harness.server_id;
 
-    let email = format!("{}+tenant@example.com", scenario.name);
+    let email = format!("{}+{}@example.com", scenario.name, tenant);
     let (secondary_operator, secondary_token) = harness.create_operator(&email).await;
     let (secondary_server, secondary_vm) = harness
         .create_server_and_vm(
             secondary_operator,
-            "tenant-b",
-            &format!("{}-vm-b", scenario.name),
+            &format!("{}-{}", tenant, scenario.name),
+            &format!("{}-vm-b-{}", scenario.name, tenant),
         )
         .await;
 
-    let playbook_key = format!("vm.restart.{}", scenario.name);
+    let playbook_key = format!("vm.restart.{}.{}", scenario.name, tenant);
+    let scenario_tag = format!("{}::{}", scenario.tag, tenant);
     let playbook_payload = json!({
         "playbook_key": playbook_key,
-        "display_name": format!("Restart VM - {}", scenario.name),
+        "display_name": format!("Restart VM - {} ({tenant})", scenario.name),
         "description": "Restart workload",
         "executor_type": "shell",
         "approval_required": true,
         "sla_duration_seconds": 900,
-        "metadata": {"tier": "gold", "scenario": scenario.tag}
+        "metadata": {"tier": "gold", "scenario": scenario_tag.clone()}
     });
     let playbook = create_playbook(&app, &primary_token, playbook_payload).await;
     let playbook_id = playbook["id"].as_i64().unwrap();
@@ -235,7 +246,7 @@ async fn scenario_tenant_isolation(harness: &RemediationHarness, scenario: &Scen
         "runtime_vm_instance_id": primary_vm,
         "playbook": playbook_key,
         "assigned_owner_id": harness.operator_id,
-        "metadata": {"scenario": scenario.tag, "tenant": "primary"},
+        "metadata": {"scenario": scenario_tag.clone(), "tenant": format!("primary::{tenant}")},
         "automation_payload": null
     });
     let primary_run = enqueue_run(&app, &primary_token, enqueue_payload_primary).await;
@@ -248,7 +259,7 @@ async fn scenario_tenant_isolation(harness: &RemediationHarness, scenario: &Scen
         "runtime_vm_instance_id": secondary_vm,
         "playbook": playbook_key,
         "assigned_owner_id": secondary_operator,
-        "metadata": {"scenario": scenario.tag, "tenant": "secondary"},
+        "metadata": {"scenario": scenario_tag.clone(), "tenant": format!("secondary::{tenant}")},
         "automation_payload": null
     });
     let secondary_run = enqueue_run(&app, &secondary_token, enqueue_payload_secondary).await;
@@ -271,7 +282,7 @@ async fn scenario_tenant_isolation(harness: &RemediationHarness, scenario: &Scen
         Some(secondary_vm)
     );
 
-    let primary_state = format!("remediation:pending:{}", scenario.name);
+    let primary_state = format!("remediation:pending:{}:{}", scenario.name, tenant);
     upsert_state(
         harness.pool(),
         UpsertRuntimeVmTrustRegistryState {
@@ -289,7 +300,7 @@ async fn scenario_tenant_isolation(harness: &RemediationHarness, scenario: &Scen
     .await
     .unwrap();
 
-    let secondary_state = format!("remediation:pending:{}", scenario.tag);
+    let secondary_state = format!("remediation:pending:{}:{}", scenario.tag, tenant);
     upsert_state(
         harness.pool(),
         UpsertRuntimeVmTrustRegistryState {
@@ -331,9 +342,11 @@ async fn scenario_tenant_isolation(harness: &RemediationHarness, scenario: &Scen
 async fn scenario_concurrent_approvals(
     harness: &RemediationHarness,
     scenario: &ScenarioDefinition,
+    tenant: &str,
 ) {
     let app = harness.app.clone();
-    let playbook_key = format!("vm.approval.{}", scenario.name);
+    let playbook_key = format!("vm.approval.{}.{}", scenario.name, tenant);
+    let scenario_tag = format!("{}::{}", scenario.tag, tenant);
     let playbook_payload = json!({
         "playbook_key": playbook_key,
         "display_name": "Approval Stress",
@@ -341,14 +354,14 @@ async fn scenario_concurrent_approvals(
         "executor_type": "shell",
         "approval_required": true,
         "sla_duration_seconds": 600,
-        "metadata": {"scenario": scenario.tag}
+        "metadata": {"scenario": scenario_tag.clone()}
     });
 
     create_playbook(&app, &harness.token, playbook_payload).await;
     let enqueue_payload = json!({
         "runtime_vm_instance_id": harness.vm_instance_id,
         "playbook": playbook_key,
-        "metadata": {"scenario": scenario.tag},
+        "metadata": {"scenario": scenario_tag},
         "automation_payload": null
     });
     let run = enqueue_run(&app, &harness.token, enqueue_payload).await;
@@ -390,9 +403,11 @@ async fn scenario_concurrent_approvals(
 async fn scenario_executor_outage_resumption(
     harness: &RemediationHarness,
     scenario: &ScenarioDefinition,
+    tenant: &str,
 ) {
     let app = harness.app.clone();
-    let playbook_key = format!("vm.executor.{}", scenario.name);
+    let playbook_key = format!("vm.executor.{}.{}", scenario.name, tenant);
+    let scenario_tag = format!("{}::{}", scenario.tag, tenant);
     let playbook_payload = json!({
         "playbook_key": playbook_key,
         "display_name": "Executor Outage",
@@ -400,14 +415,14 @@ async fn scenario_executor_outage_resumption(
         "executor_type": "shell",
         "approval_required": false,
         "sla_duration_seconds": 300,
-        "metadata": {"scenario": scenario.tag}
+        "metadata": {"scenario": scenario_tag.clone()}
     });
 
     create_playbook(&app, &harness.token, playbook_payload).await;
     let enqueue_payload = json!({
         "runtime_vm_instance_id": harness.vm_instance_id,
         "playbook": playbook_key,
-        "metadata": {"scenario": scenario.tag, "phase": "initial"},
+        "metadata": {"scenario": scenario_tag.clone(), "phase": "initial"},
         "automation_payload": null
     });
     let run = enqueue_run(&app, &harness.token, enqueue_payload).await;
@@ -419,7 +434,11 @@ async fn scenario_executor_outage_resumption(
         .await
         .unwrap();
 
-    let failure_metadata = json!({"scenario": scenario.tag, "failure": "executor-unavailable"});
+    let failure_metadata = json!({
+        "scenario": scenario_tag.clone(),
+        "failure": "executor-unavailable",
+        "tenant": tenant
+    });
     mark_run_failed(
         harness.pool(),
         run_id,
@@ -430,13 +449,18 @@ async fn scenario_executor_outage_resumption(
     .await
     .unwrap();
 
+    let outage_state = format!(
+        "remediation:executor-outage:{}:{}",
+        scenario.name, tenant
+    );
+
     let registry_state = upsert_state(
         harness.pool(),
         UpsertRuntimeVmTrustRegistryState {
             runtime_vm_instance_id: harness.vm_instance_id,
             attestation_status: "untrusted",
             lifecycle_state: "remediating",
-            remediation_state: Some("remediation:executor-outage"),
+            remediation_state: Some(outage_state.as_str()),
             remediation_attempts: 1,
             freshness_deadline: None,
             provenance_ref: None,
@@ -460,7 +484,7 @@ async fn scenario_executor_outage_resumption(
     let retry_payload = json!({
         "runtime_vm_instance_id": harness.vm_instance_id,
         "playbook": playbook_key,
-        "metadata": {"scenario": scenario.tag, "phase": "retry"},
+        "metadata": {"scenario": scenario_tag.clone(), "phase": "retry"},
         "automation_payload": null
     });
     let retry_run = enqueue_run(&app, &harness.token, retry_payload).await;
@@ -474,9 +498,10 @@ async fn scenario_executor_outage_resumption(
         .unwrap();
 
     let completion_metadata = json!({
-        "scenario": scenario.tag,
+        "scenario": scenario_tag.clone(),
         "phase": "recovery",
-        "notes": "executor restored"
+        "notes": "executor restored",
+        "tenant": tenant
     });
     mark_run_completed(
         harness.pool(),
@@ -487,13 +512,18 @@ async fn scenario_executor_outage_resumption(
     .await
     .unwrap();
 
+    let restored_state = format!(
+        "remediation:automation-complete:{}:{}",
+        scenario.name, tenant
+    );
+
     upsert_state(
         harness.pool(),
         UpsertRuntimeVmTrustRegistryState {
             runtime_vm_instance_id: harness.vm_instance_id,
             attestation_status: "trusted",
             lifecycle_state: "restored",
-            remediation_state: Some("remediation:automation-complete"),
+            remediation_state: Some(restored_state.as_str()),
             remediation_attempts: registry_state.remediation_attempts + 1,
             freshness_deadline: None,
             provenance_ref: None,
@@ -503,6 +533,33 @@ async fn scenario_executor_outage_resumption(
     )
     .await
     .unwrap();
+
+    let failed_status: (String,) = sqlx::query_as(
+        "SELECT status FROM runtime_vm_remediation_runs WHERE id = $1",
+    )
+    .bind(run_id)
+    .fetch_one(harness.pool())
+    .await
+    .unwrap();
+    assert_eq!(failed_status.0, "failed");
+
+    let completed_status: (String,) = sqlx::query_as(
+        "SELECT status FROM runtime_vm_remediation_runs WHERE id = $1",
+    )
+    .bind(retry_run_id)
+    .fetch_one(harness.pool())
+    .await
+    .unwrap();
+    assert_eq!(completed_status.0, "completed");
+
+    let queued_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM runtime_vm_remediation_runs WHERE runtime_vm_instance_id = $1 AND status = 'queued'",
+    )
+    .bind(harness.vm_instance_id)
+    .fetch_one(harness.pool())
+    .await
+    .unwrap();
+    assert_eq!(queued_count.0, 0);
 
     let restored_gate = evaluate_placement_gate(harness.pool(), harness.server_id)
         .await
@@ -972,7 +1029,18 @@ async fn remediation_multi_tenant_chaos_matrix(pool: PgPool) {
         },
     ];
 
-    for scenario in scenarios {
-        run_scenario(&harness, scenario).await;
+    let tenants = vec!["tenant-alpha", "tenant-bravo", "tenant-charlie"];
+
+    let mut futures = Vec::new();
+    for tenant in tenants {
+        for scenario in scenarios.iter().copied() {
+            let harness_clone = harness.clone();
+            let tenant_label = tenant.to_string();
+            futures.push(async move {
+                run_scenario(&harness_clone, scenario, tenant_label.as_str()).await;
+            });
+        }
     }
+
+    join_all(futures).await;
 }

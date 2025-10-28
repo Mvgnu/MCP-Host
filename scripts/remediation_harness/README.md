@@ -3,7 +3,7 @@
 This harness provisions a disposable Postgres instance, boots the backend API, and executes the
 `backend/tests/remediation_flow.rs` integration suite to exercise remediation playbook CRUD,
 queued runs, approval gating, registry lifecycle transitions, artifact retrieval, and the
-multi-tenant chaos matrix scenarios.
+multi-tenant chaos matrix scenarios that now fan out across three tenant shards in parallel.
 
 ## Prerequisites
 
@@ -25,7 +25,7 @@ The script will:
 3. Wait for the HTTP health endpoint to respond.
 4. Run `cargo test --test remediation_flow -- --ignored --nocapture` against the live database,
    covering `validation:remediation_flow`, `validation:remediation-concurrency`, and the
-   `validation:remediation-chaos-matrix` tenant/isolation/executor suites.
+   `validation:remediation-chaos-matrix` suites executed concurrently for each tenant shard.
 5. Emit a machine-readable manifest (see below).
 6. Tear down the backend process and Postgres container.
 
@@ -44,7 +44,7 @@ Environment variables allow customization:
 
 After a successful run the harness writes a JSON manifest enumerating executed scenarios and their
 `validation:*` tags. Downstream dashboards can ingest this artifact to confirm multi-tenant chaos
-coverage.
+coverage; each listed scenario now represents three tenant-specific executions under the hood.
 
 ```json
 {

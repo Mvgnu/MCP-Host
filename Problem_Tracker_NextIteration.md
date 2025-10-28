@@ -210,6 +210,7 @@
   Hypothesis: Extending the SQLx-backed remediation flow tests with concurrency and future multi-tenant scenarios will surface lifecycle regressions (approval dedupe, gating) immediately while we continue to automate SSE validation.
   Log:
     - 2025-11-25 09:30:00 UTC: Added reusable harness bootstrapper and concurrent enqueue regression (`validation: remediation-concurrency`) verifying duplicate requests collapse into a single pending run; documentation now advertises the scenario for future orchestration work.
+    - 2025-11-29 09:45:00 UTC: Expanded `validation:remediation-chaos-matrix` to execute tenant-isolation, concurrent-approval, and executor-outage scenarios in parallel across three tenant shards with unique playbook metadata, trust state assertions, scheduler queue drains, and updated harness docs/README coverage.
   
 - ID: BE-TRUST-003
   Status: IN_PROGRESS
