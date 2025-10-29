@@ -373,3 +373,11 @@
     - 2025-10-29 09:58:05 UTC: Initiated parity iteration; auditing lifecycle console modules, SSE builders, frontend hooks, and CLI transcripts to scope metadata gaps.
     - 2025-12-10 15:25:00 UTC: Added focused unit tests for lifecycle artifact extraction/enrichment helpers and console analytics chips, documenting coverage in the frontend components README.
     - 2025-12-11 09:45:00 UTC: Extended lifecycle CLI delta narration to include remediation analytics, artifact diff summaries, and promotion verdict slices; refreshed console trust overlay to render analytics/artifact change chips and updated operator docs to reflect the streaming contract.
+    - 2025-12-12 10:20:00 UTC: Replayed remediation API target extraction fixtures, pruned unused harness fields, refreshed lifecycle snapshot assertions for override actors/run ids, and aligned Jest analytics chips with backend payloads so retry ledgers, promotion verdicts, and override actors round-trip through the console tests.
+
+- ID: FE-LIFE-ANALYTICS-TESTS
+  Status: DONE
+  Task: Expand lifecycle console unit coverage to mirror backend analytics payload changes.
+  Hypothesis: Exercising retry ledger strings, override actors, promotion verdict chips, and store fetch flows in Jest keeps the console renderers aligned with lifecycle snapshots and prevents analytics drift before deeper UX work.
+  Log:
+    - 2025-12-12 10:30:00 UTC: Upgraded Testing Library for React 19 compatibility, expanded `LifecycleRunProgress` tests to cover retry ledgers, overrides, promotion verdicts, and fingerprint chips, added Zustand store fetch success/failure assertions, and documented the analytics regression suite updates in `frontend/README.md`.

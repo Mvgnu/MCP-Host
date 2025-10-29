@@ -335,8 +335,13 @@ fn load_manifest_file(path: &Path) -> Result<Vec<ScenarioExecution>> {
         ),
     };
 
+    let ScenarioManifestDocument {
+        description: _manifest_description,
+        scenarios,
+    } = document;
+
     let mut executions = Vec::new();
-    for entry in document.scenarios {
+    for entry in scenarios {
         let definition = ScenarioDefinition {
             name: entry.name.clone(),
             tag: entry.tag.clone(),

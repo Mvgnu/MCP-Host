@@ -40,8 +40,9 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to see the
 
 ### Testing & Coverage
 
-- Install dependencies with `npm install --legacy-peer-deps` to satisfy the current React 19 peer constraints in the testing stack.
+- Install dependencies with `npm install`. The suite pins `@testing-library/react@^16.3.0` so React 19 console components and analytics fixtures compile without peer dependency warnings.
 - Run unit tests with coverage via `npm test -- --coverage`. The suite is configured through `tsconfig.jest.json` so Jest can compile the lifecycle console components and their JSX fixtures.
+- Lifecycle analytics regression coverage exercises retry ledgers, manual overrides, promotion verdict chips, and the Zustand-powered server store. These tests mirror the backend lifecycle snapshots so console renderers stay aligned with the analytics payload contract.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
