@@ -4,9 +4,10 @@ use axum::{
 };
 
 use crate::{
-    auth, capabilities, domains, evaluation, file_store, governance, ingestion, intelligence,
-    invocations, keys_api, lifecycle_console, marketplace, organizations, policy, promotions,
-    remediation_api, secrets, servers, services, trust, vector_dbs, workflows,
+    auth, billing, capabilities, domains, evaluation, file_store, governance, ingestion,
+    intelligence, invocations, keys_api, lifecycle_console, marketplace, organizations, policy,
+    promotions, remediation_api, secrets, servers, services, trust, vector_dbs, webhooks,
+    workflows,
 };
 
 pub fn api_routes() -> Router {
@@ -24,6 +25,16 @@ pub fn api_routes() -> Router {
         .route("/api/login", post(auth::login_user))
         .route("/api/logout", post(auth::logout_user))
         .route("/api/me", get(auth::current_user))
+        .route("/api/webhooks/billing", post(webhooks::billing_webhook))
+        .route("/api/billing/plans", get(billing::billing_list_plans))
+        .route(
+            "/api/billing/organizations/:organization_id/subscription",
+            get(billing::billing_get_subscription).post(billing::billing_upsert_subscription),
+        )
+        .route(
+            "/api/billing/organizations/:organization_id/quotas/check",
+            post(billing::billing_check_quota),
+        )
         .route(
             "/api/servers",
             get(servers::list_servers).post(servers::create_server),

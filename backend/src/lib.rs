@@ -1,7 +1,10 @@
+pub mod audit;
+pub mod billing;
 pub mod db;
 pub mod error;
 pub mod intelligence;
 pub mod keys;
+pub mod keys_api;
 pub mod lifecycle_console;
 pub mod policy;
 pub mod remediation;
@@ -43,4 +46,5 @@ mod servers;
 mod services;
 mod vault;
 mod vector_dbs;
+mod webhooks;
 mod workflows;

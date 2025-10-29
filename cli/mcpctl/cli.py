@@ -10,6 +10,7 @@ from typing import Any, Dict
 
 from .client import APIClient, APIError
 from .commands import (
+    install_billing,
     install_evaluations,
     install_governance,
     install_keys,
@@ -48,6 +49,7 @@ def build_parser() -> ArgumentParser:
     install_evaluations(subparsers)
     install_lifecycle(subparsers)
     install_keys(subparsers)
+    install_billing(subparsers)
     install_remediation(subparsers)
     install_trust(subparsers)
     install_scaffold(subparsers)

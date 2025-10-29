@@ -128,5 +128,6 @@ fn sample_decision() -> PolicyDecision {
         promotion_stage: None,
         promotion_status: None,
         promotion_notes: vec![],
+        provider_key_posture: None,
     }
 }

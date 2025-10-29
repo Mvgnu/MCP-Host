@@ -20,6 +20,7 @@ use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
 
+use crate::billing::BillingService;
 use crate::config;
 use crate::db::runtime_vm_trust_history::{
     latest_for_instance as latest_trust_event, RuntimeVmTrustEvent,
@@ -35,6 +36,7 @@ use crate::marketplace::{classify_tier, derive_health, MarketplacePlatform};
 // key: runtime-policy -> placement-decisions,marketplace-health
 
 const POLICY_VERSION: &str = "runtime-policy-v0.1";
+const BILLING_RUNTIME_ENTITLEMENT: &str = "runtime.concurrent_servers";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -357,8 +359,28 @@ impl RuntimePolicyEngine {
         config: Option<&Value>,
         use_gpu: bool,
     ) -> Result<PolicyDecision, PolicyError> {
+        let server_row =
+            sqlx::query("SELECT owner_id, organization_id FROM mcp_servers WHERE id = $1")
+                .bind(server_id)
+                .fetch_optional(pool)
+                .await?;
+
+        let Some(server_row) = server_row else {
+            return Err(PolicyError::Database(sqlx::Error::RowNotFound));
+        };
+
+        let owner_id: i32 = server_row.get("owner_id");
+        let organization_id: Option<i32> = server_row.get("organization_id");
+
         let (decision, vm_posture) = self
-            .evaluate(pool, server_id, server_type, config, use_gpu)
+            .evaluate(
+                pool,
+                server_id,
+                organization_id,
+                server_type,
+                config,
+                use_gpu,
+            )
             .await?;
         let decision_id = self.record_decision(pool, server_id, &decision).await?;
 
@@ -381,30 +403,12 @@ impl RuntimePolicyEngine {
             }
         }
 
-        match sqlx::query("SELECT owner_id FROM mcp_servers WHERE id = $1")
-            .bind(server_id)
-            .fetch_optional(pool)
-            .await
-        {
-            Ok(Some(row)) => {
-                let owner_id: i32 = row.get("owner_id");
-                publish_policy_event(PolicyEvent::decision(
-                    owner_id,
-                    server_id,
-                    &decision,
-                    vm_posture.as_ref(),
-                ));
-            }
-            Ok(None) => tracing::warn!(
-                %server_id,
-                "policy decision recorded for missing server",
-            ),
-            Err(err) => tracing::warn!(
-                ?err,
-                %server_id,
-                "failed to publish policy decision event due to owner lookup error",
-            ),
-        }
+        publish_policy_event(PolicyEvent::decision(
+            owner_id,
+            server_id,
+            &decision,
+            vm_posture.as_ref(),
+        ));
         Ok(decision)
     }
 
@@ -412,6 +416,7 @@ impl RuntimePolicyEngine {
         &self,
         pool: &PgPool,
         server_id: i32,
+        organization_id: Option<i32>,
         server_type: &str,
         config: Option<&Value>,
         use_gpu: bool,
@@ -718,6 +723,37 @@ impl RuntimePolicyEngine {
         if !capabilities_satisfied {
             evaluation_required = true;
             notes.push("evaluation:reason:capabilities".to_string());
+        }
+
+        if let Some(org_id) = organization_id {
+            let billing_service = BillingService::new(pool.clone());
+            match billing_service
+                .enforce_quota(org_id, BILLING_RUNTIME_ENTITLEMENT, 1, false)
+                .await
+            {
+                Ok(outcome) => {
+                    notes.extend(outcome.notes.clone());
+                    if !outcome.allowed {
+                        evaluation_required = true;
+                        governance_required = true;
+                        notes.push("evaluation:reason:billing".to_string());
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        organization_id = org_id,
+                        "failed to enforce billing quota",
+                    );
+                    evaluation_required = true;
+                    governance_required = true;
+                    notes.push("billing:error:quota-check".to_string());
+                }
+            }
+        } else {
+            notes.push("billing:organization-missing".to_string());
+            evaluation_required = true;
+            governance_required = true;
         }
 
         let mut certification_blocked = false;
@@ -1272,6 +1308,7 @@ mod tests {
     use super::*;
     use crate::evaluations::{CertificationStatus, CertificationUpsert};
     use crate::governance::GovernanceEngine;
+    use crate::keys::RegisterProviderKey;
     use base64::engine::general_purpose::STANDARD as Base64Engine;
     use base64::Engine;
     use chrono::{Duration, Utc};

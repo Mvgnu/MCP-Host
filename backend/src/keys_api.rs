@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Extension, Path},
+    extract::{Extension, Path, Query},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -12,10 +12,11 @@ use uuid::Uuid;
 use base64::DecodeError;
 use chrono::{DateTime, Utc};
 
+use crate::audit::{query_provider_key_events, ProviderKeyAuditFilter, ProviderScopedAuditLog};
 use crate::keys::{
     ProviderKeyBindingRecord, ProviderKeyBindingScope, ProviderKeyRecord,
-    ProviderKeyRotationRecord, ProviderKeyService, ProviderKeyServiceConfig, RegisterProviderKey,
-    RequestKeyRotation,
+    ProviderKeyRotationRecord, ProviderKeyService, ProviderKeyServiceConfig, ProviderKeyState,
+    RegisterProviderKey, RequestKeyRotation,
 };
 
 /// key: provider-keys-api
@@ -31,8 +32,16 @@ pub fn routes() -> Router {
             post(request_rotation),
         )
         .route(
+            "/api/providers/:provider_id/keys/:key_id/revocations",
+            post(revoke_key),
+        )
+        .route(
             "/api/providers/:provider_id/keys/:key_id/bindings",
             get(list_bindings).post(create_binding),
+        )
+        .route(
+            "/api/providers/:provider_id/keys/audit",
+            get(list_audit_events),
         )
 }
 
@@ -98,9 +107,7 @@ async fn request_rotation(
         .request_rotation(provider_id, key_id, request)
         .await
         .map_err(|err| {
-            if err
-                .downcast_ref::<DecodeError>()
-                .is_some()
+            if err.downcast_ref::<DecodeError>().is_some()
                 || err.to_string().contains("attestation")
                 || err.to_string().contains("signature")
                 || err.to_string().contains("actor")
@@ -116,6 +123,50 @@ async fn request_rotation(
         })?;
 
     Ok(Json(rotation))
+}
+
+async fn revoke_key(
+    Extension(pool): Extension<PgPool>,
+    Path((provider_id, key_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<RevokeKeyRequest>,
+) -> Result<Json<ProviderKeyRecord>, StatusCode> {
+    let service = ProviderKeyService::new(pool, ProviderKeyServiceConfig::default());
+    let reason = payload.reason.clone();
+    let record = service
+        .revoke_key(provider_id, key_id, reason, payload.mark_compromised)
+        .await
+        .map_err(|err| {
+            if err.to_string().contains("not found") {
+                StatusCode::NOT_FOUND
+            } else if err.to_string().contains("provider mismatch") {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::NOT_IMPLEMENTED
+            }
+        })?;
+
+    Ok(Json(record))
+}
+
+async fn list_audit_events(
+    Extension(pool): Extension<PgPool>,
+    Path(provider_id): Path<Uuid>,
+    Query(params): Query<AuditQueryParams>,
+) -> Result<Json<Vec<ProviderScopedAuditLog>>, StatusCode> {
+    let filter = ProviderKeyAuditFilter {
+        provider_id,
+        provider_key_id: params.key_id,
+        state: params.state,
+        start: params.start,
+        end: params.end,
+        limit: params.limit.or(Some(100)),
+    };
+
+    let events = query_provider_key_events(&pool, filter)
+        .await
+        .map_err(|_| StatusCode::NOT_IMPLEMENTED)?;
+
+    Ok(Json(events))
 }
 
 async fn create_binding(
@@ -184,6 +235,28 @@ pub struct RequestRotation {
     pub attestation_digest: Option<String>,
     pub attestation_signature: Option<String>,
     pub request_actor_ref: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevokeKeyRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub mark_compromised: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditQueryParams {
+    #[serde(default)]
+    pub key_id: Option<Uuid>,
+    #[serde(default)]
+    pub state: Option<ProviderKeyState>,
+    #[serde(default)]
+    pub start: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub end: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub limit: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

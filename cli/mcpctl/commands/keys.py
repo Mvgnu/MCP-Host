@@ -68,6 +68,16 @@ def install(
     rotate_parser.set_defaults(handler=_keys_rotate)
     add_common_arguments(rotate_parser)
 
+    revoke_parser = keys_sub.add_parser(
+        "revoke", help="Emergency revoke a provider key"
+    )
+    revoke_parser.add_argument("provider_id", help="Provider identifier")
+    revoke_parser.add_argument("key_id", help="Key identifier")
+    revoke_parser.add_argument("--reason", help="Optional operator supplied reason")
+    revoke_parser.add_argument("--compromised", dest="mark_compromised", action="store_true", help="Mark the key as compromised (defaults to retiring)")
+    revoke_parser.set_defaults(handler=_keys_revoke)
+    add_common_arguments(revoke_parser)
+
     approve_parser = keys_sub.add_parser(
         "approve-rotation", help="Approve a pending key rotation (stub handler)"
     )
@@ -107,6 +117,18 @@ def install(
     bindings_parser.add_argument("key_id", help="Key identifier")
     bindings_parser.set_defaults(handler=_keys_bindings)
     add_common_arguments(bindings_parser)
+
+    audit_parser = keys_sub.add_parser(
+        "audit", help="Query BYOK audit events"
+    )
+    audit_parser.add_argument("provider_id", help="Provider identifier")
+    audit_parser.add_argument("--key-id", dest="key_id", help="Filter by provider key identifier")
+    audit_parser.add_argument("--state", help="Filter by posture state")
+    audit_parser.add_argument("--start", help="Filter events occurring at or after this RFC3339 timestamp")
+    audit_parser.add_argument("--end", help="Filter events occurring before this RFC3339 timestamp")
+    audit_parser.add_argument("--limit", type=int, help="Maximum number of events to fetch")
+    audit_parser.set_defaults(handler=_keys_audit)
+    add_common_arguments(audit_parser)
 
     watch_parser = keys_sub.add_parser(
         "watch", help="Stream provider key posture via SSE (stub handler)"
@@ -225,6 +247,94 @@ def _keys_rotate(client: APIClient, as_json: bool, args: Dict[str, object]) -> N
                 ("status", "Status"),
                 ("requested_at", "Requested"),
                 ("request_actor_ref", "Actor"),
+            ],
+        )
+    )
+
+
+def _keys_revoke(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
+    provider_id = args["provider_id"]
+    key_id = args["key_id"]
+    payload: Dict[str, object] = {"mark_compromised": bool(args.get("mark_compromised"))}
+    reason = args.get("reason")
+    if reason:
+        payload["reason"] = reason
+
+    try:
+        record = client.post(
+            f"/api/providers/{provider_id}/keys/{key_id}/revocations",
+            json_body=payload,
+        )
+    except APIError as exc:
+        _report_stubbed_feature("revoke", exc)
+        return
+
+    if as_json:
+        print(dumps_json(record))
+        return
+
+    print(
+        render_table(
+            [record],
+            columns=[
+                ("id", "Key ID"),
+                ("state", "State"),
+                ("retired_at", "Retired"),
+                ("compromised_at", "Compromised"),
+            ],
+        )
+    )
+
+
+def _keys_audit(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
+    provider_id = args["provider_id"]
+    params: Dict[str, object] = {}
+    if args.get("key_id"):
+        params["key_id"] = args["key_id"]
+    if args.get("state"):
+        params["state"] = args["state"]
+    if args.get("start"):
+        params["start"] = args["start"]
+    if args.get("end"):
+        params["end"] = args["end"]
+    if args.get("limit") is not None:
+        params["limit"] = args["limit"]
+
+    try:
+        payload = client.get(
+            f"/api/providers/{provider_id}/keys/audit", params=params or None
+        )
+    except APIError as exc:
+        _report_stubbed_feature("audit", exc)
+        return
+
+    if as_json:
+        print(dumps_json(payload))
+        return
+
+    entries = payload if isinstance(payload, list) else []
+    normalized = []
+    for entry in entries:
+        event = entry.get("event", {})
+        normalized.append(
+            {
+                "event_id": event.get("id"),
+                "key_id": event.get("provider_key_id"),
+                "event_type": event.get("event_type"),
+                "occurred_at": event.get("occurred_at"),
+                "state": entry.get("provider_key_state"),
+            }
+        )
+
+    print(
+        render_table(
+            normalized,
+            columns=[
+                ("event_id", "Event ID"),
+                ("key_id", "Key ID"),
+                ("event_type", "Type"),
+                ("occurred_at", "Occurred"),
+                ("state", "State"),
             ],
         )
     )

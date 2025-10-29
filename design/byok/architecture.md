@@ -33,7 +33,8 @@ Service responsibilities:
 - Register keys via public key material references or attestation bundles (raw material never stored).
 - Enforce state machine transitions: `pending_registration → active → rotating → retired/compromised` with optimistic version tokens.
 - Persist rotation requests and approvals, capturing operator identity from auth context.
-- Publish audit events for registration, activation, rotation scheduled/completed, compromise declared, runtime veto triggered, attestation uploaded, and binding changes.
+- Publish audit events for registration, activation, rotation scheduled/completed, compromise declared, runtime veto triggered, attestation uploaded, binding changes, rotation SLA warnings/breaches, and emergency revocations.
+- Track rotation SLA windows to raise approaching/breached deadlines without duplicate emissions so scheduled jobs remain idempotent.
 
 ## Runtime & Policy Enforcement
 - Extend `RuntimePolicyEngine` to load provider key posture when evaluating launches for tiers that declare `byok_required = true`.
@@ -51,8 +52,10 @@ Service responsibilities:
 Add new routes with optimistic locking semantics:
 - `POST /api/providers/:id/keys` – register/replace active key using attestation bundle, returning posture snapshot and version.
 - `POST /api/providers/:id/keys/:key_id/rotations` – submit rotation request with evidence, returns rotation ticket and flips the key into `rotating` posture pending approval.
+- `POST /api/providers/:id/keys/:key_id/revocations` – emergency revoke a key, forcing runtime policy re-evaluation and emitting alerting events.
 - `POST /api/providers/:id/keys/:key_id/approve` – approve rotation after attestation.
 - `GET /api/providers/:id/keys` – list keys, posture summaries, binding counts.
+- `GET /api/providers/:id/keys/audit` – scoped audit log filtering by key, timeframe, or posture to power CLI/console forensics.
 - `GET /api/providers/:id/keys/:key_id` – detailed state, rotation history, audit trail slice.
 - `GET /api/providers/:id/keys/stream` – SSE snapshots referencing audit events and posture changes, reusing `withCredentials` SSE style.
 
@@ -68,6 +71,8 @@ Introduce `mcpctl keys` command group with parity features:
 - `keys rotate --provider <id> --key <key_id> --attestation <file> --actor-ref <ref>`
 - `keys approve-rotation --provider <id> --rotation <rotation_id>`
 - `keys bindings --provider <id> --key <key_id>`
+- `keys revoke --provider <id> --key <key_id> [--reason <text>] [--compromised]`
+- `keys audit --provider <id> [--key-id <key>] [--state <state>] [--start/--end <timestamp>] [--limit <n>]`
 - `keys watch --provider <id>` (SSE stream)
 
 Implementation steps:
@@ -87,10 +92,12 @@ Implementation steps:
 - Capture operator identity (user_id/email) for every mutation; persist to audit events and enforce non-empty actor references for rotations.
 - Validate attestation freshness windows and enforce `rotation_due_at` semantics.
 - Ensure runtime gating occurs before workloads access secrets or data-plane attachments.
+- Provide an emergency revocation workflow that immediately vetoes compromised keys and documents operator response.
 - Integrate with secrets service to map provider key IDs to vault handles when BYOK extends to runtime encryption.
 
 ## Testing Strategy
 - **Backend integration tests**: extend SQLx fixtures to cover registration, rotation happy path, compromised key veto, policy gate refusal, SSE emission ordering.
+  - 2025-12-15: Added rotation SLA breach dedupe test and revocation workflow regression harness (see `backend/tests/provider_keys.rs`).
   - 2025-12-12: Added runtime policy regression coverage asserting BYOK vetoes when keys are absent and healthy posture when attested keys exist.
 - **CLI tests**: snapshot JSON for list/register/rotate/approve/bindings flows; simulate optimistic locking errors.
 - **Frontend tests/stories**: add Jest/Storybook coverage for console badges and provider portal flows with mocked SSE payloads.
