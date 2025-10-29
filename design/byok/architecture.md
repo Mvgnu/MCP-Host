@@ -91,6 +91,7 @@ Implementation steps:
 
 ## Testing Strategy
 - **Backend integration tests**: extend SQLx fixtures to cover registration, rotation happy path, compromised key veto, policy gate refusal, SSE emission ordering.
+  - 2025-12-12: Added runtime policy regression coverage asserting BYOK vetoes when keys are absent and healthy posture when attested keys exist.
 - **CLI tests**: snapshot JSON for list/register/rotate/approve/bindings flows; simulate optimistic locking errors.
 - **Frontend tests/stories**: add Jest/Storybook coverage for console badges and provider portal flows with mocked SSE payloads.
 - **Migration tests**: update migration harness to ensure downgrade path succeeds and triggers preserve NOTIFY semantics.

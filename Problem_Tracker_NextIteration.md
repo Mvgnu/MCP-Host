@@ -20,3 +20,4 @@
     - 2025-12-12 17:25:00 UTC: Required signed attestation bundles with verification timestamps, enforced rotation actor capture, and propagated signature posture across backend, CLI, and docs.
     - 2025-12-12 18:40:00 UTC: Lifecycle console SSE now streams provider key posture and deltas; UI badges, overlays, and tests surface BYOK state, vetoes, and attestation notes alongside trust analytics.
     - 2025-12-12 19:55:00 UTC: Delivered provider key binding persistence, REST/CLI endpoints, audit fan-out, and regression tests so workloads can declare BYOK coverage without leaving the CLI.
+    - 2025-12-12 21:10:00 UTC: Landed runtime policy regression tests that assert BYOK vetoes and healthy paths, confirming SSE posture data aligns with enforcement.
