@@ -84,7 +84,16 @@ async fn seed_lifecycle_fixture(pool: &PgPool) -> LifecycleFixture {
 
     let run_metadata = json!({
         "workspace_id": workspace.workspace.id,
-        "target": {"manifest_digest": manifest_digest, "lane": "console"}
+        "target": {
+            "manifest_digest": manifest_digest,
+            "lane": "console",
+            "stage": "production"
+        },
+        "promotion": {
+            "manifest_digest": manifest_digest,
+            "track": {"name": "Lifecycle", "tier": "gold"},
+            "stage": "production"
+        }
     });
     ensure_remediation_run(
         pool,
@@ -265,6 +274,12 @@ async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
     }));
     assert!(runs.iter().any(|run| run.get("marketplace").is_some()));
 
+    let promotion_runs = snapshot
+        .get("promotion_runs")
+        .and_then(|value| value.as_array())
+        .expect("promotion runs array");
+    assert!(!promotion_runs.is_empty(), "expected promotion automation runs");
+
     let promotion_postures = snapshot
         .get("promotion_postures")
         .and_then(|value| value.as_array())
@@ -323,4 +338,27 @@ async fn lifecycle_console_stream_emits_snapshot_event(pool: PgPool) {
     let payload = String::from_utf8(collected).expect("utf8");
     assert!(payload.contains("event: lifecycle-snapshot"));
     assert!(payload.contains(&fixture.workspace.workspace.id.to_string()));
+
+    let data_line = payload
+        .lines()
+        .find(|line| line.starts_with("data: "))
+        .expect("sse data line");
+    let envelope: serde_json::Value =
+        serde_json::from_str(data_line.trim_start_matches("data: ")).expect("json data");
+
+    let delta = envelope
+        .get("delta")
+        .and_then(|value| value.get("workspaces"))
+        .and_then(|value| value.as_array())
+        .expect("workspace deltas");
+    assert!(
+        delta.iter().any(|workspace| {
+            workspace
+                .get("promotion_run_deltas")
+                .and_then(|value| value.as_array())
+                .map(|runs| !runs.is_empty())
+                .unwrap_or(false)
+        }),
+        "expected promotion run deltas in snapshot"
+    );
 }

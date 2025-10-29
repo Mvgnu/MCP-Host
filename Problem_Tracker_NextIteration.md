@@ -349,3 +349,10 @@
     - 2025-10-29 08:01:26 UTC: Hydrated lifecycle snapshots with promotion_runs, diff-aware SSE envelopes, console automation tables, and README updates; CLI surfacing remains pending.
     - 2025-10-29 07:53:05 UTC: Initiated lifecycle promotion automation linkage iteration; auditing backend snapshot/delta hydration, SSE diffing, frontend data accessors, and CLI surfaces for promotion_runs coverage gaps.
     - 2025-12-09 14:05:00 UTC: Documented lifecycle SSE promotion-run schema, shipped `mcpctl lifecycle list|watch` parity with promotion automation tables and delta rendering, refreshed CLI/docs/tests, and recorded progress log updates to close the automation feedback loop.
+
+- ID: BE-LIFE-PROMO-DELTA
+  Status: DONE
+  Task: Verify lifecycle SSE promotion run delta parity.
+  Hypothesis: Seeding promotion-tagged remediation runs in lifecycle fixtures and asserting SSE envelopes include `promotion_run_deltas` will keep backend automation parity aligned with CLI expectations.
+  Log:
+    - 2025-12-10 09:45:00 UTC: Updated lifecycle console fixture metadata to mark promotion automation, extended REST assertions for `promotion_runs`, and parsed SSE payloads in tests to confirm promotion run deltas are emitted on initial snapshots.
