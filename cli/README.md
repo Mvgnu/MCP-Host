@@ -38,6 +38,11 @@ Lists marketplace artifacts and their active status. Pass `--json` to receive ra
 * `mcpctl evaluations list` – list evaluation certifications across artifacts.
 * `mcpctl evaluations retry EVALUATION_ID` – schedule a certification retry.
 
+### Lifecycle console
+
+* `mcpctl lifecycle list [--lifecycle-state STATE] [--owner-id USER] [--promotion-lane LANE]` – fetch lifecycle console snapshots with promotion automation context, posture verdicts, and recent remediation runs.
+* `mcpctl lifecycle watch [filters]` – subscribe to the lifecycle SSE feed and stream promotion automation deltas, gate verdicts, and heartbeat metadata in real time.
+
 ### Policy insights
 
 * `mcpctl policy intelligence SERVER_ID [--json]` – display capability intelligence scores, status, and recent anomaly notes for the specified server.

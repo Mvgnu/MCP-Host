@@ -211,6 +211,111 @@ def test_promotions_schedule_veto_renders_tables(
     assert "Intelligence signals" in output
 
 
+def test_lifecycle_list_renders_promotion_runs_table(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    FakeClient.responses[("GET", "/api/console/lifecycle")] = {
+        "workspaces": [
+            {
+                "workspace": {
+                    "id": 17,
+                    "workspace_key": "workspace-alpha",
+                    "display_name": "Workspace Alpha",
+                    "lifecycle_state": "active",
+                    "owner_id": 55,
+                },
+                "promotion_runs": [
+                    {
+                        "id": 321,
+                        "status": "pending",
+                        "playbook": "verify-automation",
+                        "automation_payload": {"lane": "prod"},
+                        "promotion_gate_context": {"lane": "prod", "stage": "production"},
+                        "metadata": {"notes": ["preflight"]},
+                    }
+                ],
+                "promotion_postures": [
+                    {
+                        "promotion_id": 77,
+                        "stage": "production",
+                        "track_name": "stable",
+                        "track_tier": "tier-1",
+                        "status": "pending",
+                        "allowed": False,
+                        "updated_at": "2025-12-09T00:00:00Z",
+                    }
+                ],
+                "recent_runs": [
+                    {
+                        "run": {
+                            "id": 44,
+                            "status": "succeeded",
+                            "playbook": "verify-automation",
+                        },
+                        "trust": {
+                            "attestation_status": "trusted",
+                            "lifecycle_state": "restored",
+                        },
+                        "marketplace": {
+                            "status": "ready",
+                            "last_completed_at": "2025-12-08T10:00:00Z",
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+
+    cli_module.main(["lifecycle", "list"])
+    output = capsys.readouterr().out
+    assert "Promotion automation runs:" in output
+    assert "321" in output
+    assert "Promotion posture verdicts:" in output
+    assert "Recent remediation runs:" in output
+
+
+def test_lifecycle_watch_streams_deltas(capsys: pytest.CaptureFixture[str]) -> None:
+    FakeClient.streams["/api/console/lifecycle/stream"] = [
+        json.dumps(
+            {
+                "type": "snapshot",
+                "emitted_at": "2025-12-09T12:00:00Z",
+                "cursor": 90,
+                "page": {"workspaces": []},
+                "delta": {
+                    "workspaces": [
+                        {
+                            "workspace_id": 22,
+                            "promotion_run_deltas": [
+                                {
+                                    "run_id": 44,
+                                    "status": "succeeded",
+                                    "automation_payload_changes": [
+                                        {
+                                            "field": "promotion_run.automation_payload",
+                                            "previous": None,
+                                            "current": '{"lane":"prod"}',
+                                        }
+                                    ],
+                                    "gate_context_changes": [],
+                                    "metadata_changes": [],
+                                }
+                            ],
+                            "removed_promotion_run_ids": [33],
+                        }
+                    ]
+                },
+            }
+        )
+    ]
+
+    cli_module.main(["lifecycle", "watch"])
+    output = capsys.readouterr().out
+    assert "lifecycle snapshot" in output
+    assert "workspace 22 promotion-run 44 -> status=succeeded" in output
+    assert "promotion-run 33 removed" in output
+
+
 def test_governance_start_parses_context() -> None:
     FakeClient.responses[("POST", "/api/governance/workflows/7/runs")] = {
         "id": 100,

@@ -2,6 +2,11 @@
 
 This document tracks development progress and high level notes from the planning materials in `README.md`.
 
+## 2025-12-09
+- Published lifecycle SSE schema guidance and promotion automation delta examples in `backend/README.md` so downstream clients can ingest `promotion_runs`/`promotion_run_deltas` without guesswork.
+- Added `mcpctl lifecycle list|watch` commands that render promotion automation tables, promotion posture verdicts, and remediation run summaries while streaming delta updates for promotion runs.
+- Refreshed CLI regression tests to cover lifecycle snapshots/deltas and updated documentation to advertise the new lifecycle console workflows.
+
 ## 2025-12-08
 - Wired promotion scheduling to query remediation runs, trust registry posture, and capability intelligence scores before persisting new records, emitting machine-readable notes and JSON veto payloads when posture is unhealthy.
 - Added `PromotionPostureSignals`/`PromotionVerdict` helpers with targeted unit tests so blended promotion gates stay deterministic as new signals land.
