@@ -284,8 +284,30 @@ def _render_delta(delta: Mapping[str, Any]) -> None:
         if not isinstance(workspace_delta, Mapping):
             continue
         workspace_id = workspace_delta.get("workspace_id")
+        run_deltas = workspace_delta.get("run_deltas")
+        if isinstance(run_deltas, Iterable) and not isinstance(run_deltas, (str, bytes)):
+            for run_delta in run_deltas:
+                if not isinstance(run_delta, Mapping):
+                    continue
+                run_id = run_delta.get("run_id")
+                status = run_delta.get("status")
+                changes = _summarize_field_changes(
+                    run_delta,
+                    (
+                        "trust_changes",
+                        "intelligence_changes",
+                        "marketplace_changes",
+                        "analytics_changes",
+                        "artifact_changes",
+                    ),
+                )
+                print(f"workspace {workspace_id} run {run_id} -> status={status}{changes}")
+        removed_runs = workspace_delta.get("removed_run_ids")
+        if isinstance(removed_runs, Iterable) and not isinstance(removed_runs, (str, bytes)):
+            for run_id in removed_runs:
+                print(f"workspace {workspace_id} run {run_id} removed")
         promotion_deltas = workspace_delta.get("promotion_run_deltas")
-        if isinstance(promotion_deltas, Iterable):
+        if isinstance(promotion_deltas, Iterable) and not isinstance(promotion_deltas, (str, bytes)):
             for run_delta in promotion_deltas:
                 if not isinstance(run_delta, Mapping):
                     continue
@@ -296,22 +318,78 @@ def _render_delta(delta: Mapping[str, Any]) -> None:
                     f"workspace {workspace_id} promotion-run {run_id} -> status={status}{changes}"
                 )
         removed_runs = workspace_delta.get("removed_promotion_run_ids")
-        if isinstance(removed_runs, Iterable):
+        if isinstance(removed_runs, Iterable) and not isinstance(removed_runs, (str, bytes)):
             for run_id in removed_runs:
                 print(f"workspace {workspace_id} promotion-run {run_id} removed")
+        promotion_postures = workspace_delta.get("promotion_posture_deltas")
+        if isinstance(promotion_postures, Iterable) and not isinstance(
+            promotion_postures, (str, bytes)
+        ):
+            for posture in promotion_postures:
+                if not isinstance(posture, Mapping):
+                    continue
+                promotion_id = posture.get("promotion_id")
+                status = posture.get("status")
+                allowed = posture.get("allowed")
+                stage = posture.get("stage")
+                track = posture.get("track_name")
+                tier = posture.get("track_tier")
+                details: list[str] = []
+                if stage:
+                    details.append(f"stage={stage}")
+                if track:
+                    details.append(f"track={track}")
+                if tier:
+                    details.append(f"tier={tier}")
+                veto_reasons = posture.get("veto_reasons")
+                if isinstance(veto_reasons, Iterable) and not isinstance(
+                    veto_reasons, (str, bytes)
+                ):
+                    rendered = ", ".join(str(reason) for reason in veto_reasons if reason)
+                    if rendered:
+                        details.append(f"veto=[{rendered}]")
+                notes = posture.get("notes")
+                if isinstance(notes, Iterable) and not isinstance(notes, (str, bytes)):
+                    rendered = ", ".join(str(note) for note in notes if note)
+                    if rendered:
+                        details.append(f"notes=[{rendered}]")
+                hooks = posture.get("remediation_hooks")
+                if isinstance(hooks, Iterable) and not isinstance(hooks, (str, bytes)):
+                    rendered = ", ".join(str(hook) for hook in hooks if hook)
+                    if rendered:
+                        details.append(f"hooks=[{rendered}]")
+                signals = posture.get("signals")
+                if signals:
+                    details.append(f"signals={_summarize_json(signals)}")
+                allowed_flag = "yes" if bool(allowed) else "no"
+                suffix = f" {' '.join(details)}" if details else ""
+                print(
+                    f"workspace {workspace_id} promotion {promotion_id} -> status={status} allowed={allowed_flag}{suffix}"
+                )
+        removed_promotions = workspace_delta.get("removed_promotion_ids")
+        if isinstance(removed_promotions, Iterable) and not isinstance(
+            removed_promotions, (str, bytes)
+        ):
+            for promotion_id in removed_promotions:
+                print(f"workspace {workspace_id} promotion {promotion_id} removed")
 
 
-def _summarize_field_changes(run_delta: Mapping[str, Any]) -> str:
+def _summarize_field_changes(
+    run_delta: Mapping[str, Any],
+    keys: Iterable[str] | None = None,
+) -> str:
     summaries: list[str] = []
-    for key in (
-        "automation_payload_changes",
-        "gate_context_changes",
-        "metadata_changes",
-        "analytics_changes",
-        "artifact_changes",
-    ):
+    if keys is None:
+        keys = (
+            "automation_payload_changes",
+            "gate_context_changes",
+            "metadata_changes",
+            "analytics_changes",
+            "artifact_changes",
+        )
+    for key in keys:
         changes = run_delta.get(key)
-        if not isinstance(changes, Iterable):
+        if not isinstance(changes, Iterable) or isinstance(changes, (str, bytes)):
             continue
         rendered = []
         for change in changes:

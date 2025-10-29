@@ -288,6 +288,41 @@ def test_lifecycle_watch_streams_deltas(capsys: pytest.CaptureFixture[str]) -> N
                     "workspaces": [
                         {
                             "workspace_id": 22,
+                            "run_deltas": [
+                                {
+                                    "run_id": 55,
+                                    "status": "failed",
+                                    "trust_changes": [
+                                        {
+                                            "field": "trust.lifecycle_state",
+                                            "previous": "remediating",
+                                            "current": "quarantined",
+                                        }
+                                    ],
+                                    "intelligence_changes": [],
+                                    "marketplace_changes": [],
+                                    "analytics_changes": [
+                                        {
+                                            "field": "run.duration_seconds",
+                                            "previous": "120",
+                                            "current": "300",
+                                        },
+                                        {
+                                            "field": "run.retry_attempt",
+                                            "previous": "1",
+                                            "current": "2",
+                                        },
+                                    ],
+                                    "artifact_changes": [
+                                        {
+                                            "field": "run.artifacts",
+                                            "previous": None,
+                                            "current": '[{"manifest_digest":"sha256:new"}]',
+                                        }
+                                    ],
+                                }
+                            ],
+                            "removed_run_ids": [11],
                             "promotion_run_deltas": [
                                 {
                                     "run_id": 44,
@@ -304,6 +339,36 @@ def test_lifecycle_watch_streams_deltas(capsys: pytest.CaptureFixture[str]) -> N
                                 }
                             ],
                             "removed_promotion_run_ids": [33],
+                            "promotion_posture_deltas": [
+                                {
+                                    "promotion_id": 77,
+                                    "manifest_digest": "sha256:artifact",
+                                    "stage": "production",
+                                    "status": "blocked",
+                                    "track_id": 9,
+                                    "track_name": "gold",
+                                    "track_tier": "tier-1",
+                                    "allowed": False,
+                                    "veto_reasons": [
+                                        "trust.lifecycle_state=quarantined",
+                                        "intel.score=low",
+                                    ],
+                                    "notes": [
+                                        "manual-review-required",
+                                        "policy:remediation-gate",
+                                    ],
+                                    "updated_at": "2025-12-09T12:00:00Z",
+                                    "remediation_hooks": [
+                                        "hook:remediation:retry",
+                                        "hook:notify",
+                                    ],
+                                    "signals": {
+                                        "trust": {"lifecycle_state": "quarantined"},
+                                        "remediation": {"status": "failed"},
+                                    },
+                                }
+                            ],
+                            "removed_promotion_ids": [66],
                         }
                     ]
                 },
@@ -316,6 +381,12 @@ def test_lifecycle_watch_streams_deltas(capsys: pytest.CaptureFixture[str]) -> N
     assert "lifecycle snapshot" in output
     assert "workspace 22 promotion-run 44 -> status=succeeded" in output
     assert "promotion-run 33 removed" in output
+    assert "workspace 22 run 55 -> status=failed" in output
+    assert "run.duration_seconds='300'" in output
+    assert "workspace 22 run 11 removed" in output
+    assert "workspace 22 promotion 77 -> status=blocked allowed=no" in output
+    assert "veto=[trust.lifecycle_state=quarantined, intel.score=low]" in output
+    assert "workspace 22 promotion 66 removed" in output
 
 
 def test_governance_start_parses_context() -> None:
