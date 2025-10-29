@@ -334,3 +334,10 @@
     - 2025-12-08 10:05:00 UTC: Audited promotion scheduling flow, lifecycle console aggregation, and trust/intelligence data paths to scope blended gate evaluation and payload surfacing requirements.
     - 2025-12-08 14:45:00 UTC: Implemented promotion posture evaluation wiring trust registry, remediation run, and intelligence queries; surfaced JSON veto payloads plus machine-readable notes, and added unit tests covering healthy vs. critical veto scenarios.
     - 2025-12-09 11:15:00 UTC: Persisted promotion posture verdict JSON alongside records, introduced structured `JsonBadRequest` responses for vetoes, and taught the CLI to narrate trust/remediation/intel signals when scheduling or reviewing promotions. Follow-up required to broadcast verdict slices through lifecycle SSE/UI surfaces.
+- ID: BE-LIFE-PROMO-POSTURE
+  Status: IN_PROGRESS
+  Task: Surface promotion posture verdicts through lifecycle SSE envelopes and console timelines.
+  Hypothesis: Hydrating lifecycle snapshots with persisted promotion verdict JSON and diff-aware SSE slices, then rendering a console timeline, will eliminate CLI spelunking and keep posture narratives replay-safe across channels.
+  Log:
+    - 2025-12-09 17:45:00 UTC: Kicked off posture propagation by auditing lifecycle console aggregation, SSE delta computation, and frontend timeline storage to scope manifest→promotion linkage requirements.
+    - 2025-12-09 23:05:00 UTC: Hydrated lifecycle snapshots with promotion verdict slices, broadcast SSE deltas, rendered the PromotionVerdictTimeline, and updated docs/tests so promotion posture narratives replay across REST, SSE, and the console UI.

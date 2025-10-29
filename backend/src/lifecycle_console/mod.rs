@@ -108,6 +108,8 @@ pub struct LifecycleWorkspaceSnapshot {
     pub active_revision: Option<LifecycleWorkspaceRevision>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_runs: Vec<LifecycleRunSnapshot>,
+    #[serde(default)]
+    pub promotion_postures: Vec<LifecyclePromotionPosture>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -129,6 +131,27 @@ pub struct LifecycleRunSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct LifecyclePromotionPosture {
+    pub promotion_id: i64,
+    pub manifest_digest: String,
+    pub stage: String,
+    pub status: String,
+    pub track_id: i32,
+    pub track_name: String,
+    pub track_tier: String,
+    pub allowed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub veto_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remediation_hooks: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signals: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct LifecycleDelta {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspaces: Vec<LifecycleWorkspaceDelta>,
@@ -141,6 +164,10 @@ pub struct LifecycleWorkspaceDelta {
     pub run_deltas: Vec<LifecycleRunDelta>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_run_ids: Vec<i64>,
+    #[serde(default)]
+    pub promotion_posture_deltas: Vec<LifecyclePromotionPostureDelta>,
+    #[serde(default)]
+    pub removed_promotion_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,6 +180,27 @@ pub struct LifecycleRunDelta {
     pub intelligence_changes: Vec<LifecycleFieldChange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub marketplace_changes: Vec<LifecycleFieldChange>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecyclePromotionPostureDelta {
+    pub promotion_id: i64,
+    pub manifest_digest: String,
+    pub stage: String,
+    pub status: String,
+    pub track_id: i32,
+    pub track_name: String,
+    pub track_tier: String,
+    pub allowed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub veto_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remediation_hooks: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signals: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -488,6 +536,7 @@ pub async fn fetch_page(
     let marketplace = load_marketplace(pool, &server_ids).await?;
 
     let mut snapshots = Vec::with_capacity(workspaces.len());
+    let mut workspace_manifest_index: HashMap<i64, HashSet<String>> = HashMap::new();
 
     for workspace in workspaces {
         let revision = workspace
@@ -527,11 +576,43 @@ pub async fn fetch_page(
             });
         }
 
+        let manifest_digests =
+            collect_workspace_manifest_digests(&workspace, revision.as_ref(), &run_snapshots);
+        if !manifest_digests.is_empty() {
+            workspace_manifest_index.insert(workspace.id, manifest_digests);
+        }
+
         snapshots.push(LifecycleWorkspaceSnapshot {
             workspace,
             active_revision: revision,
             recent_runs: run_snapshots,
+            promotion_postures: Vec::new(),
         });
+    }
+
+    if !workspace_manifest_index.is_empty() {
+        let mut manifest_digests = HashSet::new();
+        for digests in workspace_manifest_index.values() {
+            for digest in digests {
+                manifest_digests.insert(digest.clone());
+            }
+        }
+
+        let promotion_map = load_promotion_postures(pool, &manifest_digests).await?;
+
+        for snapshot in &mut snapshots {
+            if let Some(digests) = workspace_manifest_index.get(&snapshot.workspace.id) {
+                let mut promotions = Vec::new();
+                for digest in digests {
+                    if let Some(entries) = promotion_map.get(digest) {
+                        promotions.extend(entries.clone());
+                    }
+                }
+                promotions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                promotions.dedup_by(|left, right| left.promotion_id == right.promotion_id);
+                snapshot.promotion_postures = promotions;
+            }
+        }
     }
 
     Ok(LifecycleConsolePage {
@@ -731,6 +812,211 @@ async fn load_trust_states(
         .collect())
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct PromotionPostureRow {
+    pub id: i64,
+    pub promotion_track_id: i32,
+    pub manifest_digest: String,
+    pub stage: String,
+    pub status: String,
+    pub notes: Vec<String>,
+    pub posture_verdict: Option<Value>,
+    pub updated_at: DateTime<Utc>,
+    pub track_name: String,
+    pub tier: String,
+}
+
+struct PromotionVerdictSummary {
+    allowed: bool,
+    veto_reasons: Vec<String>,
+    notes: Vec<String>,
+    signals: Option<Value>,
+    remediation_hooks: Vec<String>,
+}
+
+fn collect_workspace_manifest_digests(
+    workspace: &RuntimeVmRemediationWorkspace,
+    revision: Option<&LifecycleWorkspaceRevision>,
+    runs: &[LifecycleRunSnapshot],
+) -> HashSet<String> {
+    let mut digests = HashSet::new();
+    collect_manifest_digests_from_value(&workspace.metadata, &mut digests);
+    if let Some(revision) = revision {
+        collect_manifest_digests_from_value(&revision.revision.plan, &mut digests);
+        collect_manifest_digests_from_value(&revision.revision.metadata, &mut digests);
+    }
+    for run in runs {
+        collect_manifest_digests_from_value(&run.run.metadata, &mut digests);
+        if let Some(payload) = run.run.automation_payload.as_ref() {
+            collect_manifest_digests_from_value(payload, &mut digests);
+        }
+        collect_manifest_digests_from_value(&run.run.promotion_gate_context, &mut digests);
+    }
+    digests
+}
+
+fn collect_manifest_digests_from_value(value: &Value, digests: &mut HashSet<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, entry) in map {
+                if key == "manifest_digest" {
+                    if let Some(text) = entry.as_str() {
+                        if !text.is_empty() {
+                            digests.insert(text.to_string());
+                        }
+                    }
+                }
+                collect_manifest_digests_from_value(entry, digests);
+            }
+        }
+        Value::Array(items) => {
+            for entry in items {
+                collect_manifest_digests_from_value(entry, digests);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn load_promotion_postures(
+    pool: &PgPool,
+    manifest_digests: &HashSet<String>,
+) -> Result<HashMap<String, Vec<LifecyclePromotionPosture>>, AppError> {
+    if manifest_digests.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let digests: Vec<String> = manifest_digests.iter().cloned().collect();
+    let rows: Vec<PromotionPostureRow> = query_as(
+        r#"
+        SELECT ap.id, ap.promotion_track_id, ap.manifest_digest, ap.stage, ap.status,
+               ap.notes, ap.posture_verdict, ap.updated_at, t.name AS track_name, t.tier
+        FROM artifact_promotions ap
+        JOIN promotion_tracks t ON t.id = ap.promotion_track_id
+        WHERE ap.manifest_digest = ANY($1)
+        ORDER BY ap.updated_at DESC
+        "#,
+    )
+    .bind(&digests)
+    .fetch_all(pool)
+    .await?;
+
+    let mut grouped: HashMap<String, Vec<LifecyclePromotionPosture>> = HashMap::new();
+    for row in rows {
+        let summary = summarize_promotion_verdict(row.posture_verdict.as_ref());
+        let mut notes = row.notes.clone();
+        notes.extend(summary.notes.iter().cloned());
+        notes.sort();
+        notes.dedup();
+
+        let mut hooks = summary.remediation_hooks.clone();
+        hooks.sort();
+        hooks.dedup();
+
+        grouped
+            .entry(row.manifest_digest.clone())
+            .or_default()
+            .push(LifecyclePromotionPosture {
+                promotion_id: row.id,
+                manifest_digest: row.manifest_digest,
+                stage: row.stage,
+                status: row.status,
+                track_id: row.promotion_track_id,
+                track_name: row.track_name,
+                track_tier: row.tier,
+                allowed: summary.allowed,
+                veto_reasons: summary.veto_reasons,
+                notes,
+                updated_at: row.updated_at,
+                remediation_hooks: hooks,
+                signals: summary.signals,
+            });
+    }
+
+    Ok(grouped)
+}
+
+fn summarize_promotion_verdict(value: Option<&Value>) -> PromotionVerdictSummary {
+    let mut summary = PromotionVerdictSummary {
+        allowed: true,
+        veto_reasons: Vec::new(),
+        notes: Vec::new(),
+        signals: None,
+        remediation_hooks: Vec::new(),
+    };
+
+    let Some(verdict) = value.and_then(|v| v.as_object()) else {
+        return summary;
+    };
+
+    if let Some(flag) = verdict.get("allowed").and_then(Value::as_bool) {
+        summary.allowed = flag;
+    }
+
+    if let Some(reasons) = verdict.get("reasons").and_then(Value::as_array) {
+        summary.veto_reasons = reasons
+            .iter()
+            .filter_map(|entry| entry.as_str().map(|value| value.to_string()))
+            .collect();
+    }
+
+    if let Some(notes) = verdict.get("notes").and_then(Value::as_array) {
+        summary.notes = notes
+            .iter()
+            .filter_map(|entry| entry.as_str().map(|value| value.to_string()))
+            .collect();
+    }
+
+    if let Some(metadata) = verdict.get("metadata") {
+        if let Some(signals) = metadata.get("signals") {
+            summary.signals = Some(signals.clone());
+            collect_remediation_hooks(signals, &mut summary.remediation_hooks);
+        }
+        collect_remediation_hooks(metadata, &mut summary.remediation_hooks);
+    }
+
+    summary.veto_reasons.sort();
+    summary.veto_reasons.dedup();
+    summary.notes.sort();
+    summary.notes.dedup();
+    summary.remediation_hooks.sort();
+    summary.remediation_hooks.dedup();
+
+    summary
+}
+
+fn collect_remediation_hooks(value: &Value, hooks: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, entry) in map {
+                if key == "hooks" || key == "remediation_hooks" {
+                    if let Some(array) = entry.as_array() {
+                        for item in array {
+                            if let Some(text) = item.as_str() {
+                                if !text.is_empty() {
+                                    hooks.push(text.to_string());
+                                }
+                            }
+                        }
+                    } else if let Some(text) = entry.as_str() {
+                        if !text.is_empty() {
+                            hooks.push(text.to_string());
+                        }
+                    }
+                } else {
+                    collect_remediation_hooks(entry, hooks);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for entry in items {
+                collect_remediation_hooks(entry, hooks);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn compute_delta(
     previous: &HashMap<i64, LifecycleWorkspaceSnapshot>,
     page: &LifecycleConsolePage,
@@ -741,19 +1027,30 @@ fn compute_delta(
     for snapshot in &page.workspaces {
         let workspace_id = snapshot.workspace.id;
         seen.insert(workspace_id);
-        let previous_runs = previous
-            .get(&workspace_id)
+        let previous_snapshot = previous.get(&workspace_id);
+        let previous_runs = previous_snapshot
             .map(|s| s.recent_runs.as_slice())
             .unwrap_or(&[]);
         let (run_deltas, removed_run_ids) = diff_runs(previous_runs, &snapshot.recent_runs);
+
+        let previous_promotions = previous_snapshot
+            .map(|s| s.promotion_postures.as_slice())
+            .unwrap_or(&[]);
+        let (promotion_posture_deltas, removed_promotion_ids) =
+            diff_promotion_postures(previous_promotions, &snapshot.promotion_postures);
+
         if !run_deltas.is_empty()
             || !removed_run_ids.is_empty()
-            || !previous.contains_key(&workspace_id)
+            || !promotion_posture_deltas.is_empty()
+            || !removed_promotion_ids.is_empty()
+            || previous_snapshot.is_none()
         {
             workspaces.push(LifecycleWorkspaceDelta {
                 workspace_id,
                 run_deltas,
                 removed_run_ids,
+                promotion_posture_deltas,
+                removed_promotion_ids,
             });
         }
     }
@@ -765,10 +1062,17 @@ fn compute_delta(
                 .iter()
                 .map(|run| run.run.id)
                 .collect::<Vec<_>>();
+            let removed_promotion_ids = prev_snapshot
+                .promotion_postures
+                .iter()
+                .map(|posture| posture.promotion_id)
+                .collect::<Vec<_>>();
             workspaces.push(LifecycleWorkspaceDelta {
                 workspace_id: *workspace_id,
                 run_deltas: Vec::new(),
                 removed_run_ids,
+                promotion_posture_deltas: Vec::new(),
+                removed_promotion_ids,
             });
         }
     }
@@ -778,6 +1082,51 @@ fn compute_delta(
     } else {
         Some(LifecycleDelta { workspaces })
     }
+}
+
+fn diff_promotion_postures(
+    previous: &[LifecyclePromotionPosture],
+    current: &[LifecyclePromotionPosture],
+) -> (Vec<LifecyclePromotionPostureDelta>, Vec<i64>) {
+    let mut previous_map: HashMap<i64, &LifecyclePromotionPosture> = HashMap::new();
+    for posture in previous {
+        previous_map.insert(posture.promotion_id, posture);
+    }
+
+    let mut deltas = Vec::new();
+    for posture in current {
+        let promotion_id = posture.promotion_id;
+        let previous_posture = previous_map.remove(&promotion_id);
+        let has_changes = previous_posture.map_or(true, |prev| {
+            prev.status != posture.status
+                || prev.allowed != posture.allowed
+                || prev.veto_reasons != posture.veto_reasons
+                || prev.notes != posture.notes
+                || prev.remediation_hooks != posture.remediation_hooks
+                || prev.signals != posture.signals
+        });
+
+        if has_changes {
+            deltas.push(LifecyclePromotionPostureDelta {
+                promotion_id,
+                manifest_digest: posture.manifest_digest.clone(),
+                stage: posture.stage.clone(),
+                status: posture.status.clone(),
+                track_id: posture.track_id,
+                track_name: posture.track_name.clone(),
+                track_tier: posture.track_tier.clone(),
+                allowed: posture.allowed,
+                veto_reasons: posture.veto_reasons.clone(),
+                notes: posture.notes.clone(),
+                updated_at: posture.updated_at,
+                remediation_hooks: posture.remediation_hooks.clone(),
+                signals: posture.signals.clone(),
+            });
+        }
+    }
+
+    let removed_ids = previous_map.into_keys().collect::<Vec<_>>();
+    (deltas, removed_ids)
 }
 
 fn diff_runs(

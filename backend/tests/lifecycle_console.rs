@@ -14,6 +14,8 @@ use tower::ServiceExt;
 
 struct LifecycleFixture {
     workspace: WorkspaceDetails,
+    owner_id: i32,
+    manifest_digest: String,
 }
 
 async fn seed_lifecycle_fixture(pool: &PgPool) -> LifecycleFixture {
@@ -47,7 +49,15 @@ async fn seed_lifecycle_fixture(pool: &PgPool) -> LifecycleFixture {
     .unwrap();
 
     let plan = json!({"steps": []});
-    let metadata = json!({"targets": [{"runtime_vm_instance_id": vm_instance_id}]});
+    let manifest_digest = "sha256:console-fixture".to_string();
+    let metadata = json!({
+        "targets": [{
+            "runtime_vm_instance_id": vm_instance_id,
+            "manifest_digest": manifest_digest,
+            "lane": "console",
+            "stage": "production"
+        }]
+    });
 
     let workspace = create_workspace(
         pool,
@@ -72,7 +82,10 @@ async fn seed_lifecycle_fixture(pool: &PgPool) -> LifecycleFixture {
         .revision
         .clone();
 
-    let run_metadata = json!({"workspace_id": workspace.workspace.id});
+    let run_metadata = json!({
+        "workspace_id": workspace.workspace.id,
+        "target": {"manifest_digest": manifest_digest, "lane": "console"}
+    });
     ensure_remediation_run(
         pool,
         EnsureRemediationRunRequest {
@@ -150,7 +163,49 @@ async fn seed_lifecycle_fixture(pool: &PgPool) -> LifecycleFixture {
     .await
     .unwrap();
 
-    LifecycleFixture { workspace }
+    let track_id: i32 = sqlx::query_scalar(
+        "INSERT INTO promotion_tracks (owner_id, name, tier, stages, description, workflow_id) VALUES ($1, $2, $3, ARRAY['candidate','staging','production']::TEXT[], NULL, NULL) RETURNING id",
+    )
+    .bind(owner_id)
+    .bind("Lifecycle")
+    .bind("gold")
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    let posture_verdict = json!({
+        "allowed": false,
+        "track": {"id": track_id, "name": "Lifecycle", "tier": "gold"},
+        "stage": "production",
+        "reasons": ["trust.lifecycle_state=quarantined"],
+        "notes": ["posture:trust.lifecycle_state:quarantined"],
+        "metadata": {
+            "track": {"id": track_id, "name": "Lifecycle", "tier": "gold"},
+            "signals": {
+                "trust": {"lifecycle_state": "quarantined", "remediation_state": "remediation:active"},
+                "remediation": {"status": "failed"}
+            }
+        }
+    });
+
+    sqlx::query(
+        "INSERT INTO artifact_promotions (promotion_track_id, manifest_digest, stage, status, notes, posture_verdict) VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(track_id)
+    .bind(&manifest_digest)
+    .bind("production")
+    .bind("scheduled")
+    .bind(&vec!["console:seed".to_string()])
+    .bind(&posture_verdict)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    LifecycleFixture {
+        workspace,
+        owner_id,
+        manifest_digest,
+    }
 }
 
 #[sqlx::test]
@@ -209,6 +264,29 @@ async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
             .unwrap_or(false)
     }));
     assert!(runs.iter().any(|run| run.get("marketplace").is_some()));
+
+    let promotion_postures = snapshot
+        .get("promotion_postures")
+        .and_then(|value| value.as_array())
+        .expect("promotion postures");
+    assert_eq!(promotion_postures.len(), 1);
+    let promotion = &promotion_postures[0];
+    assert_eq!(
+        promotion.get("stage").and_then(|value| value.as_str()),
+        Some("production")
+    );
+    assert_eq!(
+        promotion
+            .get("veto_reasons")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.get(0))
+            .and_then(|value| value.as_str()),
+        Some("trust.lifecycle_state=quarantined")
+    );
+    assert_eq!(
+        promotion.get("allowed").and_then(|value| value.as_bool()),
+        Some(false)
+    );
 }
 
 #[sqlx::test]

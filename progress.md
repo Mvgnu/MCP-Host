@@ -7,6 +7,7 @@ This document tracks development progress and high level notes from the planning
 - Added `PromotionPostureSignals`/`PromotionVerdict` helpers with targeted unit tests so blended promotion gates stay deterministic as new signals land.
 - Documented the promotion posture integration path so console/CLI surfaces can reuse the structured metadata emitted on success or veto.
 - Normalized promotion veto propagation by persisting verdict metadata, returning structured JSON errors for CLI/REST clients, and expanding the CLI history/schedule flows to narrate trust, remediation, and intelligence signals when a gate blocks progress.
+- Hydrated lifecycle console REST/SSE payloads with `promotion_postures` plus replay-safe deltas so workspaces expose promotion narratives alongside remediation runs. The frontend renders the new `PromotionVerdictTimeline` component and persists promotion deltas for offline replay.
 
 ## 2025-11-24
 - Landed remediation control plane schema upgrades (`runtime_vm_remediation_playbooks`, `runtime_vm_remediation_runs`, `runtime_vm_remediation_artifacts`) with optimistic locking, owner assignment, approval state tracking, SLA deadlines, and artifact persistence.

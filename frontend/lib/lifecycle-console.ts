@@ -8,6 +8,7 @@ export interface LifecycleWorkspaceSnapshot {
   workspace: RemediationWorkspace;
   active_revision?: LifecycleWorkspaceRevision;
   recent_runs: LifecycleRunSnapshot[];
+  promotion_postures: LifecyclePromotionPosture[];
 }
 
 export interface LifecycleWorkspaceRevision {
@@ -54,6 +55,8 @@ export interface LifecycleWorkspaceDelta {
   workspace_id: number;
   run_deltas: LifecycleRunDelta[];
   removed_run_ids: number[];
+  promotion_posture_deltas: LifecyclePromotionPostureDelta[];
+  removed_promotion_ids: number[];
 }
 
 export interface LifecycleRunDelta {
@@ -62,6 +65,38 @@ export interface LifecycleRunDelta {
   trust_changes: LifecycleFieldChange[];
   intelligence_changes: LifecycleFieldChange[];
   marketplace_changes: LifecycleFieldChange[];
+}
+
+export interface LifecyclePromotionPosture {
+  promotion_id: number;
+  manifest_digest: string;
+  stage: string;
+  status: string;
+  track_id: number;
+  track_name: string;
+  track_tier: string;
+  allowed: boolean;
+  veto_reasons: string[];
+  notes: string[];
+  updated_at: string;
+  remediation_hooks: string[];
+  signals?: Record<string, unknown> | null;
+}
+
+export interface LifecyclePromotionPostureDelta {
+  promotion_id: number;
+  manifest_digest: string;
+  stage: string;
+  status: string;
+  track_id: number;
+  track_name: string;
+  track_tier: string;
+  allowed: boolean;
+  veto_reasons: string[];
+  notes: string[];
+  updated_at: string;
+  remediation_hooks: string[];
+  signals?: Record<string, unknown> | null;
 }
 
 export interface LifecycleFieldChange {
