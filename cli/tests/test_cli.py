@@ -31,6 +31,7 @@ sys.modules.setdefault("requests", requests_stub)
 import pytest
 
 from mcpctl import cli as cli_module
+from mcpctl.client import APIError
 from mcpctl.commands import _render_trust_event
 from mcpctl.commands.remediation import _render_event as _render_remediation_event
 
@@ -49,7 +50,10 @@ class FakeClient:
 
     def get(self, path: str, params: Dict[str, Any] | None = None) -> Any:
         FakeClient.calls.append(("GET", path, params or {}))
-        return FakeClient.responses.get(("GET", path), [])
+        result = FakeClient.responses.get(("GET", path))
+        if isinstance(result, Exception):
+            raise result
+        return result if result is not None else []
 
     def post(
         self,
@@ -59,7 +63,10 @@ class FakeClient:
         params: Dict[str, Any] | None = None,
     ) -> Any:
         FakeClient.calls.append(("POST", path, json_body or {}))
-        return FakeClient.responses.get(("POST", path), {})
+        result = FakeClient.responses.get(("POST", path))
+        if isinstance(result, Exception):
+            raise result
+        return result if result is not None else {}
 
     def patch(
         self,
@@ -69,7 +76,10 @@ class FakeClient:
         params: Dict[str, Any] | None = None,
     ) -> Any:
         FakeClient.calls.append(("PATCH", path, json or {}))
-        return FakeClient.responses.get(("PATCH", path), {})
+        result = FakeClient.responses.get(("PATCH", path))
+        if isinstance(result, Exception):
+            raise result
+        return result if result is not None else {}
 
     def stream_sse(
         self,
@@ -107,6 +117,7 @@ def test_promotions_schedule_returns_json(capsys: pytest.CaptureFixture[str]) ->
         "track_name": "production",
         "stage": "prod",
         "status": "scheduled",
+        "posture_verdict": {"allowed": True, "reasons": []},
     }
 
     cli_module.main(
@@ -125,6 +136,79 @@ def test_promotions_schedule_returns_json(capsys: pytest.CaptureFixture[str]) ->
     payload = json.loads(captured)
     assert payload["id"] == 22
     assert FakeClient.calls[-1][2]["notes"] == ["ready"]
+
+
+def test_promotions_schedule_prints_posture_summary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    FakeClient.responses[("POST", "/api/promotions/schedule")] = {
+        "id": 42,
+        "track_name": "stable",
+        "stage": "production",
+        "status": "scheduled",
+        "posture_verdict": {"allowed": True, "reasons": ["intel.warn"]},
+    }
+
+    cli_module.main(
+        [
+            "promotions",
+            "schedule",
+            "3",
+            "sha256:f00",
+            "production",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert "allowed with notes" in output
+
+
+def test_promotions_schedule_veto_renders_tables(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    payload = {
+        "error": "promotion_veto",
+        "allowed": False,
+        "reasons": ["trust.lifecycle_state=quarantined"],
+        "notes": ["posture:trust.lifecycle_state:quarantined"],
+        "metadata": {
+            "signals": {
+                "trust": {
+                    "lifecycle_state": "quarantined",
+                    "attestation_status": "critical",
+                },
+                "remediation": {"status": "failed"},
+                "intelligence": [
+                    {
+                        "capability": "runtime",
+                        "status": "critical",
+                        "score": 22.5,
+                        "confidence": 0.3,
+                    }
+                ],
+            }
+        },
+    }
+    FakeClient.responses[("POST", "/api/promotions/schedule")] = APIError(
+        400, "promotion veto", payload=payload
+    )
+
+    cli_module.main(
+        [
+            "promotions",
+            "schedule",
+            "9",
+            "sha256:blocked",
+            "production",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert "Promotion scheduling failed" in output
+    assert "trust.lifecycle_state=quarantined" in output
+    assert "Veto reasons" in output
+    assert "Trust posture" in output
+    assert "Intelligence signals" in output
 
 
 def test_governance_start_parses_context() -> None:
