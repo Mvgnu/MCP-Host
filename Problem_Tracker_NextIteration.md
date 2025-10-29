@@ -356,3 +356,11 @@
   Hypothesis: Seeding promotion-tagged remediation runs in lifecycle fixtures and asserting SSE envelopes include `promotion_run_deltas` will keep backend automation parity aligned with CLI expectations.
   Log:
     - 2025-12-10 09:45:00 UTC: Updated lifecycle console fixture metadata to mark promotion automation, extended REST assertions for `promotion_runs`, and parsed SSE payloads in tests to confirm promotion run deltas are emitted on initial snapshots.
+- ID: BE-LIFE-AUTO-ANALYTICS
+  Status: IN_PROGRESS
+  Task: Finish lifecycle automation and analytics parity across backend, SSE, frontend, and CLI.
+  Hypothesis: Enriching lifecycle run snapshots with duration, retry, override, and artifact metadata while synchronizing REST/SSE payloads, UI tables, and CLI transcripts will unify operator automation narratives and analytics metrics.
+  Log:
+    - 2025-10-29 10:09:45 UTC: Enriched lifecycle run snapshots with duration/retry/override fields, hydrated artifact metadata from build runs, updated SSE deltas, UI components, CLI summaries, docs, and added supporting migrations/tests.
+    - 2025-10-29 09:58:05 UTC: Initiated parity iteration; auditing lifecycle console modules, SSE builders, frontend hooks, and CLI transcripts to scope metadata gaps.
+    - 2025-12-10 15:25:00 UTC: Added focused unit tests for lifecycle artifact extraction/enrichment helpers and console analytics chips, documenting coverage in the frontend components README.

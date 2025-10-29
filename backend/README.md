@@ -191,6 +191,16 @@ Lifecycle streaming responses (`GET /api/console/lifecycle/stream`) emit Server-
 the JSON envelope described below. Promotion automation parity hinges on the `promotion_runs`
 collection and the replay-safe `promotion_run_deltas` payload.
 
+Each remediation run snapshot now publishes automation analytics and artifact metadata alongside
+trust and intelligence state. The `recent_runs` array surfaces `duration_seconds`, blended retry
+signals (`retry_attempt`/`retry_limit`), any surfaced `override_reason`, and an `artifacts` array that
+captures manifest digests, lane/stage context, track metadata, and hydrated build insights (manifest
+tag, registry image, build status, completion timestamp, and duration). Marketplace readiness entries
+mirror these additions with `manifest_digest`, `manifest_tag`, `registry_image`, and
+`build_duration_seconds`. SSE deltas populate `analytics_changes` and `artifact_changes` vectors so
+streaming consumers can diff retry counts, durations, and artifact rollups without replaying entire
+snapshots.
+
 ```json
 {
   "type": "snapshot",                 // "snapshot", "heartbeat", or "error"

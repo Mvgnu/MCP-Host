@@ -272,6 +272,8 @@ def test_lifecycle_list_renders_promotion_runs_table(
     assert "321" in output
     assert "Promotion posture verdicts:" in output
     assert "Recent remediation runs:" in output
+    assert "attempt" in output
+    assert "artifacts" in output
 
 
 def test_lifecycle_watch_streams_deltas(capsys: pytest.CaptureFixture[str]) -> None:

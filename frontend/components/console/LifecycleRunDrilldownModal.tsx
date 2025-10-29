@@ -78,12 +78,46 @@ export default function LifecycleRunDrilldownModal({ workspace, run, delta, onCl
               <p className="text-xs text-slate-600">
                 Status: <span className="font-medium text-slate-800">{run.run.status}</span>
               </p>
+              {typeof run.duration_seconds === 'number' && (
+                <p className="text-xs text-slate-600">
+                  Duration: <span className="font-medium">{formatDuration(run.duration_seconds)}</span>
+                </p>
+              )}
+              {(typeof run.retry_attempt === 'number' || typeof run.retry_limit === 'number') && (
+                <p className="text-xs text-slate-600">
+                  Attempt:{' '}
+                  <span className="font-medium">
+                    {typeof run.retry_attempt === 'number' ? Math.floor(run.retry_attempt) : '–'}
+                    {typeof run.retry_limit === 'number'
+                      ? `/${Math.floor(run.retry_limit)}`
+                      : ''}
+                  </span>
+                </p>
+              )}
+              {run.override_reason && (
+                <p className="text-xs text-amber-600">Override reason: {run.override_reason}</p>
+              )}
               {run.run.failure_reason && <p className="text-xs text-rose-600">Failure: {run.run.failure_reason}</p>}
               {run.run.last_error && <p className="text-xs text-rose-500">Last error: {run.run.last_error}</p>}
               {run.run.approval_required && (
                 <p className="text-xs text-amber-600">
                   Awaiting approval – state: {run.run.approval_state ?? 'pending'}
                 </p>
+              )}
+              {(run.artifacts ?? []).length > 0 && (
+                <div className="space-y-1">
+                  <p className="text-xs font-semibold text-slate-600">Artifacts</p>
+                  <ul className="space-y-1 text-[11px] text-slate-600">
+                    {(run.artifacts ?? []).map((artifact) => (
+                      <li key={`${artifact.manifest_digest}-${artifact.manifest_tag ?? ''}`}>
+                        <span className="font-medium">{artifact.manifest_digest}</span>
+                        <span className="ml-1 text-slate-500">
+                          {renderArtifactDetails(artifact)}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               )}
               {run.run.metadata && (
                 <pre className="mt-2 max-h-48 overflow-auto rounded bg-slate-900/5 p-2 text-[10px] text-slate-700">
@@ -97,6 +131,8 @@ export default function LifecycleRunDrilldownModal({ workspace, run, delta, onCl
                 <ChangeList title="Trust changes" changes={delta.trust_changes} />
                 <ChangeList title="Intelligence changes" changes={delta.intelligence_changes} />
                 <ChangeList title="Marketplace changes" changes={delta.marketplace_changes} />
+                <ChangeList title="Analytics changes" changes={delta.analytics_changes} />
+                <ChangeList title="Artifact changes" changes={delta.artifact_changes} />
               </div>
             )}
           </div>
@@ -125,4 +161,40 @@ export default function LifecycleRunDrilldownModal({ workspace, run, delta, onCl
       </div>
     </div>
   );
+}
+
+function formatDuration(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return 'unknown';
+  }
+  if (seconds < 60) {
+    return `${Math.floor(seconds)}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remSeconds = Math.floor(seconds % 60);
+  if (minutes < 60) {
+    return remSeconds === 0 ? `${minutes}m` : `${minutes}m ${remSeconds}s`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remMinutes = minutes % 60;
+  return remMinutes === 0 ? `${hours}h` : `${hours}h ${remMinutes}m`;
+}
+
+function renderArtifactDetails(
+  artifact: NonNullable<LifecycleRunSnapshot['artifacts']>[number],
+) {
+  const parts: string[] = [];
+  if (artifact.lane) parts.push(`lane=${artifact.lane}`);
+  if (artifact.stage) parts.push(`stage=${artifact.stage}`);
+  if (artifact.track_name) parts.push(`track=${artifact.track_name}`);
+  if (artifact.track_tier) parts.push(`tier=${artifact.track_tier}`);
+  if (artifact.manifest_tag) parts.push(`tag=${artifact.manifest_tag}`);
+  if (artifact.registry_image) parts.push(`image=${artifact.registry_image}`);
+  if (artifact.build_status) parts.push(`build=${artifact.build_status}`);
+  if (typeof artifact.duration_seconds === 'number') {
+    const formatted = formatDuration(artifact.duration_seconds);
+    parts.push(`duration=${formatted}`);
+  }
+  if (artifact.completed_at) parts.push(`completed=${artifact.completed_at}`);
+  return parts.length === 0 ? 'no artifact metadata' : parts.join(', ');
 }

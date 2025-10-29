@@ -74,6 +74,10 @@ const MOCK_PAGE = {
             cancellation_reason: null,
             failure_reason: null,
           },
+          duration_seconds: 58,
+          retry_attempt: 2,
+          retry_limit: 5,
+          override_reason: 'manual override documented',
           trust: {
             runtime_vm_instance_id: 123,
             attestation_status: 'trusted',
@@ -100,7 +104,25 @@ const MOCK_PAGE = {
           marketplace: {
             status: 'eligible',
             last_completed_at: new Date().toISOString(),
+            manifest_digest: 'sha256:fixture',
+            manifest_tag: 'v1.2.3',
+            registry_image: 'registry.local/ops:latest',
+            build_duration_seconds: 120,
           },
+          artifacts: [
+            {
+              manifest_digest: 'sha256:fixture',
+              lane: 'prod',
+              stage: 'production',
+              track_name: 'Lifecycle',
+              track_tier: 'gold',
+              manifest_tag: 'v1.2.3',
+              registry_image: 'registry.local/ops:latest',
+              build_status: 'ready',
+              completed_at: new Date().toISOString(),
+              duration_seconds: 120,
+            },
+          ],
         },
       ],
       promotion_postures: [

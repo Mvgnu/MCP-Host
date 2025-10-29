@@ -22,6 +22,11 @@ export interface LifecycleRunSnapshot {
   trust?: TrustRegistryState;
   intelligence: IntelligenceScoreOverview[];
   marketplace?: MarketplaceReadiness;
+  duration_seconds?: number | null;
+  retry_attempt?: number | null;
+  retry_limit?: number | null;
+  override_reason?: string | null;
+  artifacts?: LifecycleRunArtifact[];
 }
 
 export interface IntelligenceScoreOverview {
@@ -37,6 +42,25 @@ export interface IntelligenceScoreOverview {
 export interface MarketplaceReadiness {
   status: string;
   last_completed_at?: string | null;
+  manifest_digest?: string | null;
+  manifest_tag?: string | null;
+  registry_image?: string | null;
+  build_duration_seconds?: number | null;
+}
+
+export interface LifecycleRunArtifact {
+  manifest_digest: string;
+  lane?: string | null;
+  stage?: string | null;
+  track_name?: string | null;
+  track_tier?: string | null;
+  manifest_tag?: string | null;
+  registry_image?: string | null;
+  source_repo?: string | null;
+  source_revision?: string | null;
+  build_status?: string | null;
+  completed_at?: string | null;
+  duration_seconds?: number | null;
 }
 
 export interface LifecycleConsoleEventEnvelope {
@@ -68,6 +92,8 @@ export interface LifecycleRunDelta {
   trust_changes: LifecycleFieldChange[];
   intelligence_changes: LifecycleFieldChange[];
   marketplace_changes: LifecycleFieldChange[];
+  analytics_changes: LifecycleFieldChange[];
+  artifact_changes: LifecycleFieldChange[];
 }
 
 export interface LifecyclePromotionPosture {

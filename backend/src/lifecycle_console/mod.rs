@@ -9,7 +9,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{to_value, Value};
 use sqlx::{query_as, PgPool, QueryBuilder};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
@@ -130,6 +130,16 @@ pub struct LifecycleRunSnapshot {
     pub intelligence: Vec<IntelligenceScoreOverview>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub marketplace: Option<MarketplaceReadiness>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_attempt: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub override_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<LifecycleRunArtifact>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,6 +196,10 @@ pub struct LifecycleRunDelta {
     pub intelligence_changes: Vec<LifecycleFieldChange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub marketplace_changes: Vec<LifecycleFieldChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub analytics_changes: Vec<LifecycleFieldChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_changes: Vec<LifecycleFieldChange>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -246,6 +260,41 @@ pub struct MarketplaceReadiness {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_completed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_duration_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecycleRunArtifact {
+    pub manifest_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -271,6 +320,10 @@ struct MarketplaceRow {
     pub server_id: i32,
     pub status: String,
     pub completed_at: Option<DateTime<Utc>>,
+    pub manifest_digest: Option<String>,
+    pub manifest_tag: Option<String>,
+    pub registry_image: Option<String>,
+    pub duration_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -587,10 +640,21 @@ pub async fn fetch_page(
                 .get(&instance_id)
                 .and_then(|row| marketplace.get(&row.server_id).cloned());
 
+            let duration_seconds = compute_run_duration(&run);
+            let retry_attempt = compute_run_retry_attempt(&run);
+            let retry_limit = compute_run_retry_limit(&run);
+            let override_reason = compute_run_override_reason(&run);
+            let artifacts = extract_run_artifacts(&run);
+
             run_snapshots.push(LifecycleRunSnapshot {
                 trust,
                 intelligence,
                 marketplace: marketplace_state,
+                duration_seconds,
+                retry_attempt,
+                retry_limit,
+                override_reason,
+                artifacts,
                 run,
             });
         }
@@ -630,6 +694,7 @@ pub async fn fetch_page(
         }
 
         let promotion_map = load_promotion_postures(pool, &manifest_digests).await?;
+        let artifact_map = load_build_artifacts_by_digest(pool, &manifest_digests).await?;
 
         for snapshot in &mut snapshots {
             if let Some(digests) = workspace_manifest_index.get(&snapshot.workspace.id) {
@@ -642,6 +707,10 @@ pub async fn fetch_page(
                 promotions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
                 promotions.dedup_by(|left, right| left.promotion_id == right.promotion_id);
                 snapshot.promotion_postures = promotions;
+            }
+
+            for run in &mut snapshot.recent_runs {
+                enrich_run_artifacts(&mut run.artifacts, &artifact_map);
             }
         }
     }
@@ -928,6 +997,29 @@ struct PromotionVerdictSummary {
     remediation_hooks: Vec<String>,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct BuildArtifactRow {
+    pub manifest_digest: String,
+    pub manifest_tag: Option<String>,
+    pub registry_image: Option<String>,
+    pub source_repo: Option<String>,
+    pub source_revision: Option<String>,
+    pub status: String,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub duration_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct BuildArtifactSummary {
+    manifest_tag: Option<String>,
+    registry_image: Option<String>,
+    source_repo: Option<String>,
+    source_revision: Option<String>,
+    status: String,
+    completed_at: Option<DateTime<Utc>>,
+    duration_seconds: Option<i64>,
+}
+
 fn collect_workspace_manifest_digests(
     workspace: &RuntimeVmRemediationWorkspace,
     revision: Option<&LifecycleWorkspaceRevision>,
@@ -1036,6 +1128,64 @@ async fn load_promotion_postures(
     }
 
     Ok(grouped)
+}
+
+async fn load_build_artifacts_by_digest(
+    pool: &PgPool,
+    manifest_digests: &HashSet<String>,
+) -> Result<HashMap<String, BuildArtifactSummary>, AppError> {
+    if manifest_digests.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows: Vec<BuildArtifactRow> = query_as(
+        r#"
+        SELECT manifest_digest, manifest_tag, registry_image, source_repo, source_revision, status, completed_at, duration_seconds
+        FROM (
+            SELECT
+                manifest_digest,
+                manifest_tag,
+                registry_image,
+                source_repo,
+                source_revision,
+                status,
+                completed_at,
+                CASE
+                    WHEN completed_at IS NOT NULL AND started_at IS NOT NULL THEN
+                        EXTRACT(EPOCH FROM (completed_at - started_at))::BIGINT
+                    ELSE NULL
+                END AS duration_seconds,
+                ROW_NUMBER() OVER (
+                    PARTITION BY manifest_digest
+                    ORDER BY completed_at DESC NULLS LAST, started_at DESC
+                ) AS row_number
+            FROM build_artifact_runs
+            WHERE manifest_digest = ANY($1)
+        ) ranked
+        WHERE ranked.row_number = 1
+        "#,
+    )
+    .bind(manifest_digests.iter().cloned().collect::<Vec<_>>())
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.manifest_digest.clone(),
+                BuildArtifactSummary {
+                    manifest_tag: row.manifest_tag,
+                    registry_image: row.registry_image,
+                    source_repo: row.source_repo,
+                    source_revision: row.source_revision,
+                    status: row.status,
+                    completed_at: row.completed_at,
+                    duration_seconds: row.duration_seconds,
+                },
+            )
+        })
+        .collect())
 }
 
 fn summarize_promotion_verdict(value: Option<&Value>) -> PromotionVerdictSummary {
@@ -1276,12 +1426,16 @@ fn diff_runs(
             previous_snapshot.and_then(|s| s.marketplace.as_ref()),
             run.marketplace.as_ref(),
         );
+        let analytics_changes = diff_run_analytics(previous_snapshot, run);
+        let artifact_changes = diff_run_artifacts(previous_snapshot, run);
         let previous_status = previous_snapshot.map(|s| s.run.status.clone());
         let has_changes = previous_snapshot.is_none()
             || previous_status.as_ref() != Some(&status)
             || !trust_changes.is_empty()
             || !intelligence_changes.is_empty()
-            || !marketplace_changes.is_empty();
+            || !marketplace_changes.is_empty()
+            || !analytics_changes.is_empty()
+            || !artifact_changes.is_empty();
 
         if has_changes {
             deltas.push(LifecycleRunDelta {
@@ -1290,6 +1444,8 @@ fn diff_runs(
                 trust_changes,
                 intelligence_changes,
                 marketplace_changes,
+                analytics_changes,
+                artifact_changes,
             });
         }
     }
@@ -1698,6 +1854,30 @@ fn diff_marketplace(
                 None,
                 curr.last_completed_at.map(|dt| dt.to_rfc3339()),
             );
+            push_change(
+                &mut changes,
+                "marketplace.manifest_digest",
+                None,
+                curr.manifest_digest.clone(),
+            );
+            push_change(
+                &mut changes,
+                "marketplace.manifest_tag",
+                None,
+                curr.manifest_tag.clone(),
+            );
+            push_change(
+                &mut changes,
+                "marketplace.registry_image",
+                None,
+                curr.registry_image.clone(),
+            );
+            push_change(
+                &mut changes,
+                "marketplace.build_duration_seconds",
+                None,
+                curr.build_duration_seconds.map(|value| value.to_string()),
+            );
         }
         (Some(prev), Some(curr)) => {
             push_change(
@@ -1711,6 +1891,30 @@ fn diff_marketplace(
                 "marketplace.last_completed_at",
                 prev.last_completed_at.map(|dt| dt.to_rfc3339()),
                 curr.last_completed_at.map(|dt| dt.to_rfc3339()),
+            );
+            push_change(
+                &mut changes,
+                "marketplace.manifest_digest",
+                prev.manifest_digest.clone(),
+                curr.manifest_digest.clone(),
+            );
+            push_change(
+                &mut changes,
+                "marketplace.manifest_tag",
+                prev.manifest_tag.clone(),
+                curr.manifest_tag.clone(),
+            );
+            push_change(
+                &mut changes,
+                "marketplace.registry_image",
+                prev.registry_image.clone(),
+                curr.registry_image.clone(),
+            );
+            push_change(
+                &mut changes,
+                "marketplace.build_duration_seconds",
+                prev.build_duration_seconds.map(|value| value.to_string()),
+                curr.build_duration_seconds.map(|value| value.to_string()),
             );
         }
         (Some(prev), None) => {
@@ -1726,8 +1930,105 @@ fn diff_marketplace(
                 prev.last_completed_at.map(|dt| dt.to_rfc3339()),
                 None,
             );
+            push_change(
+                &mut changes,
+                "marketplace.manifest_digest",
+                prev.manifest_digest.clone(),
+                None,
+            );
+            push_change(
+                &mut changes,
+                "marketplace.manifest_tag",
+                prev.manifest_tag.clone(),
+                None,
+            );
+            push_change(
+                &mut changes,
+                "marketplace.registry_image",
+                prev.registry_image.clone(),
+                None,
+            );
+            push_change(
+                &mut changes,
+                "marketplace.build_duration_seconds",
+                prev.build_duration_seconds.map(|value| value.to_string()),
+                None,
+            );
         }
     }
+    changes
+}
+
+fn diff_run_analytics(
+    previous: Option<&LifecycleRunSnapshot>,
+    current: &LifecycleRunSnapshot,
+) -> Vec<LifecycleFieldChange> {
+    let mut changes = Vec::new();
+    let previous_duration = previous.and_then(|snap| snap.duration_seconds);
+    let current_duration = current.duration_seconds;
+    push_change(
+        &mut changes,
+        "run.duration_seconds",
+        previous_duration.map(|value| value.to_string()),
+        current_duration.map(|value| value.to_string()),
+    );
+
+    let previous_attempt = previous.and_then(|snap| snap.retry_attempt);
+    let current_attempt = current.retry_attempt;
+    push_change(
+        &mut changes,
+        "run.retry_attempt",
+        previous_attempt.map(|value| value.to_string()),
+        current_attempt.map(|value| value.to_string()),
+    );
+
+    let previous_limit = previous.and_then(|snap| snap.retry_limit);
+    let current_limit = current.retry_limit;
+    push_change(
+        &mut changes,
+        "run.retry_limit",
+        previous_limit.map(|value| value.to_string()),
+        current_limit.map(|value| value.to_string()),
+    );
+
+    let previous_override = previous.and_then(|snap| snap.override_reason.clone());
+    let current_override = current.override_reason.clone();
+    push_change(
+        &mut changes,
+        "run.override_reason",
+        previous_override,
+        current_override,
+    );
+
+    changes
+}
+
+fn diff_run_artifacts(
+    previous: Option<&LifecycleRunSnapshot>,
+    current: &LifecycleRunSnapshot,
+) -> Vec<LifecycleFieldChange> {
+    let mut changes = Vec::new();
+    let previous_value = previous
+        .and_then(|snapshot| {
+            if snapshot.artifacts.is_empty() {
+                None
+            } else {
+                to_value(&snapshot.artifacts).ok()
+            }
+        });
+    let current_value = if current.artifacts.is_empty() {
+        None
+    } else {
+        to_value(&current.artifacts).ok()
+    };
+
+    push_json_change(
+        &mut changes,
+        "run.artifacts",
+        previous_value.as_ref(),
+        current_value.as_ref(),
+    );
+
     changes
 }
 
@@ -1759,6 +2060,407 @@ fn push_json_change(
 
 fn format_float(value: f32) -> String {
     format!("{value:.4}")
+}
+
+fn compute_run_duration(run: &RuntimeVmRemediationRun) -> Option<i64> {
+    let end_time = run
+        .completed_at
+        .or(run.cancelled_at)
+        .or_else(|| {
+            if run.status == "running" || run.status == "pending" {
+                Some(Utc::now())
+            } else {
+                None
+            }
+        });
+
+    end_time.map(|end| {
+        let duration = end.signed_duration_since(run.started_at);
+        duration.num_seconds().max(0)
+    })
+}
+
+fn compute_run_retry_attempt(run: &RuntimeVmRemediationRun) -> Option<i64> {
+    if let Some(value) = run
+        .automation_payload
+        .as_ref()
+        .and_then(|payload| search_for_integer(payload, "attempt"))
+    {
+        return Some(value);
+    }
+    search_for_integer(&run.metadata, "attempt")
+}
+
+fn compute_run_retry_limit(run: &RuntimeVmRemediationRun) -> Option<i64> {
+    if let Some(value) = run
+        .automation_payload
+        .as_ref()
+        .and_then(|payload| search_for_integer(payload, "retry_limit"))
+    {
+        return Some(value);
+    }
+    search_for_integer(&run.metadata, "retry_limit")
+}
+
+fn compute_run_override_reason(run: &RuntimeVmRemediationRun) -> Option<String> {
+    if let Some(notes) = run.approval_notes.clone() {
+        if !notes.is_empty() {
+            return Some(notes);
+        }
+    }
+    for key in ["override_reason", "manual_override", "override"] {
+        if let Some(value) = search_for_string(&run.metadata, key) {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    search_for_string(&run.promotion_gate_context, "override_reason")
+}
+
+fn extract_run_artifacts(run: &RuntimeVmRemediationRun) -> Vec<LifecycleRunArtifact> {
+    let promotion = run.metadata.get("promotion");
+    let promotion_track = promotion.and_then(|value| value.get("track"));
+    let promotion_stage = promotion
+        .and_then(|value| value.get("stage"))
+        .and_then(Value::as_str)
+        .map(|value| value.to_string());
+    let promotion_lane = promotion
+        .and_then(|value| value.get("lane"))
+        .and_then(Value::as_str)
+        .map(|value| value.to_string());
+    let promotion_source_repo = promotion
+        .and_then(|value| value.get("source_repo"))
+        .and_then(Value::as_str)
+        .map(|value| value.to_string());
+    let promotion_source_revision = promotion
+        .and_then(|value| value.get("source_revision"))
+        .and_then(Value::as_str)
+        .map(|value| value.to_string());
+    let track_name = promotion_track
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .map(|value| value.to_string());
+    let track_tier = promotion_track
+        .and_then(|value| value.get("tier"))
+        .and_then(Value::as_str)
+        .map(|value| value.to_string());
+
+    let gate_lane = run
+        .promotion_gate_context
+        .get("lane")
+        .and_then(Value::as_str)
+        .map(|value| value.to_string());
+    let gate_stage = run
+        .promotion_gate_context
+        .get("stage")
+        .and_then(Value::as_str)
+        .map(|value| value.to_string());
+
+    let mut artifacts = Vec::new();
+    let mut push_from_target = |target: &serde_json::Map<String, Value>| {
+        if let Some(digest) = target.get("manifest_digest").and_then(Value::as_str) {
+            if digest.is_empty() {
+                return;
+            }
+            let lane = target
+                .get("lane")
+                .and_then(Value::as_str)
+                .map(|value| value.to_string())
+                .or_else(|| promotion_lane.clone())
+                .or_else(|| gate_lane.clone());
+            let stage = target
+                .get("stage")
+                .and_then(Value::as_str)
+                .map(|value| value.to_string())
+                .or_else(|| promotion_stage.clone())
+                .or_else(|| gate_stage.clone());
+            artifacts.push(LifecycleRunArtifact {
+                manifest_digest: digest.to_string(),
+                lane,
+                stage,
+                track_name: track_name.clone(),
+                track_tier: track_tier.clone(),
+                manifest_tag: None,
+                registry_image: None,
+                source_repo: promotion_source_repo.clone(),
+                source_revision: promotion_source_revision.clone(),
+                build_status: None,
+                completed_at: None,
+                duration_seconds: None,
+            });
+        }
+    };
+
+    if let Some(target) = run.metadata.get("target").and_then(Value::as_object) {
+        push_from_target(target);
+    }
+    if let Some(targets) = run.metadata.get("targets").and_then(Value::as_array) {
+        for entry in targets {
+            if let Some(target) = entry.as_object() {
+                push_from_target(target);
+            }
+        }
+    }
+
+    if artifacts.is_empty() {
+        let mut digests = HashSet::new();
+        collect_manifest_digests_from_value(&run.metadata, &mut digests);
+        collect_manifest_digests_from_value(&run.promotion_gate_context, &mut digests);
+        for digest in digests {
+            artifacts.push(LifecycleRunArtifact {
+                manifest_digest: digest,
+                lane: promotion_lane.clone().or_else(|| gate_lane.clone()),
+                stage: promotion_stage.clone().or_else(|| gate_stage.clone()),
+                track_name: track_name.clone(),
+                track_tier: track_tier.clone(),
+                manifest_tag: None,
+                registry_image: None,
+                source_repo: promotion_source_repo.clone(),
+                source_revision: promotion_source_revision.clone(),
+                build_status: None,
+                completed_at: None,
+                duration_seconds: None,
+            });
+        }
+    }
+
+    artifacts
+}
+
+fn enrich_run_artifacts(
+    artifacts: &mut Vec<LifecycleRunArtifact>,
+    artifact_map: &HashMap<String, BuildArtifactSummary>,
+) {
+    for artifact in artifacts {
+        if let Some(summary) = artifact_map.get(&artifact.manifest_digest) {
+            if artifact.manifest_tag.is_none() {
+                artifact.manifest_tag = summary.manifest_tag.clone();
+            }
+            if artifact.registry_image.is_none() {
+                artifact.registry_image = summary.registry_image.clone();
+            }
+            if artifact.source_repo.is_none() {
+                artifact.source_repo = summary.source_repo.clone();
+            }
+            if artifact.source_revision.is_none() {
+                artifact.source_revision = summary.source_revision.clone();
+            }
+            artifact.build_status = Some(summary.status.clone());
+            artifact.completed_at = summary.completed_at;
+            artifact.duration_seconds = summary.duration_seconds;
+        }
+    }
+}
+
+fn search_for_integer(value: &Value, key: &str) -> Option<i64> {
+    match value {
+        Value::Object(map) => {
+            if let Some(entry) = map.get(key) {
+                if let Some(num) = entry.as_i64() {
+                    return Some(num);
+                }
+            }
+            for entry in map.values() {
+                if let Some(num) = search_for_integer(entry, key) {
+                    return Some(num);
+                }
+            }
+            None
+        }
+        Value::Array(items) => {
+            for entry in items {
+                if let Some(num) = search_for_integer(entry, key) {
+                    return Some(num);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use chrono::{TimeZone, Utc};
+    use serde_json::json;
+
+    fn base_run() -> RuntimeVmRemediationRun {
+        let now = Utc::now();
+        RuntimeVmRemediationRun {
+            id: 1,
+            runtime_vm_instance_id: 99,
+            playbook: "lifecycle".to_string(),
+            playbook_id: None,
+            status: "succeeded".to_string(),
+            automation_payload: None,
+            approval_required: false,
+            started_at: now,
+            completed_at: Some(now),
+            last_error: None,
+            assigned_owner_id: None,
+            sla_deadline: None,
+            approval_state: "auto-approved".to_string(),
+            approval_decided_at: Some(now),
+            approval_notes: None,
+            metadata: json!({}),
+            workspace_id: Some(7),
+            workspace_revision_id: None,
+            promotion_gate_context: json!({}),
+            version: 1,
+            updated_at: now,
+            cancelled_at: None,
+            cancellation_reason: None,
+            failure_reason: None,
+        }
+    }
+
+    #[test]
+    fn extract_run_artifacts_prefers_target_metadata() {
+        let mut run = base_run();
+        run.metadata = json!({
+            "promotion": {
+                "stage": "staging",
+                "lane": "blue",
+                "track": {
+                    "name": "release-alpha",
+                    "tier": "pilot"
+                },
+                "source_repo": "git@example.com/demo.git",
+                "source_revision": "abcdef"
+            },
+            "targets": [
+                {
+                    "manifest_digest": "sha256:target",
+                    "lane": "green",
+                    "stage": "production",
+                    "manifest_tag": "v1"
+                }
+            ]
+        });
+        run.promotion_gate_context = json!({
+            "lane": "fallback-lane",
+            "stage": "fallback-stage"
+        });
+
+        let artifacts = extract_run_artifacts(&run);
+        assert_eq!(artifacts.len(), 1);
+        let artifact = &artifacts[0];
+        assert_eq!(artifact.manifest_digest, "sha256:target");
+        assert_eq!(artifact.lane.as_deref(), Some("green"));
+        assert_eq!(artifact.stage.as_deref(), Some("production"));
+        assert_eq!(artifact.track_name.as_deref(), Some("release-alpha"));
+        assert_eq!(artifact.track_tier.as_deref(), Some("pilot"));
+        assert_eq!(artifact.source_repo.as_deref(), Some("git@example.com/demo.git"));
+        assert_eq!(artifact.source_revision.as_deref(), Some("abcdef"));
+    }
+
+    #[test]
+    fn extract_run_artifacts_falls_back_to_gate_context() {
+        let mut run = base_run();
+        run.metadata = json!({
+            "promotion": {
+                "track": {
+                    "name": "release-beta"
+                },
+                "source_repo": "git@example.com/demo.git"
+            },
+            "automation": {
+                "result": {
+                    "image": {
+                        "manifest_digest": "sha256:fallback"
+                    }
+                }
+            }
+        });
+        run.promotion_gate_context = json!({
+            "lane": "gate-lane",
+            "stage": "gate-stage"
+        });
+
+        let artifacts = extract_run_artifacts(&run);
+        assert_eq!(artifacts.len(), 1);
+        let artifact = &artifacts[0];
+        assert_eq!(artifact.manifest_digest, "sha256:fallback");
+        assert_eq!(artifact.lane.as_deref(), Some("gate-lane"));
+        assert_eq!(artifact.stage.as_deref(), Some("gate-stage"));
+        assert_eq!(artifact.track_name.as_deref(), Some("release-beta"));
+        assert_eq!(artifact.source_repo.as_deref(), Some("git@example.com/demo.git"));
+    }
+
+    #[test]
+    fn enrich_run_artifacts_merges_summary_details() {
+        let timestamp = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let mut artifacts = vec![LifecycleRunArtifact {
+            manifest_digest: "sha256:artifact".to_string(),
+            lane: None,
+            stage: None,
+            track_name: None,
+            track_tier: None,
+            manifest_tag: None,
+            registry_image: None,
+            source_repo: None,
+            source_revision: None,
+            build_status: None,
+            completed_at: None,
+            duration_seconds: None,
+        }];
+        let mut artifact_map = HashMap::new();
+        artifact_map.insert(
+            "sha256:artifact".to_string(),
+            BuildArtifactSummary {
+                manifest_tag: Some("v2".to_string()),
+                registry_image: Some("registry/app:v2".to_string()),
+                source_repo: Some("git@example.com/demo.git".to_string()),
+                source_revision: Some("1234567".to_string()),
+                status: "succeeded".to_string(),
+                completed_at: Some(timestamp),
+                duration_seconds: Some(95),
+            },
+        );
+
+        enrich_run_artifacts(&mut artifacts, &artifact_map);
+
+        let artifact = &artifacts[0];
+        assert_eq!(artifact.manifest_tag.as_deref(), Some("v2"));
+        assert_eq!(artifact.registry_image.as_deref(), Some("registry/app:v2"));
+        assert_eq!(artifact.source_repo.as_deref(), Some("git@example.com/demo.git"));
+        assert_eq!(artifact.source_revision.as_deref(), Some("1234567"));
+        assert_eq!(artifact.build_status.as_deref(), Some("succeeded"));
+        assert_eq!(artifact.completed_at, Some(timestamp));
+        assert_eq!(artifact.duration_seconds, Some(95));
+    }
+}
+
+fn search_for_string(value: &Value, key: &str) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            if let Some(entry) = map.get(key) {
+                if let Some(text) = entry.as_str() {
+                    if !text.is_empty() {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+            for entry in map.values() {
+                if let Some(text) = search_for_string(entry, key) {
+                    return Some(text);
+                }
+            }
+            None
+        }
+        Value::Array(items) => {
+            for entry in items {
+                if let Some(text) = search_for_string(entry, key) {
+                    return Some(text);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 async fn load_intelligence_scores(
@@ -1811,12 +2513,20 @@ async fn load_marketplace(
 
     let rows: Vec<MarketplaceRow> = query_as(
         r#"
-        SELECT server_id, status, completed_at
+        SELECT server_id, status, completed_at, manifest_digest, manifest_tag, registry_image, duration_seconds
         FROM (
             SELECT
                 server_id,
                 status,
                 completed_at,
+                manifest_digest,
+                manifest_tag,
+                registry_image,
+                CASE
+                    WHEN completed_at IS NOT NULL AND started_at IS NOT NULL THEN
+                        EXTRACT(EPOCH FROM (completed_at - started_at))::BIGINT
+                    ELSE NULL
+                END AS duration_seconds,
                 ROW_NUMBER() OVER (PARTITION BY server_id ORDER BY completed_at DESC NULLS LAST) AS row_number
             FROM build_artifact_runs
             WHERE server_id = ANY($1)
@@ -1836,6 +2546,10 @@ async fn load_marketplace(
                 MarketplaceReadiness {
                     status: row.status,
                     last_completed_at: row.completed_at,
+                    manifest_digest: row.manifest_digest,
+                    manifest_tag: row.manifest_tag,
+                    registry_image: row.registry_image,
+                    build_duration_seconds: row.duration_seconds,
                 },
             )
         })
