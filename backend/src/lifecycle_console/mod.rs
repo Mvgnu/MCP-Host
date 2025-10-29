@@ -108,6 +108,8 @@ pub struct LifecycleWorkspaceSnapshot {
     pub active_revision: Option<LifecycleWorkspaceRevision>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_runs: Vec<LifecycleRunSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub promotion_runs: Vec<RuntimeVmRemediationRun>,
     #[serde(default)]
     pub promotion_postures: Vec<LifecyclePromotionPosture>,
 }
@@ -164,6 +166,10 @@ pub struct LifecycleWorkspaceDelta {
     pub run_deltas: Vec<LifecycleRunDelta>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_run_ids: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub promotion_run_deltas: Vec<LifecyclePromotionRunDelta>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_promotion_run_ids: Vec<i64>,
     #[serde(default)]
     pub promotion_posture_deltas: Vec<LifecyclePromotionPostureDelta>,
     #[serde(default)]
@@ -201,6 +207,18 @@ pub struct LifecyclePromotionPostureDelta {
     pub remediation_hooks: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signals: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecyclePromotionRunDelta {
+    pub run_id: i64,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub automation_payload_changes: Vec<LifecycleFieldChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gate_context_changes: Vec<LifecycleFieldChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_changes: Vec<LifecycleFieldChange>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -516,6 +534,7 @@ pub async fn fetch_page(
     let revisions = load_revisions(pool, &revision_ids).await?;
     let gate_snapshots = load_gate_snapshots(pool, &revision_ids).await?;
     let runs = load_runs(pool, &workspace_ids, run_limit).await?;
+    let promotion_runs = load_promotion_runs(pool, &workspace_ids, run_limit).await?;
 
     let mut instance_ids = HashSet::new();
     for run_list in runs.values() {
@@ -576,16 +595,28 @@ pub async fn fetch_page(
             });
         }
 
-        let manifest_digests =
-            collect_workspace_manifest_digests(&workspace, revision.as_ref(), &run_snapshots);
+        let manifest_digests = collect_workspace_manifest_digests(
+            &workspace,
+            revision.as_ref(),
+            &run_snapshots,
+            &workspace_promotion_runs,
+        );
         if !manifest_digests.is_empty() {
             workspace_manifest_index.insert(workspace.id, manifest_digests);
         }
+
+        let mut workspace_promotion_runs = promotion_runs
+            .get(&workspace.id)
+            .cloned()
+            .unwrap_or_default();
+        workspace_promotion_runs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        workspace_promotion_runs.truncate(run_limit);
 
         snapshots.push(LifecycleWorkspaceSnapshot {
             workspace,
             active_revision: revision,
             recent_runs: run_snapshots,
+            promotion_runs: workspace_promotion_runs,
             promotion_postures: Vec::new(),
         });
     }
@@ -739,6 +770,69 @@ async fn load_runs(
     Ok(grouped)
 }
 
+async fn load_promotion_runs(
+    pool: &PgPool,
+    workspace_ids: &[i64],
+    limit: usize,
+) -> Result<HashMap<i64, Vec<RuntimeVmRemediationRun>>, AppError> {
+    if workspace_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows: Vec<RuntimeVmRemediationRun> = query_as(
+        r#"
+        SELECT
+            id,
+            runtime_vm_instance_id,
+            playbook,
+            playbook_id,
+            status,
+            automation_payload,
+            approval_required,
+            started_at,
+            completed_at,
+            last_error,
+            assigned_owner_id,
+            sla_deadline,
+            approval_state,
+            approval_decided_at,
+            approval_notes,
+            metadata,
+            workspace_id,
+            workspace_revision_id,
+            promotion_gate_context,
+            version,
+            updated_at,
+            cancelled_at,
+            cancellation_reason,
+            failure_reason
+        FROM (
+            SELECT
+                runs.*,
+                ROW_NUMBER() OVER (PARTITION BY workspace_id ORDER BY updated_at DESC) AS row_number
+            FROM runtime_vm_remediation_runs runs
+            WHERE workspace_id = ANY($1)
+              AND metadata ? 'promotion'
+        ) ranked
+        WHERE ranked.row_number <= $2
+        ORDER BY workspace_id, updated_at DESC
+        "#,
+    )
+    .bind(workspace_ids)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await?;
+
+    let mut grouped: HashMap<i64, Vec<RuntimeVmRemediationRun>> = HashMap::new();
+    for row in rows {
+        if let Some(workspace_id) = row.workspace_id {
+            grouped.entry(workspace_id).or_default().push(row);
+        }
+    }
+
+    Ok(grouped)
+}
+
 async fn load_runtime_instances(
     pool: &PgPool,
     instance_ids: &HashSet<i64>,
@@ -838,6 +932,7 @@ fn collect_workspace_manifest_digests(
     workspace: &RuntimeVmRemediationWorkspace,
     revision: Option<&LifecycleWorkspaceRevision>,
     runs: &[LifecycleRunSnapshot],
+    promotion_runs: &[RuntimeVmRemediationRun],
 ) -> HashSet<String> {
     let mut digests = HashSet::new();
     collect_manifest_digests_from_value(&workspace.metadata, &mut digests);
@@ -851,6 +946,13 @@ fn collect_workspace_manifest_digests(
             collect_manifest_digests_from_value(payload, &mut digests);
         }
         collect_manifest_digests_from_value(&run.run.promotion_gate_context, &mut digests);
+    }
+    for run in promotion_runs {
+        collect_manifest_digests_from_value(&run.metadata, &mut digests);
+        if let Some(payload) = run.automation_payload.as_ref() {
+            collect_manifest_digests_from_value(payload, &mut digests);
+        }
+        collect_manifest_digests_from_value(&run.promotion_gate_context, &mut digests);
     }
     digests
 }
@@ -1033,6 +1135,12 @@ fn compute_delta(
             .unwrap_or(&[]);
         let (run_deltas, removed_run_ids) = diff_runs(previous_runs, &snapshot.recent_runs);
 
+        let previous_promotion_runs = previous_snapshot
+            .map(|s| s.promotion_runs.as_slice())
+            .unwrap_or(&[]);
+        let (promotion_run_deltas, removed_promotion_run_ids) =
+            diff_promotion_runs(previous_promotion_runs, &snapshot.promotion_runs);
+
         let previous_promotions = previous_snapshot
             .map(|s| s.promotion_postures.as_slice())
             .unwrap_or(&[]);
@@ -1041,6 +1149,8 @@ fn compute_delta(
 
         if !run_deltas.is_empty()
             || !removed_run_ids.is_empty()
+            || !promotion_run_deltas.is_empty()
+            || !removed_promotion_run_ids.is_empty()
             || !promotion_posture_deltas.is_empty()
             || !removed_promotion_ids.is_empty()
             || previous_snapshot.is_none()
@@ -1049,6 +1159,8 @@ fn compute_delta(
                 workspace_id,
                 run_deltas,
                 removed_run_ids,
+                promotion_run_deltas,
+                removed_promotion_run_ids,
                 promotion_posture_deltas,
                 removed_promotion_ids,
             });
@@ -1062,6 +1174,11 @@ fn compute_delta(
                 .iter()
                 .map(|run| run.run.id)
                 .collect::<Vec<_>>();
+            let removed_promotion_run_ids = prev_snapshot
+                .promotion_runs
+                .iter()
+                .map(|run| run.id)
+                .collect::<Vec<_>>();
             let removed_promotion_ids = prev_snapshot
                 .promotion_postures
                 .iter()
@@ -1071,6 +1188,8 @@ fn compute_delta(
                 workspace_id: *workspace_id,
                 run_deltas: Vec::new(),
                 removed_run_ids,
+                promotion_run_deltas: Vec::new(),
+                removed_promotion_run_ids,
                 promotion_posture_deltas: Vec::new(),
                 removed_promotion_ids,
             });
@@ -1177,6 +1296,70 @@ fn diff_runs(
 
     let removed_run_ids = previous_map.into_keys().collect::<Vec<_>>();
     (deltas, removed_run_ids)
+}
+
+fn diff_promotion_runs(
+    previous: &[RuntimeVmRemediationRun],
+    current: &[RuntimeVmRemediationRun],
+) -> (Vec<LifecyclePromotionRunDelta>, Vec<i64>) {
+    let mut previous_map: HashMap<i64, &RuntimeVmRemediationRun> = HashMap::new();
+    for run in previous {
+        previous_map.insert(run.id, run);
+    }
+
+    let mut deltas = Vec::new();
+    for run in current {
+        let run_id = run.id;
+        let previous_run = previous_map.remove(&run_id);
+        let status = run.status.clone();
+
+        let mut automation_payload_changes = Vec::new();
+        let mut gate_context_changes = Vec::new();
+        let mut metadata_changes = Vec::new();
+
+        push_json_change(
+            &mut automation_payload_changes,
+            "promotion_run.automation_payload",
+            previous_run
+                .as_ref()
+                .and_then(|prev| prev.automation_payload.as_ref()),
+            run.automation_payload.as_ref(),
+        );
+        push_json_change(
+            &mut gate_context_changes,
+            "promotion_run.promotion_gate_context",
+            previous_run
+                .as_ref()
+                .map(|prev| &prev.promotion_gate_context),
+            Some(&run.promotion_gate_context),
+        );
+        push_json_change(
+            &mut metadata_changes,
+            "promotion_run.metadata",
+            previous_run.as_ref().map(|prev| &prev.metadata),
+            Some(&run.metadata),
+        );
+
+        let previous_status = previous_run.as_ref().map(|prev| prev.status.as_str());
+        let has_changes = previous_run.is_none()
+            || previous_status != Some(run.status.as_str())
+            || !automation_payload_changes.is_empty()
+            || !gate_context_changes.is_empty()
+            || !metadata_changes.is_empty();
+
+        if has_changes {
+            deltas.push(LifecyclePromotionRunDelta {
+                run_id,
+                status,
+                automation_payload_changes,
+                gate_context_changes,
+                metadata_changes,
+            });
+        }
+    }
+
+    let removed = previous_map.into_keys().collect::<Vec<_>>();
+    (deltas, removed)
 }
 
 fn diff_trust(
@@ -1561,6 +1744,17 @@ fn push_change(
             current,
         });
     }
+}
+
+fn push_json_change(
+    changes: &mut Vec<LifecycleFieldChange>,
+    field: &str,
+    previous: Option<&Value>,
+    current: Option<&Value>,
+) {
+    let previous_text = previous.map(|value| value.to_string());
+    let current_text = current.map(|value| value.to_string());
+    push_change(changes, field, previous_text, current_text);
 }
 
 fn format_float(value: f32) -> String {

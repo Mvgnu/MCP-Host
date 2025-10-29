@@ -341,3 +341,10 @@
   Log:
     - 2025-12-09 17:45:00 UTC: Kicked off posture propagation by auditing lifecycle console aggregation, SSE delta computation, and frontend timeline storage to scope manifest→promotion linkage requirements.
     - 2025-12-09 23:05:00 UTC: Hydrated lifecycle snapshots with promotion verdict slices, broadcast SSE deltas, rendered the PromotionVerdictTimeline, and updated docs/tests so promotion posture narratives replay across REST, SSE, and the console UI.
+- ID: BE-LIFE-PROMO-AUTO-LINK
+  Status: IN_PROGRESS
+  Task: Unify lifecycle promotion automation feedback.
+  Hypothesis: Surfacing promotion_runs alongside promotion postures in lifecycle REST/SSE payloads and console views will close the operator feedback gap introduced after promotion-triggered remediation orchestration landed.
+  Log:
+    - 2025-10-29 08:01:26 UTC: Hydrated lifecycle snapshots with promotion_runs, diff-aware SSE envelopes, console automation tables, and README updates; CLI surfacing remains pending.
+    - 2025-10-29 07:53:05 UTC: Initiated lifecycle promotion automation linkage iteration; auditing backend snapshot/delta hydration, SSE diffing, frontend data accessors, and CLI surfaces for promotion_runs coverage gaps.
