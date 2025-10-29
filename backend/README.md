@@ -172,6 +172,13 @@ module testable and ready for SSE streaming expansion. See
 `backend/tests/lifecycle_console.rs` for an integration scenario that seeds a workspace, trust state,
 intelligence score, and marketplace artifact before exercising the new endpoint.
 
+Promotion verdict propagation is now part of the lifecycle surface: both REST snapshots and SSE
+deltas include a `promotion_postures` array for each workspace alongside run metadata. Each slice
+carries the persisted `posture_verdict` JSON (allowed flag, veto reasons, blended signal metadata,
+and remediation hooks) plus track/stage identifiers. Streaming updates emit
+`promotion_posture_deltas`/`removed_promotion_ids` so clients can replay posture narrative changes
+without rehydrating from the CLI transcripts.
+
 ### Backend crate structure
 
 To avoid the duplicate-type compilation failures that occurred when both the library and binary

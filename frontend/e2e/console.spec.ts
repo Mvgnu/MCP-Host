@@ -103,6 +103,23 @@ const MOCK_PAGE = {
           },
         },
       ],
+      promotion_postures: [
+        {
+          promotion_id: 701,
+          manifest_digest: 'sha256:fixture',
+          stage: 'production',
+          status: 'scheduled',
+          track_id: 51,
+          track_name: 'Lifecycle',
+          track_tier: 'gold',
+          allowed: false,
+          veto_reasons: ['trust.lifecycle_state=quarantined'],
+          notes: ['posture:trust.lifecycle_state:quarantined'],
+          updated_at: new Date().toISOString(),
+          remediation_hooks: ['hook:remediation.refresh'],
+          signals: { trust: { lifecycle_state: 'quarantined' } },
+        },
+      ],
     },
   ],
   next_cursor: null,
@@ -140,6 +157,24 @@ const MOCK_DELTA = {
         },
       ],
       removed_run_ids: [],
+      promotion_posture_deltas: [
+        {
+          promotion_id: 701,
+          manifest_digest: 'sha256:fixture',
+          stage: 'production',
+          status: 'scheduled',
+          track_id: 51,
+          track_name: 'Lifecycle',
+          track_tier: 'gold',
+          allowed: true,
+          veto_reasons: [],
+          notes: ['posture:trust.lifecycle_state:restored'],
+          updated_at: new Date().toISOString(),
+          remediation_hooks: [],
+          signals: null,
+        },
+      ],
+      removed_promotion_ids: [],
     },
   ],
 };
@@ -203,6 +238,8 @@ test.describe('Lifecycle console', () => {
     await expect(page.getByLabel('Workspace search')).toBeVisible();
     await expect(page.getByRole('heading', { name: 'Ops Production' })).toBeVisible();
     await expect(page.getByText('Run #9001')).toBeVisible();
+    await expect(page.getByText('Promotion posture')).toBeVisible();
+    await expect(page.getByText('Lifecycle · production')).toBeVisible();
   });
 
   test('applies filters and persists them across reloads', async ({ page }) => {
@@ -238,6 +275,7 @@ test.describe('Lifecycle console', () => {
       });
     }, MOCK_DELTA);
     await expect(page.getByText('marketplace.status: eligible → approved')).toBeVisible();
+    await expect(page.getByText('Updated')).toBeVisible();
   });
 
   test('offline mode preserves cached workspaces', async ({ page }) => {

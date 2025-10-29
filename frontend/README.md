@@ -22,6 +22,9 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to see the
   stream exposed at `/api/console/lifecycle/stream`, reconnecting automatically with cursor resumption metadata.
 - Snapshot events drive workspace cards that surface promotion gate verdicts, recent remediation runs, trust registry states,
   capability intelligence scores, and marketplace readiness in a single view.
+- Promotion verdict metadata now renders through the `PromotionVerdictTimeline` component, highlighting the latest
+  `promotion_postures` array (track, stage, allowed flag, veto reasons, remediation hooks, and signal JSON) with delta badges
+  whenever SSE events update the posture.
 - Filter controls (workspace search, promotion lane, severity) feed the backend query parameters and persist to local storage,
   enabling scoped investigations and shared context between browser sessions.
 - Snapshot envelopes include delta metadata. The UI renders recent trust/intelligence/marketplace changes on each run and opens a
