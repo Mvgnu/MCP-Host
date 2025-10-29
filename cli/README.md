@@ -41,7 +41,7 @@ Lists marketplace artifacts and their active status. Pass `--json` to receive ra
 ### Lifecycle console
 
 * `mcpctl lifecycle list [--lifecycle-state STATE] [--owner-id USER] [--promotion-lane LANE]` – fetch lifecycle console snapshots with promotion automation context, posture verdicts, and recent remediation runs.
-* `mcpctl lifecycle watch [filters]` – subscribe to the lifecycle SSE feed and stream promotion automation deltas, gate verdicts, and heartbeat metadata in real time.
+* `mcpctl lifecycle watch [filters]` – subscribe to the lifecycle SSE feed and stream promotion automation deltas, gate verdicts, retry/duration analytics, artifact provenance updates, and heartbeat metadata in real time.
 
 ### Policy insights
 

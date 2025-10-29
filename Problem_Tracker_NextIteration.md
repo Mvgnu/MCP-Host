@@ -364,3 +364,4 @@
     - 2025-10-29 10:09:45 UTC: Enriched lifecycle run snapshots with duration/retry/override fields, hydrated artifact metadata from build runs, updated SSE deltas, UI components, CLI summaries, docs, and added supporting migrations/tests.
     - 2025-10-29 09:58:05 UTC: Initiated parity iteration; auditing lifecycle console modules, SSE builders, frontend hooks, and CLI transcripts to scope metadata gaps.
     - 2025-12-10 15:25:00 UTC: Added focused unit tests for lifecycle artifact extraction/enrichment helpers and console analytics chips, documenting coverage in the frontend components README.
+    - 2025-12-11 09:45:00 UTC: Extended lifecycle CLI delta narration to include remediation analytics, artifact diff summaries, and promotion verdict slices; refreshed console trust overlay to render analytics/artifact change chips and updated operator docs to reflect the streaming contract.
