@@ -595,6 +595,13 @@ pub async fn fetch_page(
             });
         }
 
+        let mut workspace_promotion_runs = promotion_runs
+            .get(&workspace.id)
+            .cloned()
+            .unwrap_or_default();
+        workspace_promotion_runs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        workspace_promotion_runs.truncate(run_limit);
+
         let manifest_digests = collect_workspace_manifest_digests(
             &workspace,
             revision.as_ref(),
@@ -604,13 +611,6 @@ pub async fn fetch_page(
         if !manifest_digests.is_empty() {
             workspace_manifest_index.insert(workspace.id, manifest_digests);
         }
-
-        let mut workspace_promotion_runs = promotion_runs
-            .get(&workspace.id)
-            .cloned()
-            .unwrap_or_default();
-        workspace_promotion_runs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        workspace_promotion_runs.truncate(run_limit);
 
         snapshots.push(LifecycleWorkspaceSnapshot {
             workspace,
