@@ -354,8 +354,14 @@ fn extract_promotion_targets(
 ) -> Vec<PromotionAutomationTarget> {
     let mut entries = Vec::new();
     entries.extend(collect_target_entries(revision.plan.get("targets"), true));
-    entries.extend(collect_target_entries(workspace.metadata.get("targets"), false));
-    entries.extend(collect_target_entries(revision.metadata.get("targets"), false));
+    entries.extend(collect_target_entries(
+        workspace.metadata.get("targets"),
+        false,
+    ));
+    entries.extend(collect_target_entries(
+        revision.metadata.get("targets"),
+        false,
+    ));
 
     let mut deduped_entries = Vec::new();
     let mut seen_instance_ids = HashSet::new();
@@ -403,7 +409,10 @@ fn extract_promotion_targets(
         .map(|value| value.to_string());
 
     let mut targets = Vec::new();
-    trace!(target_count = deduped_entries.len(), "processing promotion targets");
+    trace!(
+        target_count = deduped_entries.len(),
+        "processing promotion targets"
+    );
 
     for entry in deduped_entries {
         let instance_id = entry

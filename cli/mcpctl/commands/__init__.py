@@ -12,6 +12,7 @@ import sys
 from ..client import APIClient, APIError
 from ..renderers import dumps_json, render_table
 from . import evaluations as evaluations_commands
+from . import keys as keys_commands
 from . import lifecycle as lifecycle_commands
 from . import remediation as remediation_commands
 
@@ -137,6 +138,10 @@ def install_remediation(subparsers: _SubParsersAction[ArgumentParser]) -> None:
 
 def install_lifecycle(subparsers: _SubParsersAction[ArgumentParser]) -> None:
     lifecycle_commands.install(subparsers, _add_common_arguments)
+
+
+def install_keys(subparsers: _SubParsersAction[ArgumentParser]) -> None:
+    keys_commands.install(subparsers, _add_common_arguments)
 
 
 def install_promotions(subparsers: _SubParsersAction[ArgumentParser]) -> None:
@@ -764,6 +769,37 @@ def _render_policy_event(
                     prev_label = "required" if previous else "clear"
                     changes.append(f"{label} {prev_label} -> {current}")
 
+    provider_key = event.get("provider_key_posture")
+    if isinstance(provider_key, dict):
+        state_value = provider_key.get("state")
+        if isinstance(state_value, str):
+            prev_state = summary.get("provider_key_state")
+            summary["provider_key_state"] = state_value
+            if prev_state is None:
+                changes.append(f"provider key {state_value}")
+            elif prev_state != state_value:
+                changes.append(f"provider key {prev_state} -> {state_value}")
+
+        veto_flag = provider_key.get("vetoed")
+        if isinstance(veto_flag, bool):
+            prev_veto = summary.get("provider_key_vetoed")
+            summary["provider_key_vetoed"] = veto_flag
+            if prev_veto is None or prev_veto != veto_flag:
+                label = "vetoed" if veto_flag else "cleared"
+                changes.append(f"provider key {label}")
+
+        rotation_due = provider_key.get("rotation_due_at")
+        if isinstance(rotation_due, str):
+            summary["provider_key_rotation_due_at"] = rotation_due
+
+        notes = provider_key.get("notes")
+        if isinstance(notes, list):
+            summary["provider_key_notes"] = [str(entry) for entry in notes if isinstance(entry, str)]
+
+        provider_id = provider_key.get("provider_id")
+        if isinstance(provider_id, str):
+            summary["provider_key_provider_id"] = provider_id
+
     instance_id = event.get("instance_id")
     if isinstance(instance_id, str):
         previous = summary.get("instance_id")
@@ -786,6 +822,15 @@ def _render_policy_event(
     latest_posture = summary.get("attestation_status")
     if isinstance(latest_posture, str):
         parts.append(f"Latest posture: {latest_posture}")
+    provider_key_state = summary.get("provider_key_state")
+    if isinstance(provider_key_state, str):
+        descriptor = f"Provider key: {provider_key_state}"
+        if summary.get("provider_key_vetoed") is True:
+            descriptor += " (vetoed)"
+        parts.append(descriptor)
+        rotation_due = summary.get("provider_key_rotation_due_at")
+        if isinstance(rotation_due, str):
+            parts.append(f"BYOK rotation due @ {rotation_due}")
     if signal_notes:
         parts.append(", ".join(signal_notes))
 
@@ -801,6 +846,7 @@ def _filter_signal_notes(notes: Any) -> list[str]:
             note.startswith("vm:attestation")
             or note.startswith("attestation:")
             or "fallback" in note
+            or note.startswith("provider-key:")
         ):
             signals.append(note)
     return signals

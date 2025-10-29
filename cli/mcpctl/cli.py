@@ -12,6 +12,7 @@ from .client import APIClient, APIError
 from .commands import (
     install_evaluations,
     install_governance,
+    install_keys,
     install_lifecycle,
     install_marketplace,
     install_policy,
@@ -46,6 +47,7 @@ def build_parser() -> ArgumentParser:
     install_governance(subparsers)
     install_evaluations(subparsers)
     install_lifecycle(subparsers)
+    install_keys(subparsers)
     install_remediation(subparsers)
     install_trust(subparsers)
     install_scaffold(subparsers)

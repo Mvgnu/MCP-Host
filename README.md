@@ -6,6 +6,14 @@ A Model Context Protocol hosting platform.
 
 Install the mission-control tooling with `pip install -e ./cli` and use the `mcpctl` entry point to drive promotions, governance runs, evaluations, and marketplace inspection without crafting manual HTTP requests. See [cli/README.md](cli/README.md) for full usage documentation and examples.
 
+### BYOK design staging
+
+Provider bring-your-own-key planning materials and scaffolding live under [design/byok](design/byok/architecture.md). Start there for the cross-surface architecture note that aligns migrations, backend services, CLI contracts, and console hooks.
+
+Runtime policy decisions now persist BYOK posture in the `key_posture` column so control loops can surface tier-level key health. Populate the new `provider_tiers` table (migration `0042_provider_tier_requirements.sql`) to opt tiers into mandatory BYOK gating; the engine emits `provider-key:*` notes and SSE payloads whenever posture blocks a launch.
+
+Migration `0043_provider_key_attestations.sql` hardens the fabric by persisting attestation signatures, verification timestamps, and non-null rotation actors so runtime vetoes can enforce signed provenance end-to-end.
+
 ## Backend configuration
 
 The backend exposes several environment variables to control startup behavior:

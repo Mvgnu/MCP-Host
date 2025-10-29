@@ -161,6 +161,41 @@ export default function LifecycleRunDrilldownModal({ workspace, run, delta, onCl
                   {run.promotion_verdict.track_tier && ` · tier:${run.promotion_verdict.track_tier}`}
                 </p>
               )}
+              {run.provider_key_posture && (
+                <div className="space-y-1">
+                  <p className="text-xs font-semibold text-slate-600">Provider key posture</p>
+                  <ul className="space-y-1 text-[11px] text-slate-600">
+                    <li>Provider: {truncateId(run.provider_key_posture.provider_id)}</li>
+                    {run.provider_key_posture.provider_key_id && (
+                      <li>Key: {truncateId(run.provider_key_posture.provider_key_id)}</li>
+                    )}
+                    {run.provider_key_posture.state && (
+                      <li>State: {run.provider_key_posture.state.replace(/_/g, ' ')}</li>
+                    )}
+                    <li>Vetoed: {run.provider_key_posture.vetoed ? 'yes' : 'no'}</li>
+                    {run.provider_key_posture.rotation_due_at && (
+                      <li>
+                        Rotation due:{' '}
+                        {new Date(run.provider_key_posture.rotation_due_at).toLocaleString()}
+                      </li>
+                    )}
+                    <li>
+                      Attestation:{' '}
+                      {run.provider_key_posture.attestation_registered ? 'registered' : 'missing'} · signature{' '}
+                      {run.provider_key_posture.attestation_signature_verified ? 'verified' : 'unverified'}
+                    </li>
+                    {run.provider_key_posture.attestation_verified_at && (
+                      <li>
+                        Verified at:{' '}
+                        {new Date(run.provider_key_posture.attestation_verified_at).toLocaleString()}
+                      </li>
+                    )}
+                    {(run.provider_key_posture.notes ?? []).length > 0 && (
+                      <li>Notes: {(run.provider_key_posture.notes ?? []).join(', ')}</li>
+                    )}
+                  </ul>
+                </div>
+              )}
               {run.run.failure_reason && <p className="text-xs text-rose-600">Failure: {run.run.failure_reason}</p>}
               {run.run.last_error && <p className="text-xs text-rose-500">Last error: {run.run.last_error}</p>}
               {run.run.approval_required && (
@@ -209,6 +244,7 @@ export default function LifecycleRunDrilldownModal({ workspace, run, delta, onCl
                 <ChangeList title="Marketplace changes" changes={delta.marketplace_changes} />
                 <ChangeList title="Analytics changes" changes={delta.analytics_changes} />
                 <ChangeList title="Artifact changes" changes={delta.artifact_changes} />
+                <ChangeList title="Provider key changes" changes={delta.provider_key_changes} />
               </div>
             )}
           </div>
@@ -237,6 +273,13 @@ export default function LifecycleRunDrilldownModal({ workspace, run, delta, onCl
       </div>
     </div>
   );
+}
+
+function truncateId(value: string, length = 12) {
+  if (value.length <= length) {
+    return value;
+  }
+  return `${value.slice(0, length)}…`;
 }
 
 function formatDuration(seconds: number) {

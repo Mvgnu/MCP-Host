@@ -29,6 +29,7 @@ use crate::extractor::AuthUser;
 use crate::governance::GovernanceEngine;
 use crate::intelligence::{self, IntelligenceError, IntelligenceStatus, RecomputeContext};
 use crate::job_queue;
+use crate::keys::{ProviderKeyDecisionPosture, ProviderKeyService, ProviderKeyServiceConfig};
 use crate::marketplace::{classify_tier, derive_health, MarketplacePlatform};
 
 // key: runtime-policy -> placement-decisions,marketplace-health
@@ -66,6 +67,8 @@ pub struct PolicyEvent {
     pub instance_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_key_posture: Option<ProviderKeyDecisionPosture>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
 }
@@ -155,6 +158,7 @@ impl PolicyEvent {
             governance_required: Some(decision.governance_required),
             instance_id: None,
             stale: stale_flag,
+            provider_key_posture: decision.provider_key_posture.clone(),
             notes,
         }
     }
@@ -182,6 +186,7 @@ impl PolicyEvent {
             governance_required: None,
             instance_id,
             stale: Some(stale),
+            provider_key_posture: None,
             notes,
         }
     }
@@ -297,6 +302,7 @@ pub struct PolicyDecision {
     pub promotion_stage: Option<String>,
     pub promotion_status: Option<String>,
     pub promotion_notes: Vec<String>,
+    pub provider_key_posture: Option<ProviderKeyDecisionPosture>,
 }
 
 #[derive(Debug, Error)]
@@ -422,6 +428,7 @@ impl RuntimePolicyEngine {
         let mut promotion_notes = Vec::new();
         let mut evaluation_required = false;
         let mut vm_posture: Option<VmAttestationPolicyOutcome> = None;
+        let mut provider_key_posture: Option<ProviderKeyDecisionPosture> = None;
 
         if use_gpu && !matches!(backend, RuntimeBackend::Kubernetes) {
             backend = RuntimeBackend::Kubernetes;
@@ -832,6 +839,70 @@ impl RuntimePolicyEngine {
             }
         }
 
+        if let Some(tier_name) = tier.clone() {
+            let key_service =
+                ProviderKeyService::new(pool.clone(), ProviderKeyServiceConfig::default());
+            if let Some(requirement) = key_service
+                .tier_requirement(&tier_name)
+                .await
+                .map_err(PolicyError::Database)?
+            {
+                let summary = key_service
+                    .summarize_for_policy(requirement.provider_id)
+                    .await
+                    .map_err(PolicyError::Database)?;
+                let gating_veto = requirement.byok_required && summary.vetoed;
+                let mut posture_notes = summary.notes.clone();
+                if requirement.byok_required && !summary.vetoed {
+                    posture_notes.push("healthy".to_string());
+                } else if !requirement.byok_required {
+                    posture_notes.push("optional".to_string());
+                }
+
+                if gating_veto {
+                    evaluation_required = true;
+                    governance_required = true;
+                    if summary.notes.is_empty() {
+                        notes.push("provider-key:veto".to_string());
+                    }
+                    for note in summary.notes.iter() {
+                        notes.push(format!("provider-key:{note}"));
+                    }
+                } else if requirement.byok_required {
+                    notes.push("provider-key:healthy".to_string());
+                } else {
+                    notes.push("provider-key:optional".to_string());
+                }
+
+                provider_key_posture = Some(ProviderKeyDecisionPosture {
+                    provider_id: requirement.provider_id,
+                    provider_key_id: summary.record.as_ref().map(|record| record.id),
+                    tier: Some(tier_name),
+                    state: summary.posture_state(),
+                    rotation_due_at: summary
+                        .record
+                        .as_ref()
+                        .and_then(|record| record.rotation_due_at),
+                    attestation_registered: summary
+                        .record
+                        .as_ref()
+                        .and_then(|record| record.attestation_digest.as_ref())
+                        .is_some(),
+                    attestation_signature_verified: summary
+                        .record
+                        .as_ref()
+                        .map(|record| record.attestation_signature_registered)
+                        .unwrap_or(false),
+                    attestation_verified_at: summary
+                        .record
+                        .as_ref()
+                        .and_then(|record| record.attestation_verified_at),
+                    vetoed: gating_veto,
+                    notes: posture_notes,
+                });
+            }
+        }
+
         Ok((
             PolicyDecision {
                 backend,
@@ -855,6 +926,7 @@ impl RuntimePolicyEngine {
                 promotion_stage,
                 promotion_status,
                 promotion_notes,
+                provider_key_posture,
             },
             vm_posture,
         ))
@@ -875,6 +947,11 @@ impl RuntimePolicyEngine {
                 .map(|cap| Value::String(cap.as_str().to_string()))
                 .collect(),
         );
+        let key_posture_json = decision
+            .provider_key_posture
+            .as_ref()
+            .map(|posture| serde_json::to_value(posture).unwrap_or(Value::Null))
+            .unwrap_or(Value::Null);
 
         let row = sqlx::query(
             r#"
@@ -900,9 +977,10 @@ impl RuntimePolicyEngine {
                 promotion_stage,
                 promotion_status,
                 promotion_notes,
+                key_posture,
                 decided_at
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
             )
             RETURNING id
             "#,
@@ -928,6 +1006,7 @@ impl RuntimePolicyEngine {
         .bind(decision.promotion_stage.as_deref())
         .bind(decision.promotion_status.as_deref())
         .bind(&decision.promotion_notes)
+        .bind(key_posture_json)
         .bind(Utc::now())
         .fetch_one(pool)
         .await?;
@@ -1193,9 +1272,12 @@ mod tests {
     use super::*;
     use crate::evaluations::{CertificationStatus, CertificationUpsert};
     use crate::governance::GovernanceEngine;
+    use base64::engine::general_purpose::STANDARD as Base64Engine;
+    use base64::Engine;
     use chrono::{Duration, Utc};
     use serde_json::json;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn policy_requires_certifications() -> Result<(), Box<dyn std::error::Error>> {
@@ -1389,6 +1471,377 @@ mod tests {
 
         sqlx::query("DELETE FROM evaluation_certifications WHERE build_artifact_run_id = $1")
             .bind(run_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM build_artifact_platforms WHERE run_id = $1")
+            .bind(run_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM build_artifact_runs WHERE id = $1")
+            .bind(run_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM mcp_servers WHERE id = $1")
+            .bind(server_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_blocks_launch_without_provider_key() -> Result<(), Box<dyn std::error::Error>> {
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                eprintln!(
+                    "skipping policy_blocks_launch_without_provider_key: DATABASE_URL not set",
+                );
+                return Ok(());
+            }
+        };
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await?;
+        sqlx::migrate!("../backend/migrations").run(&pool).await?;
+
+        let user_id: i32 = sqlx::query_scalar(
+            "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id",
+        )
+        .bind("policy-provider@example.com")
+        .bind("hash")
+        .fetch_one(&pool)
+        .await?;
+
+        let server_id: i32 = sqlx::query_scalar(
+            "INSERT INTO mcp_servers (owner_id, name, server_type, config, status, api_key) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        )
+        .bind(user_id)
+        .bind("Router Server")
+        .bind("Router")
+        .bind(json!({}))
+        .bind("ready")
+        .bind("test-key")
+        .fetch_one(&pool)
+        .await?;
+
+        let manifest_digest = "sha256:policy-provider".to_string();
+        let start = Utc::now() - Duration::minutes(5);
+        let end = Utc::now();
+
+        let run_id: i32 = sqlx::query_scalar(
+            r#"
+            INSERT INTO build_artifact_runs (
+                server_id,
+                source_repo,
+                source_branch,
+                source_revision,
+                registry,
+                local_image,
+                registry_image,
+                manifest_tag,
+                manifest_digest,
+                started_at,
+                completed_at,
+                status,
+                multi_arch,
+                auth_refresh_attempted,
+                auth_refresh_succeeded,
+                auth_rotation_attempted,
+                auth_rotation_succeeded,
+                credential_health_status
+            ) VALUES (
+                $1, NULL, NULL, NULL, NULL, $2, $3, $4, $5, $6, $7, 'succeeded', TRUE,
+                FALSE, FALSE, FALSE, FALSE, 'healthy'
+            ) RETURNING id
+            "#,
+        )
+        .bind(server_id)
+        .bind("router/local:latest")
+        .bind(Some("registry.test/router:latest"))
+        .bind(Some("router:latest"))
+        .bind(&manifest_digest)
+        .bind(start)
+        .bind(end)
+        .fetch_one(&pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO build_artifact_platforms (
+                run_id,
+                platform,
+                remote_image,
+                remote_tag,
+                digest,
+                auth_refresh_attempted,
+                auth_refresh_succeeded,
+                auth_rotation_attempted,
+                auth_rotation_succeeded,
+                credential_health_status
+            ) VALUES ($1, $2, $3, $4, $5, FALSE, FALSE, FALSE, FALSE, 'healthy')
+            "#,
+        )
+        .bind(run_id)
+        .bind("linux/amd64")
+        .bind("registry.test/router:amd64")
+        .bind("router-amd64")
+        .bind(Some(manifest_digest.clone()))
+        .execute(&pool)
+        .await?;
+
+        let engine = Arc::new(RuntimePolicyEngine::new(RuntimeBackend::Docker));
+        let governance_engine = Arc::new(GovernanceEngine::new());
+        engine
+            .register_executor(RuntimeExecutorDescriptor::new(
+                RuntimeBackend::Docker,
+                "Docker",
+                Vec::new(),
+            ))
+            .await;
+        engine.attach_governance(governance_engine.clone()).await;
+
+        let initial = engine
+            .decide_and_record(&pool, server_id, "Router", None, false)
+            .await?;
+        let tier = initial
+            .tier
+            .clone()
+            .expect("tier should be derived before BYOK gating");
+
+        let provider_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO provider_tiers (tier, provider_id, byok_required) VALUES ($1, $2, TRUE) ON CONFLICT (tier) DO UPDATE SET provider_id = EXCLUDED.provider_id, byok_required = EXCLUDED.byok_required",
+        )
+        .bind(&tier)
+        .bind(provider_id)
+        .execute(&pool)
+        .await?;
+
+        let decision = engine
+            .decide_and_record(&pool, server_id, "Router", None, false)
+            .await?;
+        assert!(decision.governance_required);
+        assert!(decision.evaluation_required);
+        assert!(decision
+            .notes
+            .iter()
+            .any(|note| note == "provider-key:missing"));
+
+        let posture = decision
+            .provider_key_posture
+            .expect("provider key posture should be captured");
+        assert!(posture.vetoed);
+        assert_eq!(posture.provider_id, provider_id);
+        assert!(posture.notes.iter().any(|note| note == "missing"));
+
+        sqlx::query("DELETE FROM provider_tiers WHERE tier = $1")
+            .bind(&tier)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM runtime_policy_decisions WHERE server_id = $1")
+            .bind(server_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM build_artifact_platforms WHERE run_id = $1")
+            .bind(run_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM build_artifact_runs WHERE id = $1")
+            .bind(run_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM mcp_servers WHERE id = $1")
+            .bind(server_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_allows_launch_with_provider_key() -> Result<(), Box<dyn std::error::Error>> {
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                eprintln!("skipping policy_allows_launch_with_provider_key: DATABASE_URL not set",);
+                return Ok(());
+            }
+        };
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await?;
+        sqlx::migrate!("../backend/migrations").run(&pool).await?;
+
+        let user_id: i32 = sqlx::query_scalar(
+            "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id",
+        )
+        .bind("policy-provider-healthy@example.com")
+        .bind("hash")
+        .fetch_one(&pool)
+        .await?;
+
+        let server_id: i32 = sqlx::query_scalar(
+            "INSERT INTO mcp_servers (owner_id, name, server_type, config, status, api_key) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        )
+        .bind(user_id)
+        .bind("Router Server")
+        .bind("Router")
+        .bind(json!({}))
+        .bind("ready")
+        .bind("test-key")
+        .fetch_one(&pool)
+        .await?;
+
+        let manifest_digest = "sha256:policy-provider-healthy".to_string();
+        let start = Utc::now() - Duration::minutes(5);
+        let end = Utc::now();
+
+        let run_id: i32 = sqlx::query_scalar(
+            r#"
+            INSERT INTO build_artifact_runs (
+                server_id,
+                source_repo,
+                source_branch,
+                source_revision,
+                registry,
+                local_image,
+                registry_image,
+                manifest_tag,
+                manifest_digest,
+                started_at,
+                completed_at,
+                status,
+                multi_arch,
+                auth_refresh_attempted,
+                auth_refresh_succeeded,
+                auth_rotation_attempted,
+                auth_rotation_succeeded,
+                credential_health_status
+            ) VALUES (
+                $1, NULL, NULL, NULL, NULL, $2, $3, $4, $5, $6, $7, 'succeeded', TRUE,
+                FALSE, FALSE, FALSE, FALSE, 'healthy'
+            ) RETURNING id
+            "#,
+        )
+        .bind(server_id)
+        .bind("router/local:latest")
+        .bind(Some("registry.test/router:latest"))
+        .bind(Some("router:latest"))
+        .bind(&manifest_digest)
+        .bind(start)
+        .bind(end)
+        .fetch_one(&pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO build_artifact_platforms (
+                run_id,
+                platform,
+                remote_image,
+                remote_tag,
+                digest,
+                auth_refresh_attempted,
+                auth_refresh_succeeded,
+                auth_rotation_attempted,
+                auth_rotation_succeeded,
+                credential_health_status
+            ) VALUES ($1, $2, $3, $4, $5, FALSE, FALSE, FALSE, FALSE, 'healthy')
+            "#,
+        )
+        .bind(run_id)
+        .bind("linux/amd64")
+        .bind("registry.test/router:amd64")
+        .bind("router-amd64")
+        .bind(Some(manifest_digest.clone()))
+        .execute(&pool)
+        .await?;
+
+        let engine = Arc::new(RuntimePolicyEngine::new(RuntimeBackend::Docker));
+        let governance_engine = Arc::new(GovernanceEngine::new());
+        engine
+            .register_executor(RuntimeExecutorDescriptor::new(
+                RuntimeBackend::Docker,
+                "Docker",
+                Vec::new(),
+            ))
+            .await;
+        engine.attach_governance(governance_engine.clone()).await;
+
+        let initial = engine
+            .decide_and_record(&pool, server_id, "Router", None, false)
+            .await?;
+        let tier = initial
+            .tier
+            .clone()
+            .expect("tier should be derived before BYOK gating");
+
+        let provider_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO provider_tiers (tier, provider_id, byok_required) VALUES ($1, $2, TRUE) ON CONFLICT (tier) DO UPDATE SET provider_id = EXCLUDED.provider_id, byok_required = EXCLUDED.byok_required",
+        )
+        .bind(&tier)
+        .bind(provider_id)
+        .execute(&pool)
+        .await?;
+
+        let service = ProviderKeyService::new(pool.clone(), ProviderKeyServiceConfig::default());
+        let attestation = Base64Engine.encode(b"policy-provider-healthy");
+        service
+            .register_key(
+                provider_id,
+                RegisterProviderKey {
+                    alias: Some("primary".to_string()),
+                    attestation_digest: Some(attestation.clone()),
+                    attestation_signature: Some(attestation.clone()),
+                    rotation_due_at: Some(Utc::now() + Duration::days(30)),
+                },
+            )
+            .await?;
+
+        let decision = engine
+            .decide_and_record(&pool, server_id, "Router", None, false)
+            .await?;
+        assert!(decision
+            .notes
+            .iter()
+            .any(|note| note == "provider-key:healthy"));
+
+        let posture = decision
+            .provider_key_posture
+            .expect("provider key posture should be captured");
+        assert!(!posture.vetoed);
+        assert_eq!(posture.provider_id, provider_id);
+        assert!(posture.attestation_signature_verified);
+        assert!(posture.notes.iter().any(|note| note == "healthy"));
+
+        sqlx::query("DELETE FROM provider_key_audit_events WHERE provider_id = $1")
+            .bind(provider_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM provider_keys WHERE provider_id = $1")
+            .bind(provider_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM provider_tiers WHERE tier = $1")
+            .bind(&tier)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM runtime_policy_decisions WHERE server_id = $1")
+            .bind(server_id)
             .execute(&pool)
             .await?;
         sqlx::query("DELETE FROM build_artifact_platforms WHERE run_id = $1")

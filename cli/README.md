@@ -45,10 +45,20 @@ Lists marketplace artifacts and their active status. Pass `--json` to receive ra
 
 `mcpctl lifecycle list` renders per-run columns for `attempt`, total `retries`, ledger summaries, duration (seconds/ms), override actors, promotion verdict references, artifact fingerprints, trust posture, marketplace readiness, and artifact provenance so operators can pivot between CLI and console views without losing analytics coverage.
 
+### Provider BYOK keys (staging)
+
+* `mcpctl keys register PROVIDER_ID [--alias LABEL] --attestation PATH [--rotation-due RFC3339]` – registers a provider key, hashing the attestation bundle locally, base64-encoding the bundle as a signature, and forwarding both values with an optional rotation deadline to the backend. The endpoint still advertises `501 Not Implemented` while migrations roll out, but successful environments return the persisted record including signature posture metadata.
+* `mcpctl keys list PROVIDER_ID` – lists provider key posture records. The command prints a friendly notice when the backend still returns `501`.
+* `mcpctl keys rotate PROVIDER_ID KEY_ID --attestation PATH --actor-ref REF` – requests a rotation for an active provider key. The CLI hashes the attestation bundle, forwards a base64 signature, and requires an operator reference for downstream audit trails, matching the backend rotation contract.
+* `mcpctl keys bind PROVIDER_ID KEY_ID --type TYPE --target TARGET [--context JSON]` – attaches a provider key to a workload scope (e.g., workspace or runtime), parsing optional JSON context for audit metadata and surfacing the persisted binding record.
+* `mcpctl keys bindings PROVIDER_ID KEY_ID [--json]` – lists active bindings for a provider key, including binding type, target identifiers, and creation timestamps for operators reconciling workload coverage.
+* Additional subcommands (`approve-rotation`, `watch`) remain scaffolded placeholders while backend orchestration endpoints are staged.
+
 ### Policy insights
 
 * `mcpctl policy intelligence SERVER_ID [--json]` – display capability intelligence scores, status, and recent anomaly notes for the specified server.
 * `mcpctl policy vm SERVER_ID [--json]` – inspect VM attestation status, isolation tier, and active instance details for confidential workloads.
+* `mcpctl policy watch [--server-id ID]` – stream runtime policy events, including BYOK key posture (state, rotation deadlines, veto status) derived from the `key_posture` payload persisted on decisions.
 
 ### Trust control plane
 
