@@ -252,6 +252,30 @@ def test_lifecycle_list_renders_promotion_runs_table(
                             "status": "succeeded",
                             "playbook": "verify-automation",
                         },
+                        "duration_seconds": 180,
+                        "duration_ms": 182000,
+                        "retry_attempt": 2,
+                        "retry_limit": 5,
+                        "retry_count": 3,
+                        "retry_ledger": [
+                            {
+                                "attempt": 2,
+                                "status": "succeeded",
+                                "observed_at": "2025-12-08T09:55:00Z",
+                            }
+                        ],
+                        "override_reason": "manual approval",
+                        "manual_override": {
+                            "reason": "manual approval",
+                            "actor_email": "operator@example.com",
+                        },
+                        "promotion_verdict": {
+                            "verdict_id": 91,
+                            "allowed": False,
+                            "stage": "production",
+                            "track_name": "stable",
+                            "track_tier": "tier-1",
+                        },
                         "trust": {
                             "attestation_status": "trusted",
                             "lifecycle_state": "restored",
@@ -260,6 +284,19 @@ def test_lifecycle_list_renders_promotion_runs_table(
                             "status": "ready",
                             "last_completed_at": "2025-12-08T10:00:00Z",
                         },
+                        "artifacts": [
+                            {
+                                "manifest_digest": "sha256:artifact",
+                                "lane": "prod",
+                                "stage": "production",
+                            }
+                        ],
+                        "artifact_fingerprints": [
+                            {
+                                "manifest_digest": "sha256:artifact",
+                                "fingerprint": "abcdef0123456789",
+                            }
+                        ],
                     }
                 ],
             }
@@ -273,6 +310,8 @@ def test_lifecycle_list_renders_promotion_runs_table(
     assert "Promotion posture verdicts:" in output
     assert "Recent remediation runs:" in output
     assert "attempt" in output
+    assert "override_actor" in output
+    assert "fingerprints" in output
     assert "artifacts" in output
 
 

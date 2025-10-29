@@ -192,14 +192,18 @@ the JSON envelope described below. Promotion automation parity hinges on the `pr
 collection and the replay-safe `promotion_run_deltas` payload.
 
 Each remediation run snapshot now publishes automation analytics and artifact metadata alongside
-trust and intelligence state. The `recent_runs` array surfaces `duration_seconds`, blended retry
-signals (`retry_attempt`/`retry_limit`), any surfaced `override_reason`, and an `artifacts` array that
-captures manifest digests, lane/stage context, track metadata, and hydrated build insights (manifest
-tag, registry image, build status, completion timestamp, and duration). Marketplace readiness entries
-mirror these additions with `manifest_digest`, `manifest_tag`, `registry_image`, and
-`build_duration_seconds`. SSE deltas populate `analytics_changes` and `artifact_changes` vectors so
-streaming consumers can diff retry counts, durations, and artifact rollups without replaying entire
-snapshots.
+trust and intelligence state. The `recent_runs` array surfaces both coarse and precise duration
+signals (`duration_seconds`, `duration_ms`, and an `execution_window` timestamp pair), blended retry
+context (`retry_attempt`, `retry_limit`, canonical `retry_count`, and a structured `retry_ledger`),
+manual override provenance (`override_reason` plus `manual_override.actor_email/actor_id`), and an
+`artifacts` array with hydrated provenance details (manifest digest, lane/stage context, track
+metadata, manifest tag, registry image, build status, completion timestamp, and duration). Each run
+also captures `artifact_fingerprints`—stable SHA-256 digests derived from manifest and track
+attributes—and `promotion_verdict` references that link remediation attempts back to the governing
+promotion verdict. Marketplace readiness entries mirror these additions with `manifest_digest`,
+`manifest_tag`, `registry_image`, and `build_duration_seconds`. SSE deltas populate
+`analytics_changes` and `artifact_changes` vectors so streaming consumers can diff retry counts,
+overrides, verdict linkage, and artifact rollups without replaying entire snapshots.
 
 ```json
 {
@@ -237,7 +241,50 @@ snapshots.
             "run": { "id": 44, "status": "succeeded", "playbook": "verify-automation" },
             "trust": { "attestation_status": "trusted", "lifecycle_state": "restored" },
             "intelligence": [],
-            "marketplace": { "status": "ready", "last_completed_at": "2025-12-08T10:00:00Z" }
+            "marketplace": { "status": "ready", "last_completed_at": "2025-12-08T10:00:00Z" },
+            "duration_seconds": 180,
+            "duration_ms": 182000,
+            "execution_window": {
+              "started_at": "2025-12-08T09:52:00Z",
+              "completed_at": "2025-12-08T09:55:00Z"
+            },
+            "retry_attempt": 2,
+            "retry_limit": 5,
+            "retry_count": 2,
+            "retry_ledger": [
+              {"attempt": 1, "status": "failed", "observed_at": "2025-12-08T09:53:00Z"},
+              {"attempt": 2, "status": "succeeded", "observed_at": "2025-12-08T09:55:00Z"}
+            ],
+            "override_reason": "manual approval",
+            "manual_override": {
+              "reason": "manual approval",
+              "actor_email": "operator@example.com"
+            },
+            "artifacts": [
+              {
+                "manifest_digest": "sha256:artifact",
+                "lane": "prod",
+                "stage": "production",
+                "track_name": "stable",
+                "track_tier": "tier-1",
+                "manifest_tag": "v1",
+                "registry_image": "registry.example/mcp:v1",
+                "duration_seconds": 95
+              }
+            ],
+            "artifact_fingerprints": [
+              {
+                "manifest_digest": "sha256:artifact",
+                "fingerprint": "4c4d5c8a4b341f6a9c5e2d5876a9c1f2"
+              }
+            ],
+            "promotion_verdict": {
+              "verdict_id": 91,
+              "allowed": false,
+              "stage": "production",
+              "track_name": "stable",
+              "track_tier": "tier-1"
+            }
           }
         ]
       }

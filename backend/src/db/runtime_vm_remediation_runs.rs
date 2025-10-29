@@ -30,6 +30,14 @@ pub struct RuntimeVmRemediationRun {
     pub cancelled_at: Option<DateTime<Utc>>,
     pub cancellation_reason: Option<String>,
     pub failure_reason: Option<String>,
+    pub analytics_duration_ms: Option<i64>,
+    pub analytics_execution_started_at: Option<DateTime<Utc>>,
+    pub analytics_execution_completed_at: Option<DateTime<Utc>>,
+    pub analytics_retry_count: Option<i32>,
+    pub analytics_retry_ledger: Option<Value>,
+    pub analytics_override_actor_id: Option<i32>,
+    pub analytics_artifact_hash: Option<String>,
+    pub analytics_promotion_verdict_id: Option<i64>,
 }
 
 pub struct ListRuntimeVmRemediationRuns<'a> {
@@ -126,7 +134,15 @@ pub async fn get_run_by_id(
             updated_at,
             cancelled_at,
             cancellation_reason,
-            failure_reason
+            failure_reason,
+            analytics_duration_ms,
+            analytics_execution_started_at,
+            analytics_execution_completed_at,
+            analytics_retry_count,
+            analytics_retry_ledger,
+            analytics_override_actor_id,
+            analytics_artifact_hash,
+            analytics_promotion_verdict_id
         FROM runtime_vm_remediation_runs
         WHERE id = $1
         "#,

@@ -15,6 +15,8 @@ use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 
+use sha2::{Digest, Sha256};
+
 use crate::db::runtime_vm_remediation_runs::RuntimeVmRemediationRun;
 use crate::db::runtime_vm_remediation_workspaces::{
     RuntimeVmRemediationWorkspace, RuntimeVmRemediationWorkspaceRevision,
@@ -133,13 +135,54 @@ pub struct LifecycleRunSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_seconds: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_window: Option<LifecycleRunExecutionWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_attempt: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_limit: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retry_ledger: Vec<LifecycleRunRetryRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub override_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_override: Option<LifecycleRunOverride>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<LifecycleRunArtifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_fingerprints: Vec<LifecycleRunArtifactFingerprint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion_verdict: Option<LifecycleRunPromotionVerdictRef>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecycleRunExecutionWindow {
+    pub started_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecycleRunRetryRecord {
+    pub attempt: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecycleRunOverride {
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_email: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -161,6 +204,27 @@ pub struct LifecyclePromotionPosture {
     pub remediation_hooks: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signals: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecycleRunArtifactFingerprint {
+    pub manifest_digest: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecycleRunPromotionVerdictRef {
+    pub verdict_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -301,6 +365,18 @@ pub struct LifecycleRunArtifact {
 struct RuntimeVmInstanceRow {
     pub id: i64,
     pub server_id: i32,
+}
+
+#[derive(Debug, Clone)]
+struct OverrideActorRecord {
+    pub id: i32,
+    pub email: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct UserRow {
+    pub id: i32,
+    pub email: String,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -590,9 +666,13 @@ pub async fn fetch_page(
     let promotion_runs = load_promotion_runs(pool, &workspace_ids, run_limit).await?;
 
     let mut instance_ids = HashSet::new();
+    let mut override_actor_ids = HashSet::new();
     for run_list in runs.values() {
         for run in run_list {
             instance_ids.insert(run.runtime_vm_instance_id);
+            if let Some(actor_id) = run.analytics_override_actor_id {
+                override_actor_ids.insert(actor_id);
+            }
         }
     }
 
@@ -606,6 +686,7 @@ pub async fn fetch_page(
 
     let intelligence_scores = load_intelligence_scores(pool, &server_ids).await?;
     let marketplace = load_marketplace(pool, &server_ids).await?;
+    let override_actors = load_override_actors(pool, &override_actor_ids).await?;
 
     let mut snapshots = Vec::with_capacity(workspaces.len());
     let mut workspace_manifest_index: HashMap<i64, HashSet<String>> = HashMap::new();
@@ -641,20 +722,34 @@ pub async fn fetch_page(
                 .and_then(|row| marketplace.get(&row.server_id).cloned());
 
             let duration_seconds = compute_run_duration(&run);
+            let duration_ms = compute_run_duration_ms(&run);
+            let execution_window = build_execution_window(&run);
             let retry_attempt = compute_run_retry_attempt(&run);
             let retry_limit = compute_run_retry_limit(&run);
+            let retry_count = compute_retry_count(&run, retry_attempt);
+            let retry_ledger = build_retry_ledger(&run, retry_attempt);
             let override_reason = compute_run_override_reason(&run);
+            let manual_override =
+                build_manual_override(&run, override_reason.clone(), &override_actors);
             let artifacts = extract_run_artifacts(&run);
+            let artifact_fingerprints = derive_artifact_fingerprints(&artifacts);
 
             run_snapshots.push(LifecycleRunSnapshot {
                 trust,
                 intelligence,
                 marketplace: marketplace_state,
                 duration_seconds,
+                duration_ms,
+                execution_window,
                 retry_attempt,
                 retry_limit,
+                retry_count,
+                retry_ledger,
                 override_reason,
+                manual_override,
                 artifacts,
+                artifact_fingerprints,
+                promotion_verdict: None,
                 run,
             });
         }
@@ -695,6 +790,12 @@ pub async fn fetch_page(
 
         let promotion_map = load_promotion_postures(pool, &manifest_digests).await?;
         let artifact_map = load_build_artifacts_by_digest(pool, &manifest_digests).await?;
+        let mut promotion_index_by_id: HashMap<i64, LifecyclePromotionPosture> = HashMap::new();
+        for entries in promotion_map.values() {
+            for posture in entries {
+                promotion_index_by_id.insert(posture.promotion_id, posture.clone());
+            }
+        }
 
         for snapshot in &mut snapshots {
             if let Some(digests) = workspace_manifest_index.get(&snapshot.workspace.id) {
@@ -711,6 +812,30 @@ pub async fn fetch_page(
 
             for run in &mut snapshot.recent_runs {
                 enrich_run_artifacts(&mut run.artifacts, &artifact_map);
+                run.artifact_fingerprints = derive_artifact_fingerprints(&run.artifacts);
+                if run.promotion_verdict.is_none() {
+                    let mut verdict = run.run.analytics_promotion_verdict_id.and_then(|id| {
+                        promotion_index_by_id
+                            .get(&id)
+                            .map(|posture| make_promotion_verdict_ref(id, Some(posture)))
+                    });
+
+                    if verdict.is_none() {
+                        for artifact in &run.artifacts {
+                            if let Some(entries) = promotion_map.get(&artifact.manifest_digest) {
+                                if let Some(posture) = entries.first() {
+                                    verdict = Some(make_promotion_verdict_ref(
+                                        posture.promotion_id,
+                                        Some(posture),
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    run.promotion_verdict = verdict;
+                }
             }
         }
     }
@@ -922,6 +1047,40 @@ async fn load_runtime_instances(
     .await?;
 
     Ok(rows.into_iter().map(|row| (row.id, row)).collect())
+}
+
+async fn load_override_actors(
+    pool: &PgPool,
+    actor_ids: &HashSet<i32>,
+) -> Result<HashMap<i32, OverrideActorRecord>, AppError> {
+    if actor_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let ids: Vec<i32> = actor_ids.iter().copied().collect();
+    let rows: Vec<UserRow> = query_as(
+        r#"
+        SELECT id, email
+        FROM users
+        WHERE id = ANY($1)
+        "#,
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.id,
+                OverrideActorRecord {
+                    id: row.id,
+                    email: row.email,
+                },
+            )
+        })
+        .collect())
 }
 
 async fn load_trust_states(
@@ -1964,6 +2123,43 @@ fn diff_run_analytics(
     current: &LifecycleRunSnapshot,
 ) -> Vec<LifecycleFieldChange> {
     let mut changes = Vec::new();
+    let previous_duration_ms = previous.and_then(|snap| snap.duration_ms);
+    let current_duration_ms = current.duration_ms;
+    push_change(
+        &mut changes,
+        "run.duration_ms",
+        previous_duration_ms.map(|value| value.to_string()),
+        current_duration_ms.map(|value| value.to_string()),
+    );
+
+    let previous_execution_start = previous
+        .and_then(|snap| snap.execution_window.as_ref())
+        .map(|window| window.started_at.to_rfc3339());
+    let current_execution_start = current
+        .execution_window
+        .as_ref()
+        .map(|window| window.started_at.to_rfc3339());
+    push_change(
+        &mut changes,
+        "run.execution_started_at",
+        previous_execution_start,
+        current_execution_start,
+    );
+
+    let previous_execution_end = previous
+        .and_then(|snap| snap.execution_window.as_ref())
+        .and_then(|window| window.completed_at.map(|ts| ts.to_rfc3339()));
+    let current_execution_end = current
+        .execution_window
+        .as_ref()
+        .and_then(|window| window.completed_at.map(|ts| ts.to_rfc3339()));
+    push_change(
+        &mut changes,
+        "run.execution_completed_at",
+        previous_execution_end,
+        current_execution_end,
+    );
+
     let previous_duration = previous.and_then(|snap| snap.duration_seconds);
     let current_duration = current.duration_seconds;
     push_change(
@@ -1991,6 +2187,30 @@ fn diff_run_analytics(
         current_limit.map(|value| value.to_string()),
     );
 
+    let previous_retry_count = previous.and_then(|snap| snap.retry_count);
+    let current_retry_count = current.retry_count;
+    push_change(
+        &mut changes,
+        "run.retry_count",
+        previous_retry_count.map(|value| value.to_string()),
+        current_retry_count.map(|value| value.to_string()),
+    );
+
+    let previous_retry_ledger = previous
+        .filter(|snap| !snap.retry_ledger.is_empty())
+        .and_then(|snap| serde_json::to_string(&snap.retry_ledger).ok());
+    let current_retry_ledger = if current.retry_ledger.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&current.retry_ledger).ok()
+    };
+    push_change(
+        &mut changes,
+        "run.retry_ledger",
+        previous_retry_ledger,
+        current_retry_ledger,
+    );
+
     let previous_override = previous.and_then(|snap| snap.override_reason.clone());
     let current_override = current.override_reason.clone();
     push_change(
@@ -1998,6 +2218,34 @@ fn diff_run_analytics(
         "run.override_reason",
         previous_override,
         current_override,
+    );
+
+    let previous_override_actor = previous
+        .and_then(|snap| snap.manual_override.as_ref())
+        .and_then(|value| serde_json::to_string(value).ok());
+    let current_override_actor = current
+        .manual_override
+        .as_ref()
+        .and_then(|value| serde_json::to_string(value).ok());
+    push_change(
+        &mut changes,
+        "run.override_actor",
+        previous_override_actor,
+        current_override_actor,
+    );
+
+    let previous_verdict = previous
+        .and_then(|snap| snap.promotion_verdict.as_ref())
+        .and_then(|value| serde_json::to_string(value).ok());
+    let current_verdict = current
+        .promotion_verdict
+        .as_ref()
+        .and_then(|value| serde_json::to_string(value).ok());
+    push_change(
+        &mut changes,
+        "run.promotion_verdict",
+        previous_verdict,
+        current_verdict,
     );
 
     changes
@@ -2008,14 +2256,13 @@ fn diff_run_artifacts(
     current: &LifecycleRunSnapshot,
 ) -> Vec<LifecycleFieldChange> {
     let mut changes = Vec::new();
-    let previous_value = previous
-        .and_then(|snapshot| {
-            if snapshot.artifacts.is_empty() {
-                None
-            } else {
-                to_value(&snapshot.artifacts).ok()
-            }
-        });
+    let previous_value = previous.and_then(|snapshot| {
+        if snapshot.artifacts.is_empty() {
+            None
+        } else {
+            to_value(&snapshot.artifacts).ok()
+        }
+    });
     let current_value = if current.artifacts.is_empty() {
         None
     } else {
@@ -2063,8 +2310,29 @@ fn format_float(value: f32) -> String {
 }
 
 fn compute_run_duration(run: &RuntimeVmRemediationRun) -> Option<i64> {
-    let end_time = run
-        .completed_at
+    let end_time = run.completed_at.or(run.cancelled_at).or_else(|| {
+        if run.status == "running" || run.status == "pending" {
+            Some(Utc::now())
+        } else {
+            None
+        }
+    });
+
+    end_time.map(|end| {
+        let duration = end.signed_duration_since(run.started_at);
+        duration.num_seconds().max(0)
+    })
+}
+
+fn compute_run_duration_ms(run: &RuntimeVmRemediationRun) -> Option<i64> {
+    if let Some(value) = run.analytics_duration_ms {
+        return Some(value.max(0));
+    }
+
+    let start = run.analytics_execution_started_at.unwrap_or(run.started_at);
+    let end = run
+        .analytics_execution_completed_at
+        .or(run.completed_at)
         .or(run.cancelled_at)
         .or_else(|| {
             if run.status == "running" || run.status == "pending" {
@@ -2074,9 +2342,23 @@ fn compute_run_duration(run: &RuntimeVmRemediationRun) -> Option<i64> {
             }
         });
 
-    end_time.map(|end| {
-        let duration = end.signed_duration_since(run.started_at);
-        duration.num_seconds().max(0)
+    end.map(|finish| {
+        finish
+            .signed_duration_since(start)
+            .num_milliseconds()
+            .max(0)
+    })
+}
+
+fn build_execution_window(run: &RuntimeVmRemediationRun) -> Option<LifecycleRunExecutionWindow> {
+    let started_at = run.analytics_execution_started_at.unwrap_or(run.started_at);
+    let completed_at = run
+        .analytics_execution_completed_at
+        .or(run.completed_at)
+        .or(run.cancelled_at);
+    Some(LifecycleRunExecutionWindow {
+        started_at,
+        completed_at,
     })
 }
 
@@ -2102,6 +2384,20 @@ fn compute_run_retry_limit(run: &RuntimeVmRemediationRun) -> Option<i64> {
     search_for_integer(&run.metadata, "retry_limit")
 }
 
+fn compute_retry_count(run: &RuntimeVmRemediationRun, retry_attempt: Option<i64>) -> Option<i64> {
+    if let Some(value) = run.analytics_retry_count {
+        return Some(i64::from(value.max(0)));
+    }
+
+    if let Some(Value::Array(entries)) = run.analytics_retry_ledger.as_ref() {
+        if !entries.is_empty() {
+            return Some(entries.len() as i64);
+        }
+    }
+
+    retry_attempt
+}
+
 fn compute_run_override_reason(run: &RuntimeVmRemediationRun) -> Option<String> {
     if let Some(notes) = run.approval_notes.clone() {
         if !notes.is_empty() {
@@ -2116,6 +2412,141 @@ fn compute_run_override_reason(run: &RuntimeVmRemediationRun) -> Option<String> 
         }
     }
     search_for_string(&run.promotion_gate_context, "override_reason")
+}
+
+fn build_retry_ledger(
+    run: &RuntimeVmRemediationRun,
+    retry_attempt: Option<i64>,
+) -> Vec<LifecycleRunRetryRecord> {
+    if let Some(Value::Array(entries)) = run.analytics_retry_ledger.as_ref() {
+        let mut records = Vec::new();
+        for entry in entries {
+            if let Some(map) = entry.as_object() {
+                if let Some(attempt) = map.get("attempt").and_then(Value::as_i64) {
+                    let status = map
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string());
+                    let reason = map
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string());
+                    let observed_at = map
+                        .get("observed_at")
+                        .and_then(Value::as_str)
+                        .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+                        .map(|dt| dt.with_timezone(&Utc));
+                    records.push(LifecycleRunRetryRecord {
+                        attempt,
+                        status,
+                        reason,
+                        observed_at,
+                    });
+                }
+            }
+        }
+
+        if !records.is_empty() {
+            records.sort_by_key(|record| record.attempt);
+            return records;
+        }
+    }
+
+    let mut records = Vec::new();
+    if let Some(attempt) = retry_attempt {
+        let observed_at = run
+            .analytics_execution_completed_at
+            .or(run.completed_at)
+            .or(run.cancelled_at)
+            .unwrap_or(run.updated_at);
+        records.push(LifecycleRunRetryRecord {
+            attempt,
+            status: Some(run.status.clone()),
+            reason: run.failure_reason.clone(),
+            observed_at: Some(observed_at),
+        });
+    }
+    records
+}
+
+fn build_manual_override(
+    run: &RuntimeVmRemediationRun,
+    override_reason: Option<String>,
+    actors: &HashMap<i32, OverrideActorRecord>,
+) -> Option<LifecycleRunOverride> {
+    let reason = override_reason?;
+    if reason.trim().is_empty() {
+        return None;
+    }
+
+    let actor_id = run.analytics_override_actor_id;
+    let actor_email = actor_id.and_then(|id| actors.get(&id).map(|record| record.email.clone()));
+
+    Some(LifecycleRunOverride {
+        reason,
+        actor_id,
+        actor_email,
+    })
+}
+
+fn derive_artifact_fingerprints(
+    artifacts: &[LifecycleRunArtifact],
+) -> Vec<LifecycleRunArtifactFingerprint> {
+    let mut fingerprints = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for artifact in artifacts {
+        let mut hasher = Sha256::new();
+        hasher.update(artifact.manifest_digest.as_bytes());
+        if let Some(lane) = &artifact.lane {
+            hasher.update(lane.as_bytes());
+        }
+        if let Some(stage) = &artifact.stage {
+            hasher.update(stage.as_bytes());
+        }
+        if let Some(tag) = &artifact.manifest_tag {
+            hasher.update(tag.as_bytes());
+        }
+        if let Some(image) = &artifact.registry_image {
+            hasher.update(image.as_bytes());
+        }
+
+        let digest = format!("{:x}", hasher.finalize());
+        let key = format!("{}:{digest}", artifact.manifest_digest);
+        if seen.insert(key) {
+            fingerprints.push(LifecycleRunArtifactFingerprint {
+                manifest_digest: artifact.manifest_digest.clone(),
+                fingerprint: digest,
+            });
+        }
+    }
+
+    fingerprints
+}
+
+fn make_promotion_verdict_ref(
+    verdict_id: i64,
+    posture: Option<&LifecyclePromotionPosture>,
+) -> LifecycleRunPromotionVerdictRef {
+    if let Some(posture) = posture {
+        LifecycleRunPromotionVerdictRef {
+            verdict_id,
+            promotion_id: Some(posture.promotion_id),
+            allowed: Some(posture.allowed),
+            stage: Some(posture.stage.clone()),
+            track_name: Some(posture.track_name.clone()),
+            track_tier: Some(posture.track_tier.clone()),
+        }
+    } else {
+        LifecycleRunPromotionVerdictRef {
+            verdict_id,
+            promotion_id: None,
+            allowed: None,
+            stage: None,
+            track_name: None,
+            track_tier: None,
+        }
+    }
 }
 
 fn extract_run_artifacts(run: &RuntimeVmRemediationRun) -> Vec<LifecycleRunArtifact> {
@@ -2283,9 +2714,9 @@ fn search_for_integer(value: &Value, key: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use chrono::{TimeZone, Utc};
     use serde_json::json;
+    use std::collections::HashMap;
 
     fn base_run() -> RuntimeVmRemediationRun {
         let now = Utc::now();
@@ -2314,6 +2745,14 @@ mod tests {
             cancelled_at: None,
             cancellation_reason: None,
             failure_reason: None,
+            analytics_duration_ms: None,
+            analytics_execution_started_at: None,
+            analytics_execution_completed_at: None,
+            analytics_retry_count: None,
+            analytics_retry_ledger: None,
+            analytics_override_actor_id: None,
+            analytics_artifact_hash: None,
+            analytics_promotion_verdict_id: None,
         }
     }
 
@@ -2353,7 +2792,10 @@ mod tests {
         assert_eq!(artifact.stage.as_deref(), Some("production"));
         assert_eq!(artifact.track_name.as_deref(), Some("release-alpha"));
         assert_eq!(artifact.track_tier.as_deref(), Some("pilot"));
-        assert_eq!(artifact.source_repo.as_deref(), Some("git@example.com/demo.git"));
+        assert_eq!(
+            artifact.source_repo.as_deref(),
+            Some("git@example.com/demo.git")
+        );
         assert_eq!(artifact.source_revision.as_deref(), Some("abcdef"));
     }
 
@@ -2387,7 +2829,10 @@ mod tests {
         assert_eq!(artifact.lane.as_deref(), Some("gate-lane"));
         assert_eq!(artifact.stage.as_deref(), Some("gate-stage"));
         assert_eq!(artifact.track_name.as_deref(), Some("release-beta"));
-        assert_eq!(artifact.source_repo.as_deref(), Some("git@example.com/demo.git"));
+        assert_eq!(
+            artifact.source_repo.as_deref(),
+            Some("git@example.com/demo.git")
+        );
     }
 
     #[test]
@@ -2426,7 +2871,10 @@ mod tests {
         let artifact = &artifacts[0];
         assert_eq!(artifact.manifest_tag.as_deref(), Some("v2"));
         assert_eq!(artifact.registry_image.as_deref(), Some("registry/app:v2"));
-        assert_eq!(artifact.source_repo.as_deref(), Some("git@example.com/demo.git"));
+        assert_eq!(
+            artifact.source_repo.as_deref(),
+            Some("git@example.com/demo.git")
+        );
         assert_eq!(artifact.source_revision.as_deref(), Some("1234567"));
         assert_eq!(artifact.build_status.as_deref(), Some("succeeded"));
         assert_eq!(artifact.completed_at, Some(timestamp));

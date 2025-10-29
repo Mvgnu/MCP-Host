@@ -78,9 +78,25 @@ export default function LifecycleRunDrilldownModal({ workspace, run, delta, onCl
               <p className="text-xs text-slate-600">
                 Status: <span className="font-medium text-slate-800">{run.run.status}</span>
               </p>
+              {typeof run.duration_ms === 'number' && (
+                <p className="text-xs text-slate-600">
+                  Duration (ms): <span className="font-medium">{Math.max(0, Math.floor(run.duration_ms))}</span>
+                </p>
+              )}
               {typeof run.duration_seconds === 'number' && (
                 <p className="text-xs text-slate-600">
                   Duration: <span className="font-medium">{formatDuration(run.duration_seconds)}</span>
+                </p>
+              )}
+              {run.execution_window && (
+                <p className="text-xs text-slate-600">
+                  Execution window:{' '}
+                  <span className="font-medium">
+                    {new Date(run.execution_window.started_at).toLocaleString()} →{' '}
+                    {run.execution_window.completed_at
+                      ? new Date(run.execution_window.completed_at).toLocaleString()
+                      : 'in-progress'}
+                  </span>
                 </p>
               )}
               {(typeof run.retry_attempt === 'number' || typeof run.retry_limit === 'number') && (
@@ -94,8 +110,56 @@ export default function LifecycleRunDrilldownModal({ workspace, run, delta, onCl
                   </span>
                 </p>
               )}
+              {typeof run.retry_count === 'number' && (
+                <p className="text-xs text-slate-600">
+                  Total attempts recorded: <span className="font-medium">{Math.floor(run.retry_count)}</span>
+                </p>
+              )}
+              {(run.retry_ledger ?? []).length > 0 && (
+                <div className="space-y-1">
+                  <p className="text-xs font-semibold text-slate-600">Retry ledger</p>
+                  <ul className="space-y-1 text-[11px] text-slate-600">
+                    {(run.retry_ledger ?? []).map((entry, index) => (
+                      <li key={`${entry.attempt}-${index}`}>
+                        <span className="font-medium">Attempt {Math.floor(entry.attempt)}</span>
+                        {entry.status && <span className="ml-1">· {entry.status}</span>}
+                        {entry.reason && <span className="ml-1 text-slate-500">({entry.reason})</span>}
+                        {entry.observed_at && (
+                          <span className="ml-1 text-slate-500">
+                            @ {new Date(entry.observed_at).toLocaleString()}
+                          </span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
               {run.override_reason && (
                 <p className="text-xs text-amber-600">Override reason: {run.override_reason}</p>
+              )}
+              {run.manual_override && (
+                <p className="text-xs text-amber-600">
+                  Manual override actor:{' '}
+                  <span className="font-medium">
+                    {run.manual_override.actor_email ??
+                      (typeof run.manual_override.actor_id === 'number'
+                        ? `user#${run.manual_override.actor_id}`
+                        : 'unknown')}
+                  </span>
+                </p>
+              )}
+              {run.promotion_verdict && (
+                <p className="text-xs text-emerald-600">
+                  Promotion verdict #{run.promotion_verdict.verdict_id}:{' '}
+                  {run.promotion_verdict.allowed === false
+                    ? 'blocked'
+                    : run.promotion_verdict.allowed === true
+                    ? 'allowed'
+                    : 'pending'}
+                  {run.promotion_verdict.stage && ` · stage:${run.promotion_verdict.stage}`}
+                  {run.promotion_verdict.track_name && ` · track:${run.promotion_verdict.track_name}`}
+                  {run.promotion_verdict.track_tier && ` · tier:${run.promotion_verdict.track_tier}`}
+                </p>
               )}
               {run.run.failure_reason && <p className="text-xs text-rose-600">Failure: {run.run.failure_reason}</p>}
               {run.run.last_error && <p className="text-xs text-rose-500">Last error: {run.run.last_error}</p>}
@@ -114,6 +178,18 @@ export default function LifecycleRunDrilldownModal({ workspace, run, delta, onCl
                         <span className="ml-1 text-slate-500">
                           {renderArtifactDetails(artifact)}
                         </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {(run.artifact_fingerprints ?? []).length > 0 && (
+                <div className="space-y-1">
+                  <p className="text-xs font-semibold text-slate-600">Artifact fingerprints</p>
+                  <ul className="space-y-1 text-[11px] text-slate-600">
+                    {(run.artifact_fingerprints ?? []).map((fingerprint) => (
+                      <li key={`${fingerprint.manifest_digest}-${fingerprint.fingerprint}`}>
+                        {fingerprint.manifest_digest} → {fingerprint.fingerprint}
                       </li>
                     ))}
                   </ul>

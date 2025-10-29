@@ -6,7 +6,7 @@ use backend::db::runtime_vm_remediation_workspaces::{
     create_workspace, CreateWorkspace, WorkspaceDetails,
 };
 use backend::db::runtime_vm_trust_registry::{upsert_state, UpsertRuntimeVmTrustRegistryState};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use hyper::{body::HttpBody, Body, Request, StatusCode};
 use serde_json::json;
 use sqlx::PgPool;
@@ -16,6 +16,8 @@ struct LifecycleFixture {
     workspace: WorkspaceDetails,
     owner_id: i32,
     manifest_digest: String,
+    run_id: i64,
+    promotion_id: i64,
 }
 
 async fn seed_lifecycle_fixture(pool: &PgPool) -> LifecycleFixture {
@@ -95,7 +97,7 @@ async fn seed_lifecycle_fixture(pool: &PgPool) -> LifecycleFixture {
             "stage": "production"
         }
     });
-    ensure_remediation_run(
+    let run = ensure_remediation_run(
         pool,
         EnsureRemediationRunRequest {
             runtime_vm_instance_id: vm_instance_id,
@@ -114,6 +116,35 @@ async fn seed_lifecycle_fixture(pool: &PgPool) -> LifecycleFixture {
     .await
     .unwrap()
     .expect("remediation run inserted");
+
+    let analytics_completed_at = run.started_at + Duration::minutes(3);
+    let retry_ledger = json!([
+        {
+            "attempt": 1,
+            "status": "failed",
+            "reason": "timeout",
+            "observed_at": (run.started_at + Duration::minutes(1)).to_rfc3339(),
+        },
+        {
+            "attempt": 2,
+            "status": "succeeded",
+            "observed_at": analytics_completed_at.to_rfc3339(),
+        },
+    ]);
+
+    sqlx::query(
+        "UPDATE runtime_vm_remediation_runs SET analytics_duration_ms = $1, analytics_execution_started_at = $2, analytics_execution_completed_at = $3, analytics_retry_count = $4, analytics_retry_ledger = $5, analytics_override_actor_id = $6 WHERE id = $7",
+    )
+    .bind(analytics_completed_at.signed_duration_since(run.started_at).num_milliseconds())
+    .bind(run.started_at)
+    .bind(analytics_completed_at)
+    .bind(2_i32)
+    .bind(retry_ledger)
+    .bind(owner_id)
+    .bind(run.id)
+    .execute(pool)
+    .await
+    .unwrap();
 
     upsert_state(
         pool,
@@ -197,8 +228,8 @@ async fn seed_lifecycle_fixture(pool: &PgPool) -> LifecycleFixture {
         }
     });
 
-    sqlx::query(
-        "INSERT INTO artifact_promotions (promotion_track_id, manifest_digest, stage, status, notes, posture_verdict) VALUES ($1, $2, $3, $4, $5, $6)",
+    let promotion_id: i64 = sqlx::query_scalar(
+        "INSERT INTO artifact_promotions (promotion_track_id, manifest_digest, stage, status, notes, posture_verdict) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
     )
     .bind(track_id)
     .bind(&manifest_digest)
@@ -206,6 +237,15 @@ async fn seed_lifecycle_fixture(pool: &PgPool) -> LifecycleFixture {
     .bind("scheduled")
     .bind(&vec!["console:seed".to_string()])
     .bind(&posture_verdict)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE runtime_vm_remediation_runs SET analytics_promotion_verdict_id = $1 WHERE id = $2",
+    )
+    .bind(promotion_id)
+    .bind(run.id)
     .execute(pool)
     .await
     .unwrap();
@@ -214,6 +254,8 @@ async fn seed_lifecycle_fixture(pool: &PgPool) -> LifecycleFixture {
         workspace,
         owner_id,
         manifest_digest,
+        run_id: run.id,
+        promotion_id,
     }
 }
 
@@ -276,6 +318,35 @@ async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
 
     let first_run = runs.first().expect("at least one run snapshot");
     assert!(first_run.get("duration_seconds").is_some());
+    assert!(first_run.get("duration_ms").is_some());
+    let execution_window = first_run
+        .get("execution_window")
+        .and_then(|value| value.as_object())
+        .expect("execution window present");
+    assert!(execution_window
+        .get("started_at")
+        .and_then(|value| value.as_str())
+        .is_some());
+    let retry_count = first_run
+        .get("retry_count")
+        .and_then(|value| value.as_i64())
+        .expect("retry count available");
+    assert_eq!(retry_count, 2);
+    let retry_ledger = first_run
+        .get("retry_ledger")
+        .and_then(|value| value.as_array())
+        .expect("retry ledger present");
+    assert!(!retry_ledger.is_empty());
+    let manual_override = first_run
+        .get("manual_override")
+        .and_then(|value| value.as_object())
+        .expect("manual override payload");
+    assert_eq!(
+        manual_override
+            .get("actor_email")
+            .and_then(|value| value.as_str()),
+        Some("console@example.com")
+    );
     let artifacts = first_run
         .get("artifacts")
         .and_then(|value| value.as_array())
@@ -287,12 +358,28 @@ async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
             .map(|digest| digest == fixture.manifest_digest)
             .unwrap_or(false)
     }));
+    let fingerprints = first_run
+        .get("artifact_fingerprints")
+        .and_then(|value| value.as_array())
+        .expect("fingerprints available");
+    assert!(!fingerprints.is_empty());
+    let verdict = first_run
+        .get("promotion_verdict")
+        .and_then(|value| value.as_object())
+        .expect("promotion verdict reference");
+    assert_eq!(
+        verdict.get("verdict_id").and_then(|value| value.as_i64()),
+        Some(fixture.promotion_id)
+    );
 
     let promotion_runs = snapshot
         .get("promotion_runs")
         .and_then(|value| value.as_array())
         .expect("promotion runs array");
-    assert!(!promotion_runs.is_empty(), "expected promotion automation runs");
+    assert!(
+        !promotion_runs.is_empty(),
+        "expected promotion automation runs"
+    );
 
     let promotion_postures = snapshot
         .get("promotion_postures")

@@ -23,10 +23,35 @@ export interface LifecycleRunSnapshot {
   intelligence: IntelligenceScoreOverview[];
   marketplace?: MarketplaceReadiness;
   duration_seconds?: number | null;
+  duration_ms?: number | null;
+  execution_window?: LifecycleRunExecutionWindow;
   retry_attempt?: number | null;
   retry_limit?: number | null;
+  retry_count?: number | null;
+  retry_ledger?: LifecycleRunRetryRecord[];
   override_reason?: string | null;
+  manual_override?: LifecycleRunOverride;
   artifacts?: LifecycleRunArtifact[];
+  artifact_fingerprints?: LifecycleRunArtifactFingerprint[];
+  promotion_verdict?: LifecycleRunPromotionVerdictRef;
+}
+
+export interface LifecycleRunExecutionWindow {
+  started_at: string;
+  completed_at?: string | null;
+}
+
+export interface LifecycleRunRetryRecord {
+  attempt: number;
+  status?: string | null;
+  reason?: string | null;
+  observed_at?: string | null;
+}
+
+export interface LifecycleRunOverride {
+  reason: string;
+  actor_id?: number | null;
+  actor_email?: string | null;
 }
 
 export interface IntelligenceScoreOverview {
@@ -63,6 +88,11 @@ export interface LifecycleRunArtifact {
   duration_seconds?: number | null;
 }
 
+export interface LifecycleRunArtifactFingerprint {
+  manifest_digest: string;
+  fingerprint: string;
+}
+
 export interface LifecycleConsoleEventEnvelope {
   type: 'snapshot' | 'heartbeat' | 'error';
   emitted_at: string;
@@ -94,6 +124,15 @@ export interface LifecycleRunDelta {
   marketplace_changes: LifecycleFieldChange[];
   analytics_changes: LifecycleFieldChange[];
   artifact_changes: LifecycleFieldChange[];
+}
+
+export interface LifecycleRunPromotionVerdictRef {
+  verdict_id: number;
+  promotion_id?: number | null;
+  allowed?: boolean | null;
+  stage?: string | null;
+  track_name?: string | null;
+  track_tier?: string | null;
 }
 
 export interface LifecyclePromotionPosture {
