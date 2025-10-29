@@ -332,7 +332,10 @@ export default function LifecycleConsolePage() {
         params.set('cursor', String(cursor));
       }
       appendFilters(params);
-      const es = new EventSource(`/api/console/lifecycle/stream?${params.toString()}`);
+      const es = new EventSource(
+        `/api/console/lifecycle/stream?${params.toString()}`,
+        { withCredentials: true },
+      );
       es.addEventListener('lifecycle-snapshot', (event) => {
         try {
           const envelope = JSON.parse((event as MessageEvent).data) as LifecycleConsoleEventEnvelope;
