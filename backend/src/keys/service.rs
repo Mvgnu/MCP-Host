@@ -6,8 +6,9 @@ use uuid::Uuid;
 
 use super::events::{ProviderKeyAuditEvent, ProviderKeyAuditEventType};
 use super::models::{
-    ProviderKeyBindingScope, ProviderKeyRecord, ProviderKeyRotationRecord,
-    ProviderKeyRotationStatus, ProviderKeyState, ProviderTierRequirement,
+    ProviderKeyBindingRecord, ProviderKeyBindingScope, ProviderKeyRecord,
+    ProviderKeyRotationRecord, ProviderKeyRotationStatus, ProviderKeyState,
+    ProviderTierRequirement,
 };
 use super::policy::ProviderKeyPolicySummary;
 
@@ -393,15 +394,165 @@ impl ProviderKeyService {
         Ok(())
     }
 
-    #[allow(unused_variables)]
     pub async fn record_binding(
         &self,
+        provider_id: Uuid,
         key_id: Uuid,
         scope: ProviderKeyBindingScope,
-    ) -> anyhow::Result<()> {
-        // TODO: Implement binding persistence and optimistic locking
-        let _ = (key_id, scope);
-        Ok(())
+    ) -> anyhow::Result<ProviderKeyBindingRecord> {
+        if scope.binding_type.trim().is_empty() {
+            bail!("binding type required");
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        let owner: Option<Uuid> =
+            sqlx::query_scalar("SELECT provider_id FROM provider_keys WHERE id = $1 FOR UPDATE")
+                .bind(key_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        let owner = owner.ok_or_else(|| anyhow!("provider key not found"))?;
+        if owner != provider_id {
+            bail!("provider mismatch");
+        }
+
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM provider_key_bindings WHERE provider_key_id = $1 AND binding_type = $2 AND binding_target_id = $3 AND revoked_at IS NULL",
+        )
+        .bind(key_id)
+        .bind(&scope.binding_type)
+        .bind(scope.binding_target_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if existing.is_some() {
+            bail!("binding already exists");
+        }
+
+        let now = chrono::Utc::now();
+        let binding_id = Uuid::new_v4();
+        let scope_payload = if scope.additional_context.is_null() {
+            json!({})
+        } else {
+            scope.additional_context
+        };
+
+        let row = sqlx::query_as::<_, ProviderKeyBindingRow>(
+            r#"INSERT INTO provider_key_bindings(id, provider_key_id, binding_type, binding_target_id, binding_scope, created_at, revoked_at, revoked_reason, version)
+            VALUES($1,$2,$3,$4,$5,$6,NULL,NULL,0)
+            RETURNING id, provider_key_id, binding_type, binding_target_id, binding_scope, created_at, revoked_at, revoked_reason, version"#,
+        )
+        .bind(binding_id)
+        .bind(key_id)
+        .bind(&scope.binding_type)
+        .bind(scope.binding_target_id)
+        .bind(&scope_payload)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let record = ProviderKeyBindingRecord::from(row);
+
+        let event = ProviderKeyAuditEvent {
+            id: Uuid::new_v4(),
+            provider_id,
+            provider_key_id: Some(key_id),
+            event_type: ProviderKeyAuditEventType::BindingAttached,
+            payload: json!({
+                "binding_type": record.binding_type,
+                "binding_target_id": record.binding_target_id,
+                "binding_scope": record.binding_scope,
+                "created_at": record.created_at,
+            }),
+            occurred_at: now,
+        };
+
+        sqlx::query(
+            "INSERT INTO provider_key_audit_events(id, provider_id, provider_key_id, event_type, payload, occurred_at) VALUES($1,$2,$3,$4,$5,$6)",
+        )
+        .bind(event.id)
+        .bind(event.provider_id)
+        .bind(event.provider_key_id)
+        .bind(event.event_type.as_str())
+        .bind(&event.payload)
+        .bind(event.occurred_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        if !self.config.notify_channel.is_empty() {
+            let payload = serde_json::to_string(&event)?;
+            sqlx::query("SELECT pg_notify($1, $2)")
+                .bind(&self.config.notify_channel)
+                .bind(payload)
+                .execute(&self.pool)
+                .await?;
+        }
+
+        Ok(record)
+    }
+
+    pub async fn list_bindings(
+        &self,
+        provider_id: Uuid,
+        key_id: Uuid,
+    ) -> anyhow::Result<Vec<ProviderKeyBindingRecord>> {
+        let owner: Option<Uuid> =
+            sqlx::query_scalar("SELECT provider_id FROM provider_keys WHERE id = $1")
+                .bind(key_id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        let owner = owner.ok_or_else(|| anyhow!("provider key not found"))?;
+        if owner != provider_id {
+            bail!("provider mismatch");
+        }
+
+        let rows = sqlx::query_as::<_, ProviderKeyBindingRow>(
+            r#"SELECT id, provider_key_id, binding_type, binding_target_id, binding_scope, created_at, revoked_at, revoked_reason, version
+            FROM provider_key_bindings
+            WHERE provider_key_id = $1
+            ORDER BY created_at DESC"#,
+        )
+        .bind(key_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(ProviderKeyBindingRecord::from)
+            .collect())
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ProviderKeyBindingRow {
+    pub id: Uuid,
+    pub provider_key_id: Uuid,
+    pub binding_type: String,
+    pub binding_target_id: Uuid,
+    pub binding_scope: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub revoked_reason: Option<String>,
+    pub version: i64,
+}
+
+impl From<ProviderKeyBindingRow> for ProviderKeyBindingRecord {
+    fn from(row: ProviderKeyBindingRow) -> Self {
+        Self {
+            id: row.id,
+            provider_key_id: row.provider_key_id,
+            binding_type: row.binding_type,
+            binding_target_id: row.binding_target_id,
+            binding_scope: row.binding_scope,
+            created_at: row.created_at,
+            revoked_at: row.revoked_at,
+            revoked_reason: row.revoked_reason,
+            version: row.version,
+        }
     }
 }
 
@@ -522,13 +673,14 @@ mod tests {
         let provider_id = Uuid::new_v4();
         let service = ProviderKeyService::new(pool.clone(), ProviderKeyServiceConfig::default());
 
-        let digest = base64::encode(b"runtime-veto-test");
+        let attestation = base64::encode(b"runtime-veto-test");
         let record = service
             .register_key(
                 provider_id,
                 RegisterProviderKey {
                     alias: Some("primary".to_string()),
-                    attestation_digest: Some(digest),
+                    attestation_digest: Some(attestation.clone()),
+                    attestation_signature: Some(attestation),
                     rotation_due_at: None,
                 },
             )
@@ -553,6 +705,85 @@ mod tests {
             .and_then(|value| value.as_array())
             .expect("notes array missing from payload");
         assert!(notes.iter().any(|value| value.as_str() == Some("missing")));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn record_binding_persists_binding_and_audit_event() -> anyhow::Result<()> {
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                eprintln!(
+                    "skipping record_binding_persists_binding_and_audit_event: DATABASE_URL not set",
+                );
+                return Ok(());
+            }
+        };
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await?;
+        sqlx::migrate!("../backend/migrations").run(&pool).await?;
+
+        let provider_id = Uuid::new_v4();
+        let service = ProviderKeyService::new(pool.clone(), ProviderKeyServiceConfig::default());
+
+        let attestation = base64::encode(b"binding-test");
+        let key = service
+            .register_key(
+                provider_id,
+                RegisterProviderKey {
+                    alias: Some("primary".to_string()),
+                    attestation_digest: Some(attestation.clone()),
+                    attestation_signature: Some(attestation.clone()),
+                    rotation_due_at: None,
+                },
+            )
+            .await?;
+
+        let target_id = Uuid::new_v4();
+        let binding = service
+            .record_binding(
+                provider_id,
+                key.id,
+                ProviderKeyBindingScope {
+                    binding_type: "workspace".to_string(),
+                    binding_target_id: target_id,
+                    additional_context: json!({"workspace_name": "alpha"}),
+                },
+            )
+            .await?;
+
+        assert_eq!(binding.provider_key_id, key.id);
+        assert_eq!(binding.binding_type, "workspace");
+        assert_eq!(binding.binding_target_id, target_id);
+        assert!(binding.revoked_at.is_none());
+
+        let listed = service
+            .list_bindings(provider_id, key.id)
+            .await?
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert!(!listed.is_empty());
+
+        let row = sqlx::query(
+            "SELECT event_type, payload FROM provider_key_audit_events WHERE provider_key_id = $1 AND event_type = 'binding_attached' ORDER BY occurred_at DESC LIMIT 1",
+        )
+        .bind(key.id)
+        .fetch_one(&pool)
+        .await?;
+
+        let event_type: String = row.get("event_type");
+        let payload: serde_json::Value = row.get("payload");
+        assert_eq!(event_type, "binding_attached");
+        assert_eq!(
+            payload
+                .get("binding_target_id")
+                .and_then(|value| value.as_str()),
+            Some(target_id.to_string().as_str())
+        );
 
         Ok(())
     }

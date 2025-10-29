@@ -7,8 +7,8 @@ pub mod service;
 
 pub use events::ProviderKeyAuditEvent;
 pub use models::{
-    ProviderKeyBindingScope, ProviderKeyDecisionPosture, ProviderKeyRecord,
-    ProviderKeyRotationRecord, ProviderKeyRotationStatus, ProviderKeyState,
+    ProviderKeyBindingRecord, ProviderKeyBindingScope, ProviderKeyDecisionPosture,
+    ProviderKeyRecord, ProviderKeyRotationRecord, ProviderKeyRotationStatus, ProviderKeyState,
     ProviderTierRequirement,
 };
 pub use policy::ProviderKeyPolicySummary;

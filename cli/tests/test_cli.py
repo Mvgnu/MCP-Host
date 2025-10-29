@@ -333,6 +333,72 @@ def test_keys_rotate_reports_stubbed_backend(
     assert "not yet implemented" in captured.err
 
 
+def test_keys_bind_attaches_binding_and_renders_table(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    FakeClient.responses[
+        ("POST", "/api/providers/provider-1/keys/key-2/bindings")
+    ] = {
+        "id": "binding-1",
+        "binding_type": "workspace",
+        "binding_target_id": "workspace-9",
+        "binding_scope": {"workspace_name": "alpha"},
+        "created_at": "2025-01-01T00:00:00Z",
+    }
+
+    cli_module.main(
+        [
+            "keys",
+            "bind",
+            "provider-1",
+            "key-2",
+            "--type",
+            "workspace",
+            "--target",
+            "workspace-9",
+            "--context",
+            '{"workspace_name":"alpha"}',
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert "binding-1" in output
+    method, path, body = FakeClient.calls[-1]
+    assert method == "POST"
+    assert path.endswith("/bindings")
+    assert body["binding_type"] == "workspace"
+    assert body["binding_target_id"] == "workspace-9"
+    assert body["additional_context"]["workspace_name"] == "alpha"
+
+
+def test_keys_bindings_lists_records(capsys: pytest.CaptureFixture[str]) -> None:
+    FakeClient.responses[
+        ("GET", "/api/providers/provider-2/keys/key-4/bindings")
+    ] = [
+        {
+            "id": "binding-7",
+            "binding_type": "runtime",
+            "binding_target_id": "runtime-19",
+            "created_at": "2025-02-01T00:00:00Z",
+        }
+    ]
+
+    cli_module.main([
+        "keys",
+        "bindings",
+        "provider-2",
+        "key-4",
+    ])
+
+    output = capsys.readouterr().out
+    assert "binding-7" in output
+    assert "runtime" in output
+    method, path, params = FakeClient.calls[-1]
+    assert method == "GET"
+    assert path.endswith("/bindings")
+    assert params == {}
+
+
 def test_lifecycle_list_renders_promotion_runs_table(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

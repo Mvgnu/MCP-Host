@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import base64
 import hashlib
@@ -75,12 +76,36 @@ def install(
     approve_parser.set_defaults(handler=_not_yet_available, operation="approve-rotation")
     add_common_arguments(approve_parser)
 
+    bind_parser = keys_sub.add_parser(
+        "bind", help="Attach a provider key to a workload scope"
+    )
+    bind_parser.add_argument("provider_id", help="Provider identifier")
+    bind_parser.add_argument("key_id", help="Key identifier")
+    bind_parser.add_argument(
+        "--type",
+        dest="binding_type",
+        required=True,
+        help="Binding type (e.g., workspace, runtime)",
+    )
+    bind_parser.add_argument(
+        "--target",
+        dest="binding_target_id",
+        required=True,
+        help="Target identifier for the binding",
+    )
+    bind_parser.add_argument(
+        "--context",
+        help="Optional JSON context describing the binding",
+    )
+    bind_parser.set_defaults(handler=_keys_bind)
+    add_common_arguments(bind_parser)
+
     bindings_parser = keys_sub.add_parser(
-        "bindings", help="List key bindings (stub handler)"
+        "bindings", help="List key bindings"
     )
     bindings_parser.add_argument("provider_id", help="Provider identifier")
     bindings_parser.add_argument("key_id", help="Key identifier")
-    bindings_parser.set_defaults(handler=_not_yet_available, operation="bindings")
+    bindings_parser.set_defaults(handler=_keys_bindings)
     add_common_arguments(bindings_parser)
 
     watch_parser = keys_sub.add_parser(
@@ -116,15 +141,17 @@ def _keys_register(client: APIClient, as_json: bool, args: Dict[str, object]) ->
     if as_json:
         print(dumps_json(record))
     else:
-        render_table(
-            [record],
-            columns=[
-                ("id", "Key ID"),
-                ("alias", "Alias"),
-                ("state", "State"),
-                ("rotation_due_at", "Rotation Due"),
-                ("activated_at", "Activated"),
-            ],
+        print(
+            render_table(
+                [record],
+                columns=[
+                    ("id", "Key ID"),
+                    ("alias", "Alias"),
+                    ("state", "State"),
+                    ("rotation_due_at", "Rotation Due"),
+                    ("activated_at", "Activated"),
+                ],
+            )
         )
 
 
@@ -141,15 +168,17 @@ def _keys_list(client: APIClient, as_json: bool, args: Dict[str, object]) -> Non
         return
 
     records = payload if isinstance(payload, list) else []
-    render_table(
-        records,
-        columns=[
-            ("id", "Key ID"),
-            ("alias", "Alias"),
-            ("state", "State"),
-            ("rotation_due_at", "Rotation Due"),
-            ("activated_at", "Activated"),
-        ],
+    print(
+        render_table(
+            records,
+            columns=[
+                ("id", "Key ID"),
+                ("alias", "Alias"),
+                ("state", "State"),
+                ("rotation_due_at", "Rotation Due"),
+                ("activated_at", "Activated"),
+            ],
+        )
     )
 
 
@@ -188,14 +217,106 @@ def _keys_rotate(client: APIClient, as_json: bool, args: Dict[str, object]) -> N
         print(dumps_json(rotation))
         return
 
-    render_table(
-        [rotation],
-        columns=[
-            ("id", "Rotation ID"),
-            ("status", "Status"),
-            ("requested_at", "Requested"),
-            ("request_actor_ref", "Actor"),
-        ],
+    print(
+        render_table(
+            [rotation],
+            columns=[
+                ("id", "Rotation ID"),
+                ("status", "Status"),
+                ("requested_at", "Requested"),
+                ("request_actor_ref", "Actor"),
+            ],
+        )
+    )
+
+
+def _keys_bind(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
+    provider_id = args["provider_id"]
+    key_id = args["key_id"]
+    binding_type = args.get("binding_type")
+    target_id = args.get("binding_target_id")
+
+    if not binding_type or not target_id:
+        print(
+            "Binding type and target are required to attach a provider key.",
+            file=sys.stderr,
+        )
+        return
+
+    context_raw = args.get("context")
+    additional_context: Dict[str, object]
+    if context_raw:
+        try:
+            parsed = json.loads(str(context_raw))
+            if not isinstance(parsed, dict):
+                raise ValueError("Binding context must be a JSON object")
+            additional_context = parsed
+        except ValueError as exc:
+            print(f"Invalid binding context: {exc}", file=sys.stderr)
+            return
+    else:
+        additional_context = {}
+
+    payload: Dict[str, object] = {
+        "binding_type": binding_type,
+        "binding_target_id": target_id,
+    }
+    if additional_context:
+        payload["additional_context"] = additional_context
+
+    try:
+        record = client.post(
+            f"/api/providers/{provider_id}/keys/{key_id}/bindings",
+            json_body=payload,
+        )
+    except APIError as exc:
+        _report_stubbed_feature("bind", exc)
+        return
+
+    if as_json:
+        print(dumps_json(record))
+        return
+
+    print(
+        render_table(
+            [record],
+            columns=[
+                ("id", "Binding ID"),
+                ("binding_type", "Type"),
+                ("binding_target_id", "Target"),
+                ("created_at", "Created"),
+            ],
+        )
+    )
+
+
+def _keys_bindings(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
+    provider_id = args["provider_id"]
+    key_id = args["key_id"]
+
+    try:
+        payload = client.get(
+            f"/api/providers/{provider_id}/keys/{key_id}/bindings"
+        )
+    except APIError as exc:
+        _report_stubbed_feature("bindings", exc)
+        return
+
+    records = payload if isinstance(payload, list) else []
+    if as_json:
+        print(dumps_json(records))
+        return
+
+    print(
+        render_table(
+            records,
+            columns=[
+                ("id", "Binding ID"),
+                ("binding_type", "Type"),
+                ("binding_target_id", "Target"),
+                ("created_at", "Created"),
+            ],
+        )
     )
 
 

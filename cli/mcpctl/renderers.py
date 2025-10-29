@@ -4,25 +4,34 @@
 from __future__ import annotations
 
 import json
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Mapping, Sequence, Union
 
 Row = Mapping[str, object]
+Column = Union[str, tuple[str, str]]
 
 
-def to_rows(items: Iterable[Mapping[str, object]], columns: Sequence[str]) -> list[list[str]]:
-    table: list[list[str]] = []
+def _column_key(column: Column) -> str:
+    return column[0] if isinstance(column, tuple) else column
+
+
+def _column_label(column: Column) -> str:
+    if isinstance(column, tuple):
+        return column[1]
+    return column
+
+
+def render_table(items: Iterable[Mapping[str, object]], columns: Sequence[Column]) -> str:
+    keys = [_column_key(column) for column in columns]
+    labels = [_column_label(column) for column in columns]
+    rows: list[list[str]] = []
     for item in items:
-        table.append([_stringify(item.get(column, "")) for column in columns])
-    return table
+        rows.append([_stringify(item.get(key, "")) for key in keys])
 
-
-def render_table(items: Iterable[Mapping[str, object]], columns: Sequence[str]) -> str:
-    rows = to_rows(items, columns)
-    widths = [len(column) for column in columns]
+    widths = [len(label) for label in labels]
     for row in rows:
         for idx, cell in enumerate(row):
             widths[idx] = max(widths[idx], len(cell))
-    header = " ".join(column.ljust(widths[idx]) for idx, column in enumerate(columns))
+    header = " ".join(labels[idx].ljust(widths[idx]) for idx in range(len(labels)))
     separator = " ".join("-" * widths[idx] for idx in range(len(columns)))
     lines = [header, separator]
     for row in rows:

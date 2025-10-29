@@ -54,6 +54,21 @@ pub struct ProviderKeyBindingScope {
     pub additional_context: Value,
 }
 
+/// key: provider-keys-binding-record
+/// Durable binding record persisted for each attached scope.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProviderKeyBindingRecord {
+    pub id: Uuid,
+    pub provider_key_id: Uuid,
+    pub binding_type: String,
+    pub binding_target_id: Uuid,
+    pub binding_scope: Value,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub revoked_reason: Option<String>,
+    pub version: i64,
+}
+
 /// key: provider-keys-tier-requirement
 /// Declares BYOK requirements for a runtime policy tier.
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -19,3 +19,4 @@
     - 2025-12-12 16:10:00 UTC: Runtime orchestrator blocks launches on vetoed posture, records `runtime_veto` audit events, and surfaces posture-specific pending statuses for operators.
     - 2025-12-12 17:25:00 UTC: Required signed attestation bundles with verification timestamps, enforced rotation actor capture, and propagated signature posture across backend, CLI, and docs.
     - 2025-12-12 18:40:00 UTC: Lifecycle console SSE now streams provider key posture and deltas; UI badges, overlays, and tests surface BYOK state, vetoes, and attestation notes alongside trust analytics.
+    - 2025-12-12 19:55:00 UTC: Delivered provider key binding persistence, REST/CLI endpoints, audit fan-out, and regression tests so workloads can declare BYOK coverage without leaving the CLI.

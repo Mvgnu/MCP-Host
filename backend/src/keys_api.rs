@@ -5,6 +5,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
+use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -12,8 +13,9 @@ use base64::DecodeError;
 use chrono::{DateTime, Utc};
 
 use crate::keys::{
-    ProviderKeyRecord, ProviderKeyRotationRecord, ProviderKeyService, ProviderKeyServiceConfig,
-    RegisterProviderKey, RequestKeyRotation,
+    ProviderKeyBindingRecord, ProviderKeyBindingScope, ProviderKeyRecord,
+    ProviderKeyRotationRecord, ProviderKeyService, ProviderKeyServiceConfig, RegisterProviderKey,
+    RequestKeyRotation,
 };
 
 /// key: provider-keys-api
@@ -27,6 +29,10 @@ pub fn routes() -> Router {
         .route(
             "/api/providers/:provider_id/keys/:key_id/rotations",
             post(request_rotation),
+        )
+        .route(
+            "/api/providers/:provider_id/keys/:key_id/bindings",
+            get(list_bindings).post(create_binding),
         )
 }
 
@@ -112,6 +118,59 @@ async fn request_rotation(
     Ok(Json(rotation))
 }
 
+async fn create_binding(
+    Extension(pool): Extension<PgPool>,
+    Path((provider_id, key_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<RecordBindingRequest>,
+) -> Result<Json<ProviderKeyBindingRecord>, StatusCode> {
+    let service = ProviderKeyService::new(pool, ProviderKeyServiceConfig::default());
+    let scope = ProviderKeyBindingScope {
+        binding_type: payload.binding_type,
+        binding_target_id: payload.binding_target_id,
+        additional_context: payload.additional_context.unwrap_or_else(|| json!({})),
+    };
+
+    let record = service
+        .record_binding(provider_id, key_id, scope)
+        .await
+        .map_err(|err| {
+            if err.to_string().contains("binding type") {
+                StatusCode::BAD_REQUEST
+            } else if err.to_string().contains("already exists") {
+                StatusCode::CONFLICT
+            } else if err.to_string().contains("not found") {
+                StatusCode::NOT_FOUND
+            } else if err.to_string().contains("provider mismatch") {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::NOT_IMPLEMENTED
+            }
+        })?;
+
+    Ok(Json(record))
+}
+
+async fn list_bindings(
+    Extension(pool): Extension<PgPool>,
+    Path((provider_id, key_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Vec<ProviderKeyBindingRecord>>, StatusCode> {
+    let service = ProviderKeyService::new(pool, ProviderKeyServiceConfig::default());
+    let bindings = service
+        .list_bindings(provider_id, key_id)
+        .await
+        .map_err(|err| {
+            if err.to_string().contains("not found") {
+                StatusCode::NOT_FOUND
+            } else if err.to_string().contains("provider mismatch") {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::NOT_IMPLEMENTED
+            }
+        })?;
+
+    Ok(Json(bindings))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RegisterKeyRequest {
     pub alias: Option<String>,
@@ -125,6 +184,14 @@ pub struct RequestRotation {
     pub attestation_digest: Option<String>,
     pub attestation_signature: Option<String>,
     pub request_actor_ref: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecordBindingRequest {
+    pub binding_type: String,
+    pub binding_target_id: Uuid,
+    #[serde(default)]
+    pub additional_context: Option<serde_json::Value>,
 }
 
 fn parse_rotation_due(input: &str) -> Result<DateTime<Utc>, StatusCode> {

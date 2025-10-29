@@ -74,6 +74,7 @@ Implementation steps:
 - Add client wrappers under `cli/mcpctl/keys.py` (or analogous module) that reuse existing HTTP client scaffolding.
 - Record snapshot tests in `cli/tests/test_keys_*.py` verifying JSON payloads and optimistic-lock headers.
 - Update CLI README with usage and parity guarantees.
+- Status: `register`, `list`, `rotate`, `bind`, and `bindings` now return live data backed by the REST service; `approve-rotation` and `watch` remain staged as placeholders pending backend orchestration.
 
 ## Console & Provider Portal
 - Inject BYOK posture into lifecycle console cards inside `frontend/components/console/` with badges for `rotation overdue`, `attestation missing`, and `compromised` states.

@@ -50,7 +50,9 @@ Lists marketplace artifacts and their active status. Pass `--json` to receive ra
 * `mcpctl keys register PROVIDER_ID [--alias LABEL] --attestation PATH [--rotation-due RFC3339]` – registers a provider key, hashing the attestation bundle locally, base64-encoding the bundle as a signature, and forwarding both values with an optional rotation deadline to the backend. The endpoint still advertises `501 Not Implemented` while migrations roll out, but successful environments return the persisted record including signature posture metadata.
 * `mcpctl keys list PROVIDER_ID` – lists provider key posture records. The command prints a friendly notice when the backend still returns `501`.
 * `mcpctl keys rotate PROVIDER_ID KEY_ID --attestation PATH --actor-ref REF` – requests a rotation for an active provider key. The CLI hashes the attestation bundle, forwards a base64 signature, and requires an operator reference for downstream audit trails, matching the backend rotation contract.
-* Additional subcommands (`rotate`, `approve-rotation`, `bindings`, `watch`) are scaffolded as placeholders and currently emit guidance in lieu of live endpoints.
+* `mcpctl keys bind PROVIDER_ID KEY_ID --type TYPE --target TARGET [--context JSON]` – attaches a provider key to a workload scope (e.g., workspace or runtime), parsing optional JSON context for audit metadata and surfacing the persisted binding record.
+* `mcpctl keys bindings PROVIDER_ID KEY_ID [--json]` – lists active bindings for a provider key, including binding type, target identifiers, and creation timestamps for operators reconciling workload coverage.
+* Additional subcommands (`approve-rotation`, `watch`) remain scaffolded placeholders while backend orchestration endpoints are staged.
 
 ### Policy insights
 
