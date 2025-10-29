@@ -32,11 +32,22 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to see the
   enabling scoped investigations and shared context between browser sessions.
 - Snapshot envelopes include delta metadata. The UI renders recent trust/intelligence/marketplace changes on each run and opens a
   drill-down modal with threaded timelines, metadata, and replay context.
+- BYOK posture arrives alongside run analytics. `LifecycleRunSnapshot` now exposes `provider_key_posture` so progress cards,
+  drill-down modals, and trust overlays render provider key badges, veto states, attestation signals, and change logs directly
+  from the SSE contract.
 - When streaming is unavailable or the browser goes offline the UI falls back to a 15s REST polling loop. Cursor state, filters,
   recent snapshots, and run deltas hydrate from local storage so operators can resume where they left off once connectivity
   returns.
 - Playwright regression coverage for filters, offline resume, and SSE replay semantics lives in `e2e/console.spec.ts`; run
   `npx playwright test e2e/console.spec.ts` against a running development server to capture updated expectations.
+
+### Provider BYOK staging
+
+- Shared helper stubs in `frontend/lib/byok.ts` define the provider key contract (`ProviderKeyRecord`, posture helpers) and
+  currently throw a descriptive error until the backend endpoints ship. Console and provider portal features should consume these
+  helpers so the contract remains centralized.
+- `ProviderKeyDecisionPosture` mirrors the backend `key_posture` payload persisted with runtime policy decisions so SSE consumers can render BYOK state (active/rotating, rotation deadlines, signature verification posture, veto notes) without duplicating contract mapping.
+- Jest coverage in `frontend/lib/byok.test.ts` asserts rotation posture helpers behave deterministically before UI wiring lands.
 
 ### Testing & Coverage
 

@@ -1,4 +1,5 @@
 // key: lifecycle-console-ui -> data-contract
+import type { ProviderKeyDecisionPosture } from './byok';
 export interface LifecycleConsolePage {
   workspaces: LifecycleWorkspaceSnapshot[];
   next_cursor?: number | null;
@@ -22,6 +23,7 @@ export interface LifecycleRunSnapshot {
   trust?: TrustRegistryState;
   intelligence: IntelligenceScoreOverview[];
   marketplace?: MarketplaceReadiness;
+  provider_key_posture?: ProviderKeyDecisionPosture;
   duration_seconds?: number | null;
   duration_ms?: number | null;
   execution_window?: LifecycleRunExecutionWindow;
@@ -124,6 +126,7 @@ export interface LifecycleRunDelta {
   marketplace_changes: LifecycleFieldChange[];
   analytics_changes: LifecycleFieldChange[];
   artifact_changes: LifecycleFieldChange[];
+  provider_key_changes: LifecycleFieldChange[];
 }
 
 export interface LifecycleRunPromotionVerdictRef {

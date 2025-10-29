@@ -33,6 +33,7 @@ function ChangeGroup({ title, changes }: { title: string; changes: LifecycleFiel
 export default function LifecycleTrustOverlay({ run, delta }: Props) {
   const trust = run.trust;
   const marketplace = run.marketplace;
+  const providerKey = run.provider_key_posture;
   const changeGroups = delta
     ? (
         [
@@ -41,11 +42,12 @@ export default function LifecycleTrustOverlay({ run, delta }: Props) {
           { title: 'Marketplace changes', entries: delta.marketplace_changes },
           { title: 'Analytics changes', entries: delta.analytics_changes },
           { title: 'Artifact changes', entries: delta.artifact_changes },
+          { title: 'Provider key changes', entries: delta.provider_key_changes },
         ] as { title: string; entries: LifecycleFieldChange[] }[]
       ).filter((group) => group.entries.length > 0)
     : [];
   return (
-    <div className="grid gap-2 md:grid-cols-4 text-xs mt-2">
+    <div className="grid gap-2 md:grid-cols-5 text-xs mt-2">
       <div className="bg-slate-50 border border-slate-200 rounded p-2">
         <p className="font-semibold text-slate-700">Trust</p>
         {trust ? (
@@ -82,6 +84,30 @@ export default function LifecycleTrustOverlay({ run, delta }: Props) {
           </ul>
         ) : (
           <p className="text-slate-500">No marketplace readiness captured.</p>
+        )}
+      </div>
+      <div className="bg-slate-50 border border-slate-200 rounded p-2">
+        <p className="font-semibold text-slate-700">Provider key</p>
+        {providerKey ? (
+          <ul className="mt-1 space-y-1">
+            <li>Provider: {providerKey.provider_id}</li>
+            {providerKey.provider_key_id && <li>Key: {providerKey.provider_key_id}</li>}
+            {providerKey.tier && <li>Tier: {providerKey.tier}</li>}
+            {providerKey.state && <li>State: {providerKey.state.replace(/_/g, ' ')}</li>}
+            <li>Vetoed: {providerKey.vetoed ? 'yes' : 'no'}</li>
+            {providerKey.rotation_due_at && (
+              <li>Rotation due: {new Date(providerKey.rotation_due_at).toLocaleString()}</li>
+            )}
+            <li>
+              Attestation: {providerKey.attestation_registered ? 'registered' : 'missing'} · signature{' '}
+              {providerKey.attestation_signature_verified ? 'verified' : 'unverified'}
+            </li>
+            {providerKey.notes && providerKey.notes.length > 0 && (
+              <li>Notes: {providerKey.notes.join(', ')}</li>
+            )}
+          </ul>
+        ) : (
+          <p className="text-slate-500">No BYOK posture recorded.</p>
         )}
       </div>
       <div className="bg-slate-50 border border-slate-200 rounded p-2">

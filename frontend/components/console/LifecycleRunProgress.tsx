@@ -130,6 +130,33 @@ function summarizePromotion(verdict?: LifecycleRunSnapshot['promotion_verdict'])
   return parts.join(' · ');
 }
 
+function summarizeProviderKey(posture?: LifecycleRunSnapshot['provider_key_posture']) {
+  if (!posture) {
+    return undefined;
+  }
+  const parts: string[] = [];
+  if (posture.state) {
+    parts.push(posture.state.replace(/_/g, ' '));
+  }
+  if (!posture.attestation_registered) {
+    parts.push('attestation-missing');
+  } else if (!posture.attestation_signature_verified) {
+    parts.push('signature-unverified');
+  }
+  parts.push(posture.vetoed ? 'vetoed' : 'clear');
+  if (posture.rotation_due_at) {
+    const deadline = new Date(posture.rotation_due_at);
+    if (!Number.isNaN(deadline.getTime())) {
+      parts.push(`rotation:${deadline.toLocaleDateString()}`);
+    }
+  }
+  if (posture.notes && posture.notes.length > 0) {
+    const preview = posture.notes.slice(0, 2).join('|');
+    parts.push(`notes:${preview}`);
+  }
+  return parts.join(' · ');
+}
+
 export default function LifecycleRunProgress({ run, onSelect }: Props) {
   const statusBadge = useMemo(() => {
     const status = run.run.status;
@@ -152,6 +179,7 @@ export default function LifecycleRunProgress({ run, onSelect }: Props) {
     formatDurationMs(run.duration_ms ?? null) ??
     formatDurationSeconds(run.duration_seconds ?? null) ??
     fallbackDuration(startedAt, completedAt);
+  const providerKeySummary = summarizeProviderKey(run.provider_key_posture);
 
   return (
     <div className="border border-slate-200 rounded p-3 bg-white shadow-sm">
@@ -213,6 +241,17 @@ export default function LifecycleRunProgress({ run, onSelect }: Props) {
         {summarizePromotion(run.promotion_verdict) && (
           <span className="rounded border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-emerald-700">
             {summarizePromotion(run.promotion_verdict)}
+          </span>
+        )}
+        {providerKeySummary && run.provider_key_posture && (
+          <span
+            className={`rounded border px-2 py-0.5 ${
+              run.provider_key_posture.vetoed
+                ? 'border-rose-200 bg-rose-50 text-rose-600'
+                : 'border-emerald-200 bg-emerald-50 text-emerald-700'
+            }`}
+          >
+            BYOK {providerKeySummary}
           </span>
         )}
         {summarizeFingerprints(run) && (

@@ -5,7 +5,7 @@ use axum::{
 
 use crate::{
     auth, capabilities, domains, evaluation, file_store, governance, ingestion, intelligence,
-    invocations, lifecycle_console, marketplace, organizations, policy, promotions,
+    invocations, keys_api, lifecycle_console, marketplace, organizations, policy, promotions,
     remediation_api, secrets, servers, services, trust, vector_dbs, workflows,
 };
 
@@ -213,6 +213,7 @@ pub fn api_routes() -> Router {
             get(remediation_api::stream_remediation_events),
         )
         .route("/api/policy/stream", get(policy::stream_policy_events))
+        .merge(keys_api::routes())
         .merge(governance::routes())
         .merge(promotions::routes())
         .merge(workflows::routes())

@@ -26,6 +26,23 @@ Enabling the libvirt executor also requires building the backend with the `libvi
 ## Secret Rotation
 Passwords can be rotated without restarts by updating `LIBVIRT_PASSWORD_FILE` to point at the new secret and sending a SIGHUP (or restarting the process). The runtime records only sanitized snapshots of credentials in `runtime_vm_instances`, ensuring API consumers see whether secrets were supplied without exposing raw values.
 
+## Provider BYOK staging surface
+
+The provider bring-your-own-key (BYOK) fabric is being staged to satisfy managed SaaS compliance requirements. Migration `0041_provider_keys.sql` introduces the initial persistence layout:
+
+- `provider_keys` persists provider-scoped key posture (`state`, rotation deadlines, attestation digests, signature presence, verification timestamps) with optimistic locking metadata.
+- `provider_key_rotations` records rotation attempts, evidence URIs, attestation digests/signatures, request/approval actors, and failure reasons.
+- `provider_key_bindings` tracks which artifacts, workspaces, or runtime decisions rely on a particular key version.
+- `provider_key_audit_events` stores durable JSON audit events that power SSE/CLI streams and compliance exports.
+
+The Rust scaffolding lives in `backend/src/keys/` and exposes a `ProviderKeyService` (`key: provider-keys-service`) alongside contract types for API/CLI parity. Registration now requires attestation digests (base64 encoded SHA-256) plus matching attestation signatures, recording a verification timestamp before activating the key. Rotation requests can be submitted via `POST /api/providers/:provider_id/keys/:key_id/rotations`, which captures the attestation digest/signature pair, enforces a non-empty operator reference, flips the key into the `rotating` posture, and emits a `provider-keys-audit-event` entry tagged `rotation_requested`. REST handlers in `backend/src/keys_api.rs` validate digest/signature encodings, surface missing keys as `404`, reject inactive keys with `409`, and otherwise fall back to the previous `501 Not Implemented` status while runtime enforcement is being stitched together. Downstream surfaces should rely on the machine-readable `key:` annotations when binding to the contract.
+
+Runtime policy now honors BYOK requirements declared in the `provider_tiers` table (migration `0042_provider_tier_requirements.sql`). Each row maps a tier string to a provider UUID plus a `byok_required` flag so compliance-sensitive stages can demand active keys. Decisions persisted in `runtime_policy_decisions` include a `key_posture` JSON payload (see `key: provider-keys-decision-posture`) describing the evaluated key, rotation deadline, veto notes, and whether the launch was blocked. The policy engine annotates decisions with `provider-key:*` notes whenever BYOK posture contributes to a veto, allowing lifecycle analytics, CLI streaming, and SSE consumers to surface key health alongside governance and evaluation metadata.
+
+The runtime orchestrator now respects the recorded BYOK posture before launching workloads. When the policy engine reports a vetoed posture, the orchestrator halts the launch, updates the server lifecycle to `pending-key-registration`, `pending-key-activation`, or `pending-key-rotation` (based on posture notes), and emits a `runtime_veto` audit event via `ProviderKeyService::record_runtime_veto`. These audit entries reuse the service's notification channel so forthcoming SSE streams can react without additional plumbing.
+
+The lifecycle console aggregation layer (`backend/src/lifecycle_console/mod.rs`) now loads the latest `runtime_policy_decisions` posture for every workspace run surfaced in SSE snapshots. Each `LifecycleRunSnapshot` carries an optional `provider_key_posture` mirror of the backend contract, and deltas include a `provider_key_changes` array that tracks state, rotation deadlines, attestation signals, and veto transitions. Downstream UI components consume the serialized posture to render BYOK badges and change logs alongside trust, intelligence, and marketplace analytics.
+
 ## Troubleshooting Console Access
 If log retrieval returns empty output, verify `LIBVIRT_CONSOLE_SOURCE` matches the domain's serial device configuration and that `LIBVIRT_LOG_TAIL` is large enough to capture recent lines. The new streaming test covers channel setup end-to-end; if streaming fails in production, confirm `virtlogd` is running and that SELinux/AppArmor policies allow read access to the console device.
 

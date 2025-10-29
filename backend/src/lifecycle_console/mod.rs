@@ -24,6 +24,7 @@ use crate::db::runtime_vm_remediation_workspaces::{
 };
 use crate::db::runtime_vm_trust_registry::RuntimeVmTrustRegistryState;
 use crate::error::{AppError, AppResult};
+use crate::keys::models::ProviderKeyDecisionPosture;
 
 // key: lifecycle-console -> aggregation,data-plane
 
@@ -132,6 +133,8 @@ pub struct LifecycleRunSnapshot {
     pub intelligence: Vec<IntelligenceScoreOverview>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub marketplace: Option<MarketplaceReadiness>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_key_posture: Option<ProviderKeyDecisionPosture>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_seconds: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -264,6 +267,8 @@ pub struct LifecycleRunDelta {
     pub analytics_changes: Vec<LifecycleFieldChange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifact_changes: Vec<LifecycleFieldChange>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_key_changes: Vec<LifecycleFieldChange>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -399,6 +404,12 @@ struct MarketplaceRow {
     pub manifest_tag: Option<String>,
     pub registry_image: Option<String>,
     pub duration_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ProviderKeyPostureRow {
+    pub server_id: i32,
+    pub key_posture: Option<Value>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -685,6 +696,7 @@ pub async fn fetch_page(
 
     let intelligence_scores = load_intelligence_scores(pool, &server_ids).await?;
     let marketplace = load_marketplace(pool, &server_ids).await?;
+    let provider_key_postures = load_provider_key_postures(pool, &server_ids).await?;
     let override_actors = load_override_actors(pool, &override_actor_ids).await?;
 
     let mut snapshots = Vec::with_capacity(workspaces.len());
@@ -719,6 +731,9 @@ pub async fn fetch_page(
             let marketplace_state = instance_rows
                 .get(&instance_id)
                 .and_then(|row| marketplace.get(&row.server_id).cloned());
+            let provider_key_posture = instance_rows
+                .get(&instance_id)
+                .and_then(|row| provider_key_postures.get(&row.server_id).cloned());
 
             let duration_seconds = compute_run_duration(&run);
             let duration_ms = compute_run_duration_ms(&run);
@@ -737,6 +752,7 @@ pub async fn fetch_page(
                 trust,
                 intelligence,
                 marketplace: marketplace_state,
+                provider_key_posture,
                 duration_seconds,
                 duration_ms,
                 execution_window,
@@ -1576,6 +1592,10 @@ fn diff_runs(
             previous_snapshot.and_then(|s| s.marketplace.as_ref()),
             run.marketplace.as_ref(),
         );
+        let provider_key_changes = diff_provider_key_posture(
+            previous_snapshot.and_then(|s| s.provider_key_posture.as_ref()),
+            run.provider_key_posture.as_ref(),
+        );
         let analytics_changes = diff_run_analytics(previous_snapshot, run);
         let artifact_changes = diff_run_artifacts(previous_snapshot, run);
         let previous_status = previous_snapshot.map(|s| s.run.status.clone());
@@ -1584,6 +1604,7 @@ fn diff_runs(
             || !trust_changes.is_empty()
             || !intelligence_changes.is_empty()
             || !marketplace_changes.is_empty()
+            || !provider_key_changes.is_empty()
             || !analytics_changes.is_empty()
             || !artifact_changes.is_empty();
 
@@ -1596,6 +1617,7 @@ fn diff_runs(
                 marketplace_changes,
                 analytics_changes,
                 artifact_changes,
+                provider_key_changes,
             });
         }
     }
@@ -2106,6 +2128,132 @@ fn diff_marketplace(
             );
         }
     }
+    changes
+}
+
+fn diff_provider_key_posture(
+    previous: Option<&ProviderKeyDecisionPosture>,
+    current: Option<&ProviderKeyDecisionPosture>,
+) -> Vec<LifecycleFieldChange> {
+    let mut changes = Vec::new();
+
+    let prev_provider_id = previous.map(|posture| posture.provider_id.to_string());
+    let current_provider_id = current.map(|posture| posture.provider_id.to_string());
+    push_change(
+        &mut changes,
+        "provider_key.provider_id",
+        prev_provider_id,
+        current_provider_id,
+    );
+
+    let prev_provider_key_id = previous
+        .and_then(|posture| posture.provider_key_id)
+        .map(|id| id.to_string());
+    let current_provider_key_id = current
+        .and_then(|posture| posture.provider_key_id)
+        .map(|id| id.to_string());
+    push_change(
+        &mut changes,
+        "provider_key.provider_key_id",
+        prev_provider_key_id,
+        current_provider_key_id,
+    );
+
+    let prev_tier = previous.and_then(|posture| posture.tier.clone());
+    let current_tier = current.and_then(|posture| posture.tier.clone());
+    push_change(&mut changes, "provider_key.tier", prev_tier, current_tier);
+
+    let prev_state = previous
+        .and_then(|posture| posture.state)
+        .map(|state| state.as_str().to_string());
+    let current_state = current
+        .and_then(|posture| posture.state)
+        .map(|state| state.as_str().to_string());
+    push_change(
+        &mut changes,
+        "provider_key.state",
+        prev_state,
+        current_state,
+    );
+
+    let prev_vetoed = previous.map(|posture| posture.vetoed.to_string());
+    let current_vetoed = current.map(|posture| posture.vetoed.to_string());
+    push_change(
+        &mut changes,
+        "provider_key.vetoed",
+        prev_vetoed,
+        current_vetoed,
+    );
+
+    let prev_rotation_due = previous
+        .and_then(|posture| posture.rotation_due_at)
+        .map(|dt| dt.to_rfc3339());
+    let current_rotation_due = current
+        .and_then(|posture| posture.rotation_due_at)
+        .map(|dt| dt.to_rfc3339());
+    push_change(
+        &mut changes,
+        "provider_key.rotation_due_at",
+        prev_rotation_due,
+        current_rotation_due,
+    );
+
+    let prev_attestation_registered =
+        previous.map(|posture| posture.attestation_registered.to_string());
+    let current_attestation_registered =
+        current.map(|posture| posture.attestation_registered.to_string());
+    push_change(
+        &mut changes,
+        "provider_key.attestation_registered",
+        prev_attestation_registered,
+        current_attestation_registered,
+    );
+
+    let prev_signature_verified =
+        previous.map(|posture| posture.attestation_signature_verified.to_string());
+    let current_signature_verified =
+        current.map(|posture| posture.attestation_signature_verified.to_string());
+    push_change(
+        &mut changes,
+        "provider_key.attestation_signature_verified",
+        prev_signature_verified,
+        current_signature_verified,
+    );
+
+    let prev_verified_at = previous
+        .and_then(|posture| posture.attestation_verified_at)
+        .map(|dt| dt.to_rfc3339());
+    let current_verified_at = current
+        .and_then(|posture| posture.attestation_verified_at)
+        .map(|dt| dt.to_rfc3339());
+    push_change(
+        &mut changes,
+        "provider_key.attestation_verified_at",
+        prev_verified_at,
+        current_verified_at,
+    );
+
+    let prev_notes = previous.and_then(|posture| {
+        if posture.notes.is_empty() {
+            None
+        } else {
+            Some(posture.notes.join(","))
+        }
+    });
+    let current_notes = current.and_then(|posture| {
+        if posture.notes.is_empty() {
+            None
+        } else {
+            Some(posture.notes.join(","))
+        }
+    });
+    push_change(
+        &mut changes,
+        "provider_key.notes",
+        prev_notes,
+        current_notes,
+    );
+
     changes
 }
 
@@ -2993,4 +3141,51 @@ async fn load_marketplace(
             )
         })
         .collect())
+}
+
+async fn load_provider_key_postures(
+    pool: &PgPool,
+    server_ids: &HashSet<i32>,
+) -> Result<HashMap<i32, ProviderKeyDecisionPosture>, AppError> {
+    if server_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows: Vec<ProviderKeyPostureRow> = query_as(
+        r#"
+        SELECT server_id, key_posture
+        FROM (
+            SELECT
+                server_id,
+                key_posture,
+                ROW_NUMBER() OVER (PARTITION BY server_id ORDER BY decided_at DESC NULLS LAST) AS row_number
+            FROM runtime_policy_decisions
+            WHERE server_id = ANY($1)
+        ) ranked
+        WHERE ranked.row_number = 1
+        "#,
+    )
+    .bind(server_ids.iter().copied().collect::<Vec<_>>())
+    .fetch_all(pool)
+    .await?;
+
+    let mut map = HashMap::new();
+    for row in rows {
+        if let Some(value) = row.key_posture {
+            match serde_json::from_value::<ProviderKeyDecisionPosture>(value) {
+                Ok(posture) => {
+                    map.insert(row.server_id, posture);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        server_id = row.server_id,
+                        "unable to decode provider key posture payload",
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(map)
 }

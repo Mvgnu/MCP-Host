@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import hashlib
 import sys
 import types
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -209,6 +212,125 @@ def test_promotions_schedule_veto_renders_tables(
     assert "Veto reasons" in output
     assert "Trust posture" in output
     assert "Intelligence signals" in output
+
+
+def test_keys_register_streams_attestation_digest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    attestation = tmp_path / "attest.bin"
+    attestation.write_bytes(b"attestation-bytes")
+    iso_deadline = datetime(2030, 1, 1, 0, 0, tzinfo=timezone.utc).isoformat()
+
+    FakeClient.responses[("POST", "/api/providers/00000000-0000-0000-0000-000000000000/keys")] = {
+        "id": "key-1",
+        "provider_id": "00000000-0000-0000-0000-000000000000",
+        "state": "active",
+        "attestation_signature_registered": True,
+        "attestation_verified_at": "2025-01-01T00:00:00Z",
+        "version": 0,
+        "created_at": "2025-01-01T00:00:00Z",
+        "updated_at": "2025-01-01T00:00:00Z",
+    }
+
+    cli_module.main(
+        [
+            "keys",
+            "register",
+            "00000000-0000-0000-0000-000000000000",
+            "--alias",
+            "primary",
+            "--attestation",
+            str(attestation),
+            "--rotation-due",
+            iso_deadline,
+            "--json",
+        ]
+    )
+
+    captured = capsys.readouterr().out
+    payload = json.loads(captured)
+    assert payload["id"] == "key-1"
+    method, path, body = FakeClient.calls[-1]
+    assert method == "POST"
+    assert path.endswith("/keys")
+    expected_digest = base64.b64encode(hashlib.sha256(b"attestation-bytes").digest()).decode()
+    assert body["attestation_digest"] == expected_digest
+    expected_signature = base64.b64encode(b"attestation-bytes").decode()
+    assert body["attestation_signature"] == expected_signature
+    assert body["rotation_due_at"] == iso_deadline
+
+
+def test_keys_rotate_hashes_attestation_and_records_actor(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    attestation = tmp_path / "rotate.bin"
+    attestation.write_bytes(b"rotation-bytes")
+
+    FakeClient.responses[(
+        "POST",
+        "/api/providers/provider-9/keys/key-77/rotations",
+    )] = {
+        "id": "rotation-1",
+        "provider_key_id": "key-77",
+        "status": "pending_approval",
+        "requested_at": "2025-01-01T00:00:00Z",
+        "request_actor_ref": "operator@example.com",
+        "attestation_digest": base64.b64encode(hashlib.sha256(b"rotation-bytes").digest()).decode(),
+        "attestation_signature_verified": True,
+    }
+
+    cli_module.main(
+        [
+            "keys",
+            "rotate",
+            "provider-9",
+            "key-77",
+            "--attestation",
+            str(attestation),
+            "--actor-ref",
+            "operator@example.com",
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["id"] == "rotation-1"
+    method, path, body = FakeClient.calls[-1]
+    assert method == "POST"
+    assert path.endswith("/rotations")
+    expected_digest = base64.b64encode(hashlib.sha256(b"rotation-bytes").digest()).decode()
+    assert body["attestation_digest"] == expected_digest
+    expected_signature = base64.b64encode(b"rotation-bytes").decode()
+    assert body["attestation_signature"] == expected_signature
+    assert body["request_actor_ref"] == "operator@example.com"
+
+
+def test_keys_rotate_reports_stubbed_backend(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    FakeClient.responses[(
+        "POST",
+        "/api/providers/provider-11/keys/key-88/rotations",
+    )] = APIError(501, "stub")
+
+    attestation = tmp_path / "rotate.bin"
+    attestation.write_bytes(b"rotate")
+
+    cli_module.main(
+        [
+            "keys",
+            "rotate",
+            "provider-11",
+            "key-88",
+            "--attestation",
+            str(attestation),
+            "--actor-ref",
+            "ops@example.com",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert "not yet implemented" in captured.err
 
 
 def test_lifecycle_list_renders_promotion_runs_table(
@@ -711,7 +833,19 @@ def test_policy_watch_renders_stream(capsys: pytest.CaptureFixture[str]) -> None
                 "candidate_backend": "virtual-machine",
                 "attestation_status": "trusted",
                 "evaluation_required": True,
-                "notes": ["vm:attestation:trusted"],
+                "notes": ["vm:attestation:trusted", "provider-key:healthy"],
+                "provider_key_posture": {
+                    "provider_id": "00000000-0000-0000-0000-000000000123",
+                    "provider_key_id": "00000000-0000-0000-0000-000000000999",
+                    "tier": "gold:router",
+                    "state": "active",
+                    "rotation_due_at": "2025-12-01T00:00:00Z",
+                    "attestation_registered": True,
+                    "attestation_signature_verified": True,
+                    "attestation_verified_at": "2025-11-10T00:00:00Z",
+                    "vetoed": False,
+                    "notes": ["healthy"],
+                },
             }
         ),
         json.dumps(
@@ -733,6 +867,8 @@ def test_policy_watch_renders_stream(capsys: pytest.CaptureFixture[str]) -> None
     assert "attestation untrusted" in output
     assert FakeClient.calls[-1][0] == "STREAM"
     assert "Latest posture: trusted" in output
+    assert "Provider key: active" in output
+    assert "BYOK rotation due @ 2025-12-01T00:00:00Z" in output
     assert "Active instance: vm-alpha" in output
 
 
@@ -849,3 +985,46 @@ def test_remediation_render_event_includes_policy_feedback(
     assert any("policy feedback" in line for line in output)
     assert any("accelerator accel-1" in line for line in output)
     assert any("status -> completed" in line for line in output)
+
+
+def test_keys_register_reports_stubbed_backend(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    FakeClient.responses[("POST", "/api/providers/tenant-1/keys")] = APIError(
+        501, "not implemented"
+    )
+
+    attestation = tmp_path / "attest.bin"
+    attestation.write_bytes(b"bundle")
+
+    cli_module.main(
+        [
+            "keys",
+            "register",
+            "tenant-1",
+            "--attestation",
+            str(attestation),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert "not yet implemented" in captured.err
+    method, path, payload = FakeClient.calls[-1]
+    assert method == "POST"
+    assert path == "/api/providers/tenant-1/keys"
+    assert payload["alias"] is None
+    assert payload["attestation_digest"] == base64.b64encode(
+        hashlib.sha256(b"bundle").digest()
+    ).decode()
+    assert payload["attestation_signature"] == base64.b64encode(b"bundle").decode()
+
+
+def test_keys_list_falls_back_to_notice(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    FakeClient.responses[("GET", "/api/providers/tenant-2/keys")] = APIError(
+        501, "not implemented"
+    )
+
+    cli_module.main(["keys", "list", "tenant-2"])
+    captured = capsys.readouterr()
+    assert "not yet implemented" in captured.err

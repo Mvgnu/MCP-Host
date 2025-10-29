@@ -11,6 +11,7 @@ use std::io;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 
+use crate::keys::{ProviderKeyService, ProviderKeyServiceConfig};
 use crate::policy::{
     trust::evaluate_placement_gate, PolicyDecision, RuntimeBackend, RuntimeCapability,
     RuntimeExecutorDescriptor, RuntimePolicyEngine,
@@ -114,6 +115,16 @@ impl RuntimeOrchestrator {
             }
         }
     }
+
+    fn provider_key_pending_status(notes: &[String]) -> &'static str {
+        if notes.iter().any(|note| note == "rotation-overdue") {
+            "pending-key-rotation"
+        } else if notes.iter().any(|note| note == "not-active") {
+            "pending-key-activation"
+        } else {
+            "pending-key-registration"
+        }
+    }
 }
 
 #[async_trait]
@@ -191,6 +202,50 @@ impl ContainerRuntime for RuntimeOrchestrator {
                             "failed to set server status after trust gate"
                         );
                     }
+                    assignments.remove(&server_id);
+                    return;
+                }
+            }
+
+            if let Some(posture) = decision.provider_key_posture.as_ref() {
+                if posture.vetoed {
+                    let status = Self::provider_key_pending_status(&posture.notes);
+                    tracing::warn!(
+                        %server_id,
+                        provider_id = %posture.provider_id,
+                        provider_key_id = ?posture.provider_key_id,
+                        notes = %posture.notes.join(","),
+                        "blocking runtime launch due to provider key veto",
+                    );
+                    if let Err(set_err) = crate::servers::set_status(&pool, server_id, status).await
+                    {
+                        tracing::error!(
+                            ?set_err,
+                            %server_id,
+                            status,
+                            "failed to set server status after provider key veto",
+                        );
+                    }
+
+                    let service =
+                        ProviderKeyService::new(pool.clone(), ProviderKeyServiceConfig::default());
+                    if let Err(err) = service
+                        .record_runtime_veto(
+                            posture.provider_id,
+                            posture.provider_key_id,
+                            posture.notes.clone(),
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            ?err,
+                            %server_id,
+                            provider_id = %posture.provider_id,
+                            provider_key_id = ?posture.provider_key_id,
+                            "failed to persist provider key veto audit event",
+                        );
+                    }
+
                     assignments.remove(&server_id);
                     return;
                 }

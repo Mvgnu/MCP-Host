@@ -29,6 +29,7 @@ use crate::extractor::AuthUser;
 use crate::governance::GovernanceEngine;
 use crate::intelligence::{self, IntelligenceError, IntelligenceStatus, RecomputeContext};
 use crate::job_queue;
+use crate::keys::{ProviderKeyDecisionPosture, ProviderKeyService, ProviderKeyServiceConfig};
 use crate::marketplace::{classify_tier, derive_health, MarketplacePlatform};
 
 // key: runtime-policy -> placement-decisions,marketplace-health
@@ -66,6 +67,8 @@ pub struct PolicyEvent {
     pub instance_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_key_posture: Option<ProviderKeyDecisionPosture>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
 }
@@ -155,6 +158,7 @@ impl PolicyEvent {
             governance_required: Some(decision.governance_required),
             instance_id: None,
             stale: stale_flag,
+            provider_key_posture: decision.provider_key_posture.clone(),
             notes,
         }
     }
@@ -182,6 +186,7 @@ impl PolicyEvent {
             governance_required: None,
             instance_id,
             stale: Some(stale),
+            provider_key_posture: None,
             notes,
         }
     }
@@ -297,6 +302,7 @@ pub struct PolicyDecision {
     pub promotion_stage: Option<String>,
     pub promotion_status: Option<String>,
     pub promotion_notes: Vec<String>,
+    pub provider_key_posture: Option<ProviderKeyDecisionPosture>,
 }
 
 #[derive(Debug, Error)]
@@ -422,6 +428,7 @@ impl RuntimePolicyEngine {
         let mut promotion_notes = Vec::new();
         let mut evaluation_required = false;
         let mut vm_posture: Option<VmAttestationPolicyOutcome> = None;
+        let mut provider_key_posture: Option<ProviderKeyDecisionPosture> = None;
 
         if use_gpu && !matches!(backend, RuntimeBackend::Kubernetes) {
             backend = RuntimeBackend::Kubernetes;
@@ -832,6 +839,70 @@ impl RuntimePolicyEngine {
             }
         }
 
+        if let Some(tier_name) = tier.clone() {
+            let key_service =
+                ProviderKeyService::new(pool.clone(), ProviderKeyServiceConfig::default());
+            if let Some(requirement) = key_service
+                .tier_requirement(&tier_name)
+                .await
+                .map_err(PolicyError::Database)?
+            {
+                let summary = key_service
+                    .summarize_for_policy(requirement.provider_id)
+                    .await
+                    .map_err(PolicyError::Database)?;
+                let gating_veto = requirement.byok_required && summary.vetoed;
+                let mut posture_notes = summary.notes.clone();
+                if requirement.byok_required && !summary.vetoed {
+                    posture_notes.push("healthy".to_string());
+                } else if !requirement.byok_required {
+                    posture_notes.push("optional".to_string());
+                }
+
+                if gating_veto {
+                    evaluation_required = true;
+                    governance_required = true;
+                    if summary.notes.is_empty() {
+                        notes.push("provider-key:veto".to_string());
+                    }
+                    for note in summary.notes.iter() {
+                        notes.push(format!("provider-key:{note}"));
+                    }
+                } else if requirement.byok_required {
+                    notes.push("provider-key:healthy".to_string());
+                } else {
+                    notes.push("provider-key:optional".to_string());
+                }
+
+                provider_key_posture = Some(ProviderKeyDecisionPosture {
+                    provider_id: requirement.provider_id,
+                    provider_key_id: summary.record.as_ref().map(|record| record.id),
+                    tier: Some(tier_name),
+                    state: summary.posture_state(),
+                    rotation_due_at: summary
+                        .record
+                        .as_ref()
+                        .and_then(|record| record.rotation_due_at),
+                    attestation_registered: summary
+                        .record
+                        .as_ref()
+                        .and_then(|record| record.attestation_digest.as_ref())
+                        .is_some(),
+                    attestation_signature_verified: summary
+                        .record
+                        .as_ref()
+                        .map(|record| record.attestation_signature_registered)
+                        .unwrap_or(false),
+                    attestation_verified_at: summary
+                        .record
+                        .as_ref()
+                        .and_then(|record| record.attestation_verified_at),
+                    vetoed: gating_veto,
+                    notes: posture_notes,
+                });
+            }
+        }
+
         Ok((
             PolicyDecision {
                 backend,
@@ -855,6 +926,7 @@ impl RuntimePolicyEngine {
                 promotion_stage,
                 promotion_status,
                 promotion_notes,
+                provider_key_posture,
             },
             vm_posture,
         ))
@@ -875,6 +947,11 @@ impl RuntimePolicyEngine {
                 .map(|cap| Value::String(cap.as_str().to_string()))
                 .collect(),
         );
+        let key_posture_json = decision
+            .provider_key_posture
+            .as_ref()
+            .map(|posture| serde_json::to_value(posture).unwrap_or(Value::Null))
+            .unwrap_or(Value::Null);
 
         let row = sqlx::query(
             r#"
@@ -900,9 +977,10 @@ impl RuntimePolicyEngine {
                 promotion_stage,
                 promotion_status,
                 promotion_notes,
+                key_posture,
                 decided_at
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
             )
             RETURNING id
             "#,
@@ -928,6 +1006,7 @@ impl RuntimePolicyEngine {
         .bind(decision.promotion_stage.as_deref())
         .bind(decision.promotion_status.as_deref())
         .bind(&decision.promotion_notes)
+        .bind(key_posture_json)
         .bind(Utc::now())
         .fetch_one(pool)
         .await?;

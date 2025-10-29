@@ -1,6 +1,7 @@
 pub mod db;
 pub mod error;
 pub mod intelligence;
+pub mod keys;
 pub mod lifecycle_console;
 pub mod policy;
 pub mod remediation;

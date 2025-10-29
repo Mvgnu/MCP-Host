@@ -49,6 +49,7 @@ describe('LifecycleRunProgress', () => {
           duration_seconds: 125,
         },
       ],
+      provider_key_posture: undefined,
     };
     return { ...base, ...overrides };
   }
@@ -122,6 +123,18 @@ describe('LifecycleRunProgress', () => {
         track_name: 'stable',
         track_tier: 'gold',
       },
+      provider_key_posture: {
+        provider_id: 'provider-1234',
+        provider_key_id: 'key-9999',
+        tier: 'production',
+        state: 'rotating',
+        rotation_due_at: '2024-02-01T00:00:00.000Z',
+        attestation_registered: true,
+        attestation_signature_verified: false,
+        attestation_verified_at: null,
+        vetoed: true,
+        notes: ['rotation-overdue', 'signature-pending'],
+      },
     });
 
     const onSelect = jest.fn();
@@ -136,6 +149,11 @@ describe('LifecycleRunProgress', () => {
     expect(screen.getByText(/Awaiting approval/)).toBeInTheDocument();
     expect(screen.getByText(/Failure: exhausted/)).toBeInTheDocument();
     expect(screen.getByText(/Started.*2m 5s/)).toBeInTheDocument();
+    expect(
+      screen.getByText((content) =>
+        content.includes('BYOK') && content.includes('signature-unverified') && content.includes('vetoed')
+      )
+    ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: /View details/ }));
     expect(onSelect).toHaveBeenCalledWith(run);
