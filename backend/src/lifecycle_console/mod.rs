@@ -369,7 +369,6 @@ struct RuntimeVmInstanceRow {
 
 #[derive(Debug, Clone)]
 struct OverrideActorRecord {
-    pub id: i32,
     pub email: String,
 }
 
@@ -1071,15 +1070,7 @@ async fn load_override_actors(
 
     Ok(rows
         .into_iter()
-        .map(|row| {
-            (
-                row.id,
-                OverrideActorRecord {
-                    id: row.id,
-                    email: row.email,
-                },
-            )
-        })
+        .map(|row| (row.id, OverrideActorRecord { email: row.email }))
         .collect())
 }
 

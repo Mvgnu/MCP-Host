@@ -490,10 +490,7 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
 
-    fn sample_workspace(
-        plan_targets: Value,
-        metadata_targets: Value,
-    ) -> RuntimeVmRemediationWorkspace {
+    fn sample_workspace(metadata_targets: Value) -> RuntimeVmRemediationWorkspace {
         RuntimeVmRemediationWorkspace {
             id: 77,
             workspace_key: "workspace.test".to_string(),
@@ -568,7 +565,7 @@ mod tests {
         let metadata_targets = json!({
             "fallback": {"runtime_vm_instance_id": 404, "source": "workspace"}
         });
-        let workspace = sample_workspace(plan_targets.clone(), metadata_targets);
+        let workspace = sample_workspace(metadata_targets);
         let revision = sample_revision(plan_targets);
 
         let mut targets = extract_promotion_targets(&workspace, &revision);
@@ -627,7 +624,7 @@ mod tests {
 
     #[test]
     fn extract_targets_falls_back_to_revision_metadata_when_no_targets() {
-        let workspace = sample_workspace(Value::Null, json!({"runtime_vm_instance_id": 707}));
+        let workspace = sample_workspace(json!({"runtime_vm_instance_id": 707}));
         let mut revision = sample_revision(Value::Null);
         revision.plan = json!({"playbooks": ["vm.restart"]});
         revision.metadata = json!({"runtime_vm_instance_id": 808});

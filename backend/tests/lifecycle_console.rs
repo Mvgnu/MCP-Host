@@ -347,6 +347,12 @@ async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
             .and_then(|value| value.as_str()),
         Some("console@example.com")
     );
+    assert_eq!(
+        manual_override
+            .get("actor_id")
+            .and_then(|value| value.as_i64()),
+        Some(fixture.owner_id as i64)
+    );
     let artifacts = first_run
         .get("artifacts")
         .and_then(|value| value.as_array())
@@ -370,6 +376,13 @@ async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
     assert_eq!(
         verdict.get("verdict_id").and_then(|value| value.as_i64()),
         Some(fixture.promotion_id)
+    );
+    assert_eq!(
+        first_run
+            .get("run")
+            .and_then(|value| value.get("id"))
+            .and_then(|value| value.as_i64()),
+        Some(fixture.run_id)
     );
 
     let promotion_runs = snapshot
