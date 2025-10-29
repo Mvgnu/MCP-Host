@@ -42,6 +42,8 @@ pub struct PromotionRecord {
     pub scheduled_by: Option<i32>,
     pub approved_by: Option<i32>,
     pub notes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posture_verdict: Option<Value>,
     pub scheduled_at: DateTime<Utc>,
     pub approved_at: Option<DateTime<Utc>>,
     pub activated_at: Option<DateTime<Utc>>,
@@ -255,15 +257,14 @@ async fn schedule_promotion(
 
     let signals = collect_promotion_signals(&mut tx, artifact_run_id, &manifest_digest).await?;
     let verdict = evaluate_promotion_posture(&track, &signals);
+    let verdict_payload = build_verdict_payload(&track, &stage, &verdict);
+
     if !verdict.allowed {
-        let payload = json!({
-            "error": "promotion_veto",
-            "track": {"id": track.id, "name": track.name, "tier": track.tier},
-            "stage": stage,
-            "reasons": verdict.veto_reasons,
-            "metadata": verdict.metadata,
-        });
-        return Err(AppError::BadRequest(payload.to_string()));
+        let mut payload = verdict_payload.clone();
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("error".to_string(), json!("promotion_veto"));
+        }
+        return Err(AppError::JsonBadRequest(payload));
     }
 
     notes.extend(verdict.posture_notes);
@@ -277,8 +278,9 @@ async fn schedule_promotion(
             stage,
             status,
             scheduled_by,
-            notes
-        ) VALUES ($1, $2, $3, $4, 'scheduled', $5, $6)
+            notes,
+            posture_verdict
+        ) VALUES ($1, $2, $3, $4, 'scheduled', $5, $6, $7)
         RETURNING id
         "#,
     )
@@ -288,6 +290,7 @@ async fn schedule_promotion(
     .bind(&stage)
     .bind(user_id)
     .bind(&notes)
+    .bind(&verdict_payload)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -396,7 +399,7 @@ async fn history(
 ) -> AppResult<Json<Vec<PromotionRecord>>> {
     let mut builder = QueryBuilder::new(
         "SELECT ap.id, ap.promotion_track_id, ap.manifest_digest, ap.artifact_run_id, ap.stage, ap.status, \
-         ap.workflow_run_id, ap.scheduled_by, ap.approved_by, ap.notes, ap.scheduled_at, ap.approved_at, \
+         ap.workflow_run_id, ap.scheduled_by, ap.approved_by, ap.notes, ap.posture_verdict, ap.scheduled_at, ap.approved_at, \
          ap.activated_at, ap.updated_at, ap.created_at, t.name as track_name, t.tier \
          FROM artifact_promotions ap \
          JOIN promotion_tracks t ON t.id = ap.promotion_track_id \
@@ -425,7 +428,7 @@ async fn load_promotion(pool: &PgPool, id: i64) -> AppResult<PromotionRecord> {
     let record = sqlx::query_as::<_, PromotionRecord>(
         r#"
         SELECT ap.id, ap.promotion_track_id, ap.manifest_digest, ap.artifact_run_id, ap.stage, ap.status,
-               ap.workflow_run_id, ap.scheduled_by, ap.approved_by, ap.notes, ap.scheduled_at, ap.approved_at,
+               ap.workflow_run_id, ap.scheduled_by, ap.approved_by, ap.notes, ap.posture_verdict, ap.scheduled_at, ap.approved_at,
                ap.activated_at, ap.updated_at, ap.created_at, t.name as track_name, t.tier
         FROM artifact_promotions ap
         JOIN promotion_tracks t ON t.id = ap.promotion_track_id
@@ -436,6 +439,26 @@ async fn load_promotion(pool: &PgPool, id: i64) -> AppResult<PromotionRecord> {
     .fetch_one(pool)
     .await?;
     Ok(record)
+}
+
+fn build_verdict_payload(track: &PromotionTrack, stage: &str, verdict: &PromotionVerdict) -> Value {
+    let mut root = Map::new();
+    root.insert("allowed".to_string(), json!(verdict.allowed));
+    root.insert(
+        "track".to_string(),
+        json!({
+            "id": track.id,
+            "name": track.name,
+            "tier": track.tier,
+        }),
+    );
+    root.insert("stage".to_string(), json!(stage));
+    root.insert("reasons".to_string(), json!(verdict.veto_reasons));
+    if !verdict.posture_notes.is_empty() {
+        root.insert("notes".to_string(), json!(verdict.posture_notes));
+    }
+    root.insert("metadata".to_string(), verdict.metadata.clone());
+    Value::Object(root)
 }
 
 #[derive(Debug, FromRow)]
@@ -731,8 +754,8 @@ fn evaluate_promotion_posture(
 #[cfg(test)]
 mod tests {
     use super::{
-        evaluate_promotion_posture, IntelligenceSignal, PromotionPostureSignals, PromotionTrack,
-        ReleaseTrain,
+        build_verdict_payload, evaluate_promotion_posture, IntelligenceSignal,
+        PromotionPostureSignals, PromotionTrack, ReleaseTrain,
     };
 
     #[test]
@@ -826,5 +849,54 @@ mod tests {
             .veto_reasons
             .iter()
             .any(|reason| reason.contains("intelligence.supply")));
+    }
+
+    #[test]
+    fn verdict_payload_captures_track_and_stage() {
+        let track = PromotionTrack {
+            id: 7,
+            owner_id: 9,
+            name: "Release".to_string(),
+            tier: "gold".to_string(),
+            stages: vec!["candidate".into(), "production".into()],
+            description: None,
+            workflow_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let signals = PromotionPostureSignals {
+            artifact_status: Some("completed".into()),
+            credential_health_status: Some("degraded".into()),
+            trust_lifecycle_state: Some("quarantined".into()),
+            trust_attestation_status: Some("critical".into()),
+            trust_remediation_state: Some("remediation:pending".into()),
+            trust_remediation_attempts: Some(3),
+            remediation_status: Some("failed".into()),
+            remediation_failure_reason: Some("policy".into()),
+            intelligence: vec![],
+        };
+
+        let verdict = evaluate_promotion_posture(&track, &signals);
+        assert!(!verdict.allowed);
+
+        let payload = build_verdict_payload(&track, "production", &verdict);
+        let root = payload.as_object().expect("payload should be an object");
+        assert_eq!(
+            root.get("stage").and_then(|value| value.as_str()),
+            Some("production")
+        );
+        let track_obj = root
+            .get("track")
+            .and_then(|value| value.as_object())
+            .expect("track metadata expected");
+        assert_eq!(
+            track_obj.get("name").and_then(|value| value.as_str()),
+            Some("Release")
+        );
+        assert!(root
+            .get("reasons")
+            .and_then(|value| value.as_array())
+            .map(|entries| !entries.is_empty())
+            .unwrap_or(false));
     }
 }

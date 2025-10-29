@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict
 
 import sys
 
-from ..client import APIClient
+from ..client import APIClient, APIError
 from ..renderers import dumps_json, render_table
 from . import evaluations as evaluations_commands
 from . import remediation as remediation_commands
@@ -293,15 +293,30 @@ def _promotions_history(client: APIClient, as_json: bool, args: Dict[str, object
     if as_json:
         print(dumps_json(history))
         return
-    columns = ["id", "track_name", "stage", "status", "manifest_digest", "updated_at"]
-    records = [{
-        "id": item.get("id"),
-        "track_name": item.get("track_name"),
-        "stage": item.get("stage"),
-        "status": item.get("status"),
-        "manifest_digest": item.get("manifest_digest"),
-        "updated_at": item.get("updated_at"),
-    } for item in history]
+    columns = [
+        "id",
+        "track_name",
+        "stage",
+        "status",
+        "posture",
+        "manifest_digest",
+        "updated_at",
+    ]
+    records = []
+    for item in history:
+        verdict = item.get("posture_verdict") if isinstance(item, dict) else None
+        posture = _summarize_promotion_posture(verdict)
+        records.append(
+            {
+                "id": item.get("id"),
+                "track_name": item.get("track_name"),
+                "stage": item.get("stage"),
+                "status": item.get("status"),
+                "posture": posture,
+                "manifest_digest": item.get("manifest_digest"),
+                "updated_at": item.get("updated_at"),
+            }
+        )
     print(render_table(records, columns))
 
 
@@ -313,12 +328,36 @@ def _promotions_schedule(client: APIClient, as_json: bool, args: Dict[str, objec
         "artifact_run_id": args.get("artifact_run_id"),
         "notes": args.get("notes") or [],
     }
-    result = client.post("/api/promotions/schedule", json_body=payload)
+    try:
+        result = client.post("/api/promotions/schedule", json_body=payload)
+    except APIError as exc:
+        if as_json:
+            print(dumps_json(exc.payload or {"error": str(exc)}))
+            return
+        print(f"Promotion scheduling failed: {exc}")
+        _render_promotion_veto(exc.payload)
+        return
+
     if as_json:
         print(dumps_json(result))
-    else:
-        columns = ["id", "track_name", "stage", "status"]
-        print(render_table([result], columns))
+        return
+
+    posture = _summarize_promotion_posture(result.get("posture_verdict"))
+    columns = ["id", "track_name", "stage", "status", "posture"]
+    print(
+        render_table(
+            [
+                {
+                    "id": result.get("id"),
+                    "track_name": result.get("track_name"),
+                    "stage": result.get("stage"),
+                    "status": result.get("status"),
+                    "posture": posture,
+                }
+            ],
+            columns,
+        )
+    )
 
 
 def _promotions_approve(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
@@ -382,6 +421,83 @@ def _governance_get_run(client: APIClient, as_json: bool, args: Dict[str, object
     else:
         columns = ["id", "workflow_id", "status", "updated_at"]
         print(render_table([detail], columns))
+
+
+def _summarize_promotion_posture(verdict: Any) -> str:
+    if not isinstance(verdict, dict):
+        return "unknown"
+    allowed = verdict.get("allowed")
+    reasons = verdict.get("reasons") if isinstance(verdict.get("reasons"), list) else []
+    if allowed is True and not reasons:
+        return "allowed"
+    if allowed is True:
+        return "allowed with notes"
+    if allowed is False and reasons:
+        return "blocked: " + "; ".join(str(reason) for reason in reasons)
+    if allowed is False:
+        return "blocked"
+    return "unknown"
+
+
+def _render_promotion_veto(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    reasons = payload.get("reasons") if isinstance(payload.get("reasons"), list) else []
+    notes = payload.get("notes") if isinstance(payload.get("notes"), list) else []
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+
+    if reasons:
+        print("\nVeto reasons:")
+        print(render_table([{"reason": str(reason)} for reason in reasons], ["reason"]))
+    if notes:
+        print("\nPosture notes:")
+        print(render_table([{"note": str(note)} for note in notes], ["note"]))
+
+    trust = metadata.get("signals", {}).get("trust") if isinstance(metadata.get("signals"), dict) else None
+    remediation = metadata.get("signals", {}).get("remediation") if isinstance(metadata.get("signals"), dict) else None
+    intelligence = metadata.get("signals", {}).get("intelligence") if isinstance(metadata.get("signals"), dict) else []
+
+    if isinstance(trust, dict) and trust:
+        print("\nTrust posture:")
+        trust_rows = []
+        for field in ("lifecycle_state", "attestation_status", "remediation_state"):
+            value = trust.get(field)
+            if value is not None:
+                trust_rows.append({"field": field, "value": value})
+        attempts = trust.get("remediation_attempts")
+        if attempts is not None:
+            trust_rows.append({"field": "remediation_attempts", "value": attempts})
+        if trust_rows:
+            print(render_table(trust_rows, ["field", "value"]))
+
+    if isinstance(remediation, dict) and remediation:
+        print("\nRemediation posture:")
+        rem_rows = []
+        status = remediation.get("status")
+        if status is not None:
+            rem_rows.append({"field": "status", "value": status})
+        failure = remediation.get("failure_reason")
+        if failure:
+            rem_rows.append({"field": "failure_reason", "value": failure})
+        if rem_rows:
+            print(render_table(rem_rows, ["field", "value"]))
+
+    if isinstance(intelligence, list) and intelligence:
+        print("\nIntelligence signals:")
+        intel_rows = []
+        for entry in intelligence:
+            if not isinstance(entry, dict):
+                continue
+            intel_rows.append(
+                {
+                    "capability": entry.get("capability"),
+                    "status": entry.get("status"),
+                    "score": entry.get("score"),
+                    "confidence": entry.get("confidence"),
+                }
+            )
+        if intel_rows:
+            print(render_table(intel_rows, ["capability", "status", "score", "confidence"]))
 def _scaffold_fetch(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
     data = client.get(f"/api/servers/{args['server_id']}/client-config")
     if as_json:

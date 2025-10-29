@@ -333,3 +333,4 @@
   Log:
     - 2025-12-08 10:05:00 UTC: Audited promotion scheduling flow, lifecycle console aggregation, and trust/intelligence data paths to scope blended gate evaluation and payload surfacing requirements.
     - 2025-12-08 14:45:00 UTC: Implemented promotion posture evaluation wiring trust registry, remediation run, and intelligence queries; surfaced JSON veto payloads plus machine-readable notes, and added unit tests covering healthy vs. critical veto scenarios.
+    - 2025-12-09 11:15:00 UTC: Persisted promotion posture verdict JSON alongside records, introduced structured `JsonBadRequest` responses for vetoes, and taught the CLI to narrate trust/remediation/intel signals when scheduling or reviewing promotions. Follow-up required to broadcast verdict slices through lifecycle SSE/UI surfaces.
