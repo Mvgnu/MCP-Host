@@ -8,6 +8,7 @@ export interface LifecycleWorkspaceSnapshot {
   workspace: RemediationWorkspace;
   active_revision?: LifecycleWorkspaceRevision;
   recent_runs: LifecycleRunSnapshot[];
+  promotion_runs: RemediationRun[];
   promotion_postures: LifecyclePromotionPosture[];
 }
 
@@ -55,6 +56,8 @@ export interface LifecycleWorkspaceDelta {
   workspace_id: number;
   run_deltas: LifecycleRunDelta[];
   removed_run_ids: number[];
+  promotion_run_deltas: LifecyclePromotionRunDelta[];
+  removed_promotion_run_ids: number[];
   promotion_posture_deltas: LifecyclePromotionPostureDelta[];
   removed_promotion_ids: number[];
 }
@@ -97,6 +100,14 @@ export interface LifecyclePromotionPostureDelta {
   updated_at: string;
   remediation_hooks: string[];
   signals?: Record<string, unknown> | null;
+}
+
+export interface LifecyclePromotionRunDelta {
+  run_id: number;
+  status: string;
+  automation_payload_changes: LifecycleFieldChange[];
+  gate_context_changes: LifecycleFieldChange[];
+  metadata_changes: LifecycleFieldChange[];
 }
 
 export interface LifecycleFieldChange {

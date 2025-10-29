@@ -6,6 +6,7 @@ import {
   LifecycleConsoleEventEnvelope,
   LifecycleConsolePage,
   LifecyclePromotionPostureDelta,
+  LifecyclePromotionRunDelta,
   LifecycleRunDelta,
   LifecycleWorkspaceSnapshot,
 } from '../../../lib/lifecycle-console';
@@ -35,12 +36,14 @@ const STORAGE_CURSOR_KEY = 'lifecycle-console.cursor.v2';
 type WorkspaceMap = Record<number, LifecycleWorkspaceSnapshot>;
 type RunDeltaMap = Record<number, LifecycleRunDelta>;
 type PromotionDeltaMap = Record<number, LifecyclePromotionPostureDelta>;
+type PromotionRunDeltaMap = Record<number, LifecyclePromotionRunDelta>;
 
 interface PersistedState {
   workspaces: WorkspaceMap;
   order: number[];
   runDeltas: RunDeltaMap;
   promotionDeltas?: PromotionDeltaMap;
+  promotionRunDeltas?: PromotionRunDeltaMap;
   lastCursor: number | null;
   lastEmittedAt: string | null;
 }
@@ -55,6 +58,7 @@ export default function LifecycleConsolePage() {
   const [order, setOrder] = useState<number[]>([]);
   const [runDeltas, setRunDeltas] = useState<RunDeltaMap>({});
   const [promotionDeltas, setPromotionDeltas] = useState<PromotionDeltaMap>({});
+  const [promotionRunDeltas, setPromotionRunDeltas] = useState<PromotionRunDeltaMap>({});
   const [filters, setFilters] = useState<LifecycleFilters>(DEFAULT_FILTERS);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -116,6 +120,18 @@ export default function LifecycleConsolePage() {
       });
       return next;
     });
+    setPromotionRunDeltas((current) => {
+      const next: PromotionRunDeltaMap = { ...current };
+      delta.workspaces.forEach((workspaceDelta) => {
+        workspaceDelta.promotion_run_deltas.forEach((runDelta) => {
+          next[runDelta.run_id] = runDelta;
+        });
+        workspaceDelta.removed_promotion_run_ids.forEach((runId) => {
+          delete next[runId];
+        });
+      });
+      return next;
+    });
     setWorkspaces((current) => {
       const next: WorkspaceMap = { ...current };
       delta.workspaces.forEach((workspaceDelta) => {
@@ -129,6 +145,36 @@ export default function LifecycleConsolePage() {
           snapshot = {
             ...snapshot,
             recent_runs: remaining,
+          };
+          next[workspaceDelta.workspace_id] = snapshot;
+        }
+        if (workspaceDelta.promotion_run_deltas.length > 0) {
+          const promotionRunMap = new Map(snapshot.promotion_runs.map((run) => [run.id, run]));
+          workspaceDelta.promotion_run_deltas.forEach((runDelta) => {
+            const existingRun = promotionRunMap.get(runDelta.run_id);
+            if (existingRun) {
+              promotionRunMap.set(runDelta.run_id, {
+                ...existingRun,
+                status: runDelta.status,
+              });
+            }
+          });
+          const updatedRuns = Array.from(promotionRunMap.values()).sort(
+            (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
+          );
+          snapshot = {
+            ...snapshot,
+            promotion_runs: updatedRuns,
+          };
+          next[workspaceDelta.workspace_id] = snapshot;
+        }
+        if (workspaceDelta.removed_promotion_run_ids.length > 0) {
+          const remainingPromotionRuns = snapshot.promotion_runs.filter(
+            (run) => !workspaceDelta.removed_promotion_run_ids.includes(run.id),
+          );
+          snapshot = {
+            ...snapshot,
+            promotion_runs: remainingPromotionRuns,
           };
           next[workspaceDelta.workspace_id] = snapshot;
         }
@@ -360,6 +406,7 @@ export default function LifecycleConsolePage() {
             normalized[Number(workspaceId)] = {
               ...snapshot,
               promotion_postures: snapshot.promotion_postures ?? [],
+              promotion_runs: snapshot.promotion_runs ?? [],
             };
           });
           setWorkspaces(normalized);
@@ -372,6 +419,9 @@ export default function LifecycleConsolePage() {
         }
         if (parsed.promotionDeltas) {
           setPromotionDeltas(parsed.promotionDeltas);
+        }
+        if (parsed.promotionRunDeltas) {
+          setPromotionRunDeltas(parsed.promotionRunDeltas);
         }
         if (typeof parsed.lastCursor === 'number') {
           persistCursor(parsed.lastCursor);
@@ -437,6 +487,7 @@ export default function LifecycleConsolePage() {
     setOrder([]);
     setRunDeltas({});
     setPromotionDeltas({});
+    setPromotionRunDeltas({});
     setLoading(true);
     persistCursor(null);
     fetchPage().then(() => {
@@ -456,10 +507,11 @@ export default function LifecycleConsolePage() {
       order,
       runDeltas,
       promotionDeltas,
+      promotionRunDeltas,
       lastCursor: lastCursorRef.current,
       lastEmittedAt,
     });
-  }, [workspaces, order, runDeltas, promotionDeltas, lastEmittedAt, persistState]);
+  }, [workspaces, order, runDeltas, promotionDeltas, promotionRunDeltas, lastEmittedAt, persistState]);
 
   useEffect(() => {
     return () => {
@@ -523,7 +575,9 @@ export default function LifecycleConsolePage() {
             {snapshot.promotion_postures.length > 0 && (
               <PromotionVerdictTimeline
                 promotions={snapshot.promotion_postures}
+                promotionRuns={snapshot.promotion_runs}
                 promotionDeltas={promotionDeltas}
+                promotionRunDeltas={promotionRunDeltas}
               />
             )}
           </article>

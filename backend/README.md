@@ -179,6 +179,12 @@ and remediation hooks) plus track/stage identifiers. Streaming updates emit
 `promotion_posture_deltas`/`removed_promotion_ids` so clients can replay posture narrative changes
 without rehydrating from the CLI transcripts.
 
+Lifecycle snapshots also expose a `promotion_runs` array so operators can correlate promotion
+verdicts with the remediation automation that a promotion staged or refreshed. The backend reuses
+the promotion orchestration helper to hydrate the latest per-workspace automation runs, and SSE
+delta envelopes now include `promotion_run_deltas`/`removed_promotion_run_ids` so clients can
+diff automation refreshes without dropping cached state.
+
 ### Backend crate structure
 
 To avoid the duplicate-type compilation failures that occurred when both the library and binary

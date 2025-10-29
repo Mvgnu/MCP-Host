@@ -25,6 +25,9 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to see the
 - Promotion verdict metadata now renders through the `PromotionVerdictTimeline` component, highlighting the latest
   `promotion_postures` array (track, stage, allowed flag, veto reasons, remediation hooks, and signal JSON) with delta badges
   whenever SSE events update the posture.
+- Promotion automation refreshes now appear alongside posture narratives. The console renders the `promotion_runs` table with
+  gate lane/stage context, automation payload attempts, and a change summary sourced from SSE `promotion_run_deltas` so
+  operators can correlate veto narratives with the remediation orchestration they triggered.
 - Filter controls (workspace search, promotion lane, severity) feed the backend query parameters and persist to local storage,
   enabling scoped investigations and shared context between browser sessions.
 - Snapshot envelopes include delta metadata. The UI renders recent trust/intelligence/marketplace changes on each run and opens a
