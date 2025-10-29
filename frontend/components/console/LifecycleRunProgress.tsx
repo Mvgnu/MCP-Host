@@ -1,6 +1,6 @@
 'use client';
 import { useMemo } from 'react';
-import { LifecycleRunSnapshot } from '../../lib/lifecycle-console';
+import { LifecycleRunArtifact, LifecycleRunSnapshot } from '../../lib/lifecycle-console';
 
 // key: lifecycle-console-ui -> run-progress
 interface Props {
@@ -8,15 +8,56 @@ interface Props {
   onSelect?: (run: LifecycleRunSnapshot) => void;
 }
 
-function formatDuration(startedAt: string, completedAt?: string | null) {
+function formatDurationSeconds(durationSeconds?: number | null) {
+  if (typeof durationSeconds !== 'number' || Number.isNaN(durationSeconds) || durationSeconds < 0) {
+    return undefined;
+  }
+  if (durationSeconds < 60) {
+    return `${Math.floor(durationSeconds)}s`;
+  }
+  const minutes = Math.floor(durationSeconds / 60);
+  const seconds = Math.floor(durationSeconds % 60);
+  if (minutes < 60) {
+    return seconds === 0 ? `${minutes}m` : `${minutes}m ${seconds}s`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remMinutes = minutes % 60;
+  return remMinutes === 0 ? `${hours}h` : `${hours}h ${remMinutes}m`;
+}
+
+function fallbackDuration(startedAt: string, completedAt?: string | null) {
   const started = new Date(startedAt).getTime();
   const finished = completedAt ? new Date(completedAt).getTime() : Date.now();
-  if (Number.isNaN(started) || Number.isNaN(finished)) return 'unknown duration';
-  const delta = Math.max(0, finished - started);
-  const minutes = Math.floor(delta / 60000);
-  const seconds = Math.floor((delta % 60000) / 1000);
-  if (minutes === 0) return `${seconds}s`;
-  return `${minutes}m ${seconds}s`;
+  if (Number.isNaN(started) || Number.isNaN(finished)) return undefined;
+  const seconds = Math.max(0, Math.floor((finished - started) / 1000));
+  return formatDurationSeconds(seconds);
+}
+
+function summarizeAttempt(attempt?: number | null, retryLimit?: number | null) {
+  if (typeof attempt !== 'number' && typeof retryLimit !== 'number') {
+    return undefined;
+  }
+  const attemptPart = typeof attempt === 'number' ? String(Math.floor(attempt)) : '–';
+  if (typeof retryLimit !== 'number') {
+    return attemptPart;
+  }
+  return `${attemptPart}/${Math.floor(retryLimit)}`;
+}
+
+function summarizeArtifact(artifact: LifecycleRunArtifact) {
+  const digest = artifact.manifest_digest;
+  const shortDigest = digest.length > 12 ? `${digest.slice(0, 12)}…` : digest;
+  const parts: string[] = [];
+  if (artifact.lane) parts.push(`lane:${artifact.lane}`);
+  if (artifact.stage) parts.push(`stage:${artifact.stage}`);
+  if (artifact.manifest_tag) parts.push(`tag:${artifact.manifest_tag}`);
+  if (artifact.registry_image) parts.push(`image:${artifact.registry_image}`);
+  if (artifact.build_status) parts.push(`build:${artifact.build_status}`);
+  if (typeof artifact.duration_seconds === 'number') {
+    const formatted = formatDurationSeconds(artifact.duration_seconds);
+    if (formatted) parts.push(`duration:${formatted}`);
+  }
+  return parts.length > 0 ? `${shortDigest} (${parts.join(', ')})` : shortDigest;
 }
 
 export default function LifecycleRunProgress({ run, onSelect }: Props) {
@@ -41,7 +82,13 @@ export default function LifecycleRunProgress({ run, onSelect }: Props) {
         <div>
           <p className="text-sm font-semibold">Run #{run.run.id}</p>
           <p className="text-xs text-slate-500">
-            Started {new Date(run.run.started_at).toLocaleString()} · {formatDuration(run.run.started_at, run.run.completed_at)}
+            Started {new Date(run.run.started_at).toLocaleString()} ·
+            {(() => {
+              const formatted =
+                formatDurationSeconds(run.duration_seconds ?? null) ??
+                fallbackDuration(run.run.started_at, run.run.completed_at);
+              return formatted ? ` ${formatted}` : ' unknown duration';
+            })()}
           </p>
         </div>
         <span className={statusBadge}>{run.run.status}</span>
@@ -65,6 +112,26 @@ export default function LifecycleRunProgress({ run, onSelect }: Props) {
           Awaiting approval – state: {run.run.approval_state ?? 'pending'}
         </p>
       )}
+      <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-slate-600">
+        {summarizeAttempt(run.retry_attempt ?? null, run.retry_limit ?? null) && (
+          <span className="rounded border border-slate-200 bg-slate-50 px-2 py-0.5">
+            Attempt {summarizeAttempt(run.retry_attempt ?? null, run.retry_limit ?? null)}
+          </span>
+        )}
+        {run.override_reason && (
+          <span className="rounded border border-amber-200 bg-amber-50 px-2 py-0.5 text-amber-700">
+            Override: {run.override_reason}
+          </span>
+        )}
+        {(run.artifacts ?? []).map((artifact) => (
+          <span
+            key={`${run.run.id}-${artifact.manifest_digest}-${artifact.manifest_tag ?? ''}`}
+            className="rounded border border-sky-200 bg-sky-50 px-2 py-0.5 text-sky-700"
+          >
+            {summarizeArtifact(artifact)}
+          </span>
+        ))}
+      </div>
     </div>
   );
 }

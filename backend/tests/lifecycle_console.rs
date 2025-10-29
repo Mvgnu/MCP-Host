@@ -274,6 +274,20 @@ async fn lifecycle_console_returns_workspace_snapshot(pool: PgPool) {
     }));
     assert!(runs.iter().any(|run| run.get("marketplace").is_some()));
 
+    let first_run = runs.first().expect("at least one run snapshot");
+    assert!(first_run.get("duration_seconds").is_some());
+    let artifacts = first_run
+        .get("artifacts")
+        .and_then(|value| value.as_array())
+        .expect("artifacts array");
+    assert!(artifacts.iter().any(|artifact| {
+        artifact
+            .get("manifest_digest")
+            .and_then(|value| value.as_str())
+            .map(|digest| digest == fixture.manifest_digest)
+            .unwrap_or(false)
+    }));
+
     let promotion_runs = snapshot
         .get("promotion_runs")
         .and_then(|value| value.as_array())

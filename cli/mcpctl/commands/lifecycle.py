@@ -245,13 +245,34 @@ def _render_workspace(snapshot: Mapping[str, Any]) -> None:
                     "id": run_body.get("id"),
                     "status": run_body.get("status"),
                     "playbook": run_body.get("playbook"),
+                    "attempt": _summarize_attempt(
+                        run.get("retry_attempt"), run.get("retry_limit")
+                    ),
+                    "duration": _summarize_duration(run.get("duration_seconds")),
+                    "override": run.get("override_reason") or "-",
                     "trust": _summarize_trust(run.get("trust")),
                     "market": _summarize_marketplace(run.get("marketplace")),
+                    "artifacts": _summarize_artifacts(run.get("artifacts")),
                 }
             )
         if rows:
             print("Recent remediation runs:")
-            print(render_table(rows, ["id", "status", "playbook", "trust", "market"]))
+            print(
+                render_table(
+                    rows,
+                    [
+                        "id",
+                        "status",
+                        "playbook",
+                        "attempt",
+                        "duration",
+                        "override",
+                        "trust",
+                        "market",
+                        "artifacts",
+                    ],
+                )
+            )
     print("")
 
 
@@ -282,7 +303,13 @@ def _render_delta(delta: Mapping[str, Any]) -> None:
 
 def _summarize_field_changes(run_delta: Mapping[str, Any]) -> str:
     summaries: list[str] = []
-    for key in ("automation_payload_changes", "gate_context_changes", "metadata_changes"):
+    for key in (
+        "automation_payload_changes",
+        "gate_context_changes",
+        "metadata_changes",
+        "analytics_changes",
+        "artifact_changes",
+    ):
         changes = run_delta.get(key)
         if not isinstance(changes, Iterable):
             continue
@@ -330,6 +357,51 @@ def _summarize_marketplace(value: Any) -> str:
     if status and completed:
         return f"{status} @ {completed}"
     return status or "-"
+
+
+def _summarize_duration(value: Any) -> str:
+    if isinstance(value, (int, float)):
+        return f"{int(value)}s"
+    return "-"
+
+
+def _summarize_attempt(attempt: Any, retry_limit: Any) -> str:
+    attempt_value = attempt if isinstance(attempt, (int, float)) else None
+    limit_value = retry_limit if isinstance(retry_limit, (int, float)) else None
+    if attempt_value is None and limit_value is None:
+        return "-"
+    if limit_value is None:
+        return f"{int(attempt_value)}"
+    if attempt_value is None:
+        return f"-/ {int(limit_value)}"
+    return f"{int(attempt_value)}/{int(limit_value)}"
+
+
+def _summarize_artifacts(value: Any) -> str:
+    if not isinstance(value, Iterable):
+        return "-"
+    entries = []
+    for artifact in value:
+        if not isinstance(artifact, Mapping):
+            continue
+        digest = artifact.get("manifest_digest")
+        lane = artifact.get("lane")
+        stage = artifact.get("stage")
+        tag = artifact.get("manifest_tag")
+        summary = str(digest) if digest else "artifact"
+        details = []
+        if lane:
+            details.append(f"lane={lane}")
+        if stage:
+            details.append(f"stage={stage}")
+        if tag:
+            details.append(f"tag={tag}")
+        if details:
+            summary = f"{summary} ({', '.join(details)})"
+        entries.append(summary)
+    if not entries:
+        return "-"
+    return "; ".join(entries)
 
 
 def _extract_string(data: Mapping[str, Any], keys: Iterable[str]) -> Optional[str]:

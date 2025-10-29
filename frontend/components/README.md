@@ -17,6 +17,7 @@ This directory contains reusable UI components used across the MCP Host frontend
   - **LifecycleRunProgress** – highlights run status, timing, and approval state metadata
   - **LifecycleTrustOverlay** – surfaces trust registry, intelligence scores, and marketplace readiness for each run
   - **LifecycleVerdictCard** – summarizes active revision gate snapshots and promotion verdicts
+  - **Tests** – `console/__tests__/LifecycleRunProgress.test.tsx` validates analytics chip formatting and duration fallbacks
 
 These components follow the design principles in `../../design-vision.md` and
 include musikconnect tags for tooling.
