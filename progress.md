@@ -7,6 +7,11 @@ This document tracks development progress and high level notes from the planning
 - Added `mcpctl lifecycle list|watch` commands that render promotion automation tables, promotion posture verdicts, and remediation run summaries while streaming delta updates for promotion runs.
 - Refreshed CLI regression tests to cover lifecycle snapshots/deltas and updated documentation to advertise the new lifecycle console workflows.
 
+## 2025-12-10
+- Landed the lifecycle automation & analytics contract: persisted canonical run analytics columns (`analytics_duration_ms`, execution window timestamps, retry ledger/count, override actor, promotion verdict linkage) via migration `0040_lifecycle_automation_contract.sql` and threaded the metadata through `LifecycleRunSnapshot`/`LifecycleRunDelta`.
+- Updated REST/SSE builders, documentation, and TypeScript contracts so console clients and downstream services receive duration windows, retry ledgers, manual override provenance, artifact fingerprints, and promotion verdict references alongside existing trust/intelligence payloads.
+- Enhanced the mission-control CLI (`mcpctl lifecycle list|watch`) and React console components to surface the richer analytics story, including retry badges, override actors, fingerprint chips, and verdict callouts; refreshed tests to lock the new schema.
+
 ## 2025-12-08
 - Wired promotion scheduling to query remediation runs, trust registry posture, and capability intelligence scores before persisting new records, emitting machine-readable notes and JSON veto payloads when posture is unhealthy.
 - Added `PromotionPostureSignals`/`PromotionVerdict` helpers with targeted unit tests so blended promotion gates stay deterministic as new signals land.

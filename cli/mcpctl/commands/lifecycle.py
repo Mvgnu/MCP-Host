@@ -248,8 +248,19 @@ def _render_workspace(snapshot: Mapping[str, Any]) -> None:
                     "attempt": _summarize_attempt(
                         run.get("retry_attempt"), run.get("retry_limit")
                     ),
-                    "duration": _summarize_duration(run.get("duration_seconds")),
+                    "retries": _summarize_retry_count(run.get("retry_count")),
+                    "retry_ledger": _summarize_retry_ledger(run.get("retry_ledger")),
+                    "duration": _summarize_duration(
+                        run.get("duration_seconds"), run.get("duration_ms")
+                    ),
                     "override": run.get("override_reason") or "-",
+                    "override_actor": _summarize_override_actor(run.get("manual_override")),
+                    "promotion": _summarize_promotion_verdict(
+                        run.get("promotion_verdict")
+                    ),
+                    "fingerprints": _summarize_fingerprints(
+                        run.get("artifact_fingerprints")
+                    ),
                     "trust": _summarize_trust(run.get("trust")),
                     "market": _summarize_marketplace(run.get("marketplace")),
                     "artifacts": _summarize_artifacts(run.get("artifacts")),
@@ -265,8 +276,13 @@ def _render_workspace(snapshot: Mapping[str, Any]) -> None:
                         "status",
                         "playbook",
                         "attempt",
+                        "retries",
+                        "retry_ledger",
                         "duration",
                         "override",
+                        "override_actor",
+                        "promotion",
+                        "fingerprints",
                         "trust",
                         "market",
                         "artifacts",
@@ -437,10 +453,24 @@ def _summarize_marketplace(value: Any) -> str:
     return status or "-"
 
 
-def _summarize_duration(value: Any) -> str:
-    if isinstance(value, (int, float)):
-        return f"{int(value)}s"
-    return "-"
+def _summarize_duration(seconds: Any, milliseconds: Any | None = None) -> str:
+    duration_seconds: float | None = None
+    if isinstance(milliseconds, (int, float)):
+        duration_seconds = max(0.0, float(milliseconds) / 1000.0)
+    elif isinstance(seconds, (int, float)):
+        duration_seconds = max(0.0, float(seconds))
+
+    if duration_seconds is None:
+        return "-"
+
+    total_seconds = int(duration_seconds)
+    minutes, rem_seconds = divmod(total_seconds, 60)
+    hours, rem_minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {rem_minutes}m"
+    if rem_minutes:
+        return f"{rem_minutes}m {rem_seconds}s"
+    return f"{rem_seconds}s"
 
 
 def _summarize_attempt(attempt: Any, retry_limit: Any) -> str:
@@ -453,6 +483,79 @@ def _summarize_attempt(attempt: Any, retry_limit: Any) -> str:
     if attempt_value is None:
         return f"-/ {int(limit_value)}"
     return f"{int(attempt_value)}/{int(limit_value)}"
+
+
+def _summarize_retry_count(value: Any) -> str:
+    if isinstance(value, (int, float)):
+        if value <= 0:
+            return "-"
+        return f"{int(value)}x"
+    return "-"
+
+
+def _summarize_retry_ledger(value: Any) -> str:
+    if isinstance(value, list) and value:
+        latest = value[-1]
+        if isinstance(latest, Mapping):
+            attempt = latest.get("attempt")
+            status = latest.get("status")
+            observed = latest.get("observed_at")
+            parts: list[str] = []
+            if isinstance(attempt, (int, float)):
+                parts.append(f"#{int(attempt)}")
+            if isinstance(status, str) and status:
+                parts.append(status)
+            if isinstance(observed, str) and observed:
+                parts.append(observed)
+            if parts:
+                return " ".join(parts)
+    return "-"
+
+
+def _summarize_override_actor(value: Any) -> str:
+    if isinstance(value, Mapping):
+        actor_email = value.get("actor_email")
+        actor_id = value.get("actor_id")
+        if isinstance(actor_email, str) and actor_email:
+            return actor_email
+        if isinstance(actor_id, (int, float)):
+            return f"user#{int(actor_id)}"
+    return "-"
+
+
+def _summarize_promotion_verdict(value: Any) -> str:
+    if isinstance(value, Mapping):
+        verdict_id = value.get("verdict_id")
+        allowed = value.get("allowed")
+        stage = value.get("stage")
+        track = value.get("track_name")
+        parts: list[str] = []
+        if isinstance(verdict_id, (int, float)):
+            parts.append(f"#{int(verdict_id)}")
+        if isinstance(allowed, bool):
+            parts.append("allowed" if allowed else "blocked")
+        if isinstance(stage, str) and stage:
+            parts.append(stage)
+        if isinstance(track, str) and track:
+            parts.append(track)
+        if parts:
+            return " ".join(parts)
+    return "-"
+
+
+def _summarize_fingerprints(value: Any) -> str:
+    if isinstance(value, list) and value:
+        rendered: list[str] = []
+        for entry in value[:3]:
+            if isinstance(entry, Mapping):
+                digest = entry.get("manifest_digest")
+                fingerprint = entry.get("fingerprint")
+                if isinstance(digest, str) and isinstance(fingerprint, str):
+                    rendered.append(f"{digest[:12]}={fingerprint[:12]}")
+        if rendered:
+            suffix = "" if len(value) <= 3 else "…"
+            return ", ".join(rendered) + suffix
+    return "-"
 
 
 def _summarize_artifacts(value: Any) -> str:

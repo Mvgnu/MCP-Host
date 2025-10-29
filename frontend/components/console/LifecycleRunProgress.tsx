@@ -25,6 +25,13 @@ function formatDurationSeconds(durationSeconds?: number | null) {
   return remMinutes === 0 ? `${hours}h` : `${hours}h ${remMinutes}m`;
 }
 
+function formatDurationMs(durationMs?: number | null) {
+  if (typeof durationMs !== 'number' || Number.isNaN(durationMs) || durationMs < 0) {
+    return undefined;
+  }
+  return formatDurationSeconds(durationMs / 1000);
+}
+
 function fallbackDuration(startedAt: string, completedAt?: string | null) {
   const started = new Date(startedAt).getTime();
   const finished = completedAt ? new Date(completedAt).getTime() : Date.now();
@@ -44,6 +51,30 @@ function summarizeAttempt(attempt?: number | null, retryLimit?: number | null) {
   return `${attemptPart}/${Math.floor(retryLimit)}`;
 }
 
+function summarizeRetryCount(count?: number | null) {
+  if (typeof count !== 'number' || Number.isNaN(count) || count < 0) {
+    return undefined;
+  }
+  if (count === 1) {
+    return '1 attempt logged';
+  }
+  return `${Math.floor(count)} attempts logged`;
+}
+
+function summarizeRetryLedger(run: LifecycleRunSnapshot) {
+  const ledger = run.retry_ledger ?? [];
+  if (ledger.length === 0) {
+    return undefined;
+  }
+  const latest = ledger[ledger.length - 1];
+  const observed = latest.observed_at ? new Date(latest.observed_at).toLocaleString() : undefined;
+  const pieces: string[] = [`latest #${Math.floor(latest.attempt)}`];
+  if (latest.status) pieces.push(latest.status);
+  if (latest.reason) pieces.push(`reason:${latest.reason}`);
+  if (observed) pieces.push(observed);
+  return pieces.join(' · ');
+}
+
 function summarizeArtifact(artifact: LifecycleRunArtifact) {
   const digest = artifact.manifest_digest;
   const shortDigest = digest.length > 12 ? `${digest.slice(0, 12)}…` : digest;
@@ -58,6 +89,45 @@ function summarizeArtifact(artifact: LifecycleRunArtifact) {
     if (formatted) parts.push(`duration:${formatted}`);
   }
   return parts.length > 0 ? `${shortDigest} (${parts.join(', ')})` : shortDigest;
+}
+
+function summarizeOverride(run: LifecycleRunSnapshot) {
+  const override = run.manual_override;
+  if (!override) {
+    return run.override_reason ?? undefined;
+  }
+  const pieces = [override.reason];
+  if (override.actor_email) {
+    pieces.push(`actor:${override.actor_email}`);
+  } else if (typeof override.actor_id === 'number') {
+    pieces.push(`actor-id:${override.actor_id}`);
+  }
+  return pieces.join(' · ');
+}
+
+function summarizeFingerprints(run: LifecycleRunSnapshot) {
+  const fingerprints = run.artifact_fingerprints ?? [];
+  if (fingerprints.length === 0) {
+    return undefined;
+  }
+  return fingerprints
+    .map((entry) => `${entry.manifest_digest.slice(0, 12)}…=${entry.fingerprint.slice(0, 16)}…`)
+    .join(', ');
+}
+
+function summarizePromotion(verdict?: LifecycleRunSnapshot['promotion_verdict']) {
+  if (!verdict) {
+    return undefined;
+  }
+  const parts: string[] = [];
+  parts.push(`verdict #${verdict.verdict_id}`);
+  if (typeof verdict.allowed === 'boolean') {
+    parts.push(verdict.allowed ? 'allowed' : 'blocked');
+  }
+  if (verdict.stage) parts.push(`stage:${verdict.stage}`);
+  if (verdict.track_name) parts.push(`track:${verdict.track_name}`);
+  if (verdict.track_tier) parts.push(`tier:${verdict.track_tier}`);
+  return parts.join(' · ');
 }
 
 export default function LifecycleRunProgress({ run, onSelect }: Props) {
@@ -76,19 +146,21 @@ export default function LifecycleRunProgress({ run, onSelect }: Props) {
     }
   }, [run.run.status]);
 
+  const startedAt = run.execution_window?.started_at ?? run.run.started_at;
+  const completedAt = run.execution_window?.completed_at ?? run.run.completed_at;
+  const durationDisplay =
+    formatDurationMs(run.duration_ms ?? null) ??
+    formatDurationSeconds(run.duration_seconds ?? null) ??
+    fallbackDuration(startedAt, completedAt);
+
   return (
     <div className="border border-slate-200 rounded p-3 bg-white shadow-sm">
       <div className="flex items-center justify-between gap-2">
         <div>
           <p className="text-sm font-semibold">Run #{run.run.id}</p>
           <p className="text-xs text-slate-500">
-            Started {new Date(run.run.started_at).toLocaleString()} ·
-            {(() => {
-              const formatted =
-                formatDurationSeconds(run.duration_seconds ?? null) ??
-                fallbackDuration(run.run.started_at, run.run.completed_at);
-              return formatted ? ` ${formatted}` : ' unknown duration';
-            })()}
+            Started {new Date(startedAt).toLocaleString()} ·
+            {durationDisplay ? ` ${durationDisplay}` : ' unknown duration'}
           </p>
         </div>
         <span className={statusBadge}>{run.run.status}</span>
@@ -118,9 +190,34 @@ export default function LifecycleRunProgress({ run, onSelect }: Props) {
             Attempt {summarizeAttempt(run.retry_attempt ?? null, run.retry_limit ?? null)}
           </span>
         )}
+        {summarizeRetryCount(run.retry_count ?? null) && (
+          <span className="rounded border border-slate-200 bg-slate-50 px-2 py-0.5">
+            {summarizeRetryCount(run.retry_count ?? null)}
+          </span>
+        )}
+        {summarizeRetryLedger(run) && (
+          <span className="rounded border border-slate-200 bg-slate-50 px-2 py-0.5">
+            {summarizeRetryLedger(run)}
+          </span>
+        )}
         {run.override_reason && (
           <span className="rounded border border-amber-200 bg-amber-50 px-2 py-0.5 text-amber-700">
             Override: {run.override_reason}
+          </span>
+        )}
+        {summarizeOverride(run) && summarizeOverride(run) !== run.override_reason && (
+          <span className="rounded border border-amber-200 bg-amber-50 px-2 py-0.5 text-amber-700">
+            {summarizeOverride(run)}
+          </span>
+        )}
+        {summarizePromotion(run.promotion_verdict) && (
+          <span className="rounded border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-emerald-700">
+            {summarizePromotion(run.promotion_verdict)}
+          </span>
+        )}
+        {summarizeFingerprints(run) && (
+          <span className="rounded border border-slate-200 bg-slate-50 px-2 py-0.5">
+            Fingerprints: {summarizeFingerprints(run)}
           </span>
         )}
         {(run.artifacts ?? []).map((artifact) => (

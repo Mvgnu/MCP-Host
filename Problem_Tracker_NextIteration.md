@@ -146,6 +146,14 @@
     - 2025-11-05 11:18:00 UTC: Added backlog entry to explore rule-based or learned scoring feeding into runtime policy decisions.
     - 2025-11-10 09:45:00 UTC: Implemented capability intelligence schema, recomputation workers, policy gating, REST/CLI surfacing, and regression tests validating degraded scores trigger visibility.
 
+- ID: BE-LIFE-ANALYTICS
+  Status: DONE
+  Task: Deliver lifecycle automation & analytics contract across REST, SSE, console, and CLI surfaces.
+  Hypothesis: Persisting canonical lifecycle analytics (durations, retries, overrides, artifact fingerprints, promotion verdict links) and threading them through streaming/REST contracts plus operator surfaces will unlock trustworthy automation narratives for mission control.
+  Log:
+    - 2025-11-24 20:15:00 UTC: Initiated schema and contract expansion pass after auditing existing lifecycle snapshot fields and downstream consumers.
+    - 2025-11-24 21:35:00 UTC: Completed targeted `cargo test --locked lifecycle_console` run (pass), attempted full `cargo test --locked` noting existing remediation_api fixture regressions, exercised CLI coverage with `PYTHONPATH=cli pytest cli/tests/test_cli.py` (pass), and documented frontend lint/test blockers (Next.js ESLint bootstrap prompt, Jest TSX transform gap) pending follow-up.
+
 - ID: BE-EVAL-004
   Status: DONE
   Task: Automate evaluation evidence lifecycle management.

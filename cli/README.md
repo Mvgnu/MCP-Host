@@ -40,8 +40,10 @@ Lists marketplace artifacts and their active status. Pass `--json` to receive ra
 
 ### Lifecycle console
 
-* `mcpctl lifecycle list [--lifecycle-state STATE] [--owner-id USER] [--promotion-lane LANE]` – fetch lifecycle console snapshots with promotion automation context, posture verdicts, and recent remediation runs.
+* `mcpctl lifecycle list [--lifecycle-state STATE] [--owner-id USER] [--promotion-lane LANE]` – fetch lifecycle console snapshots with promotion automation context, posture verdicts, and recent remediation runs, including duration windows, retry ledgers, manual override provenance, artifact fingerprints, and linked promotion verdicts.
 * `mcpctl lifecycle watch [filters]` – subscribe to the lifecycle SSE feed and stream promotion automation deltas, gate verdicts, retry/duration analytics, artifact provenance updates, and heartbeat metadata in real time.
+
+`mcpctl lifecycle list` renders per-run columns for `attempt`, total `retries`, ledger summaries, duration (seconds/ms), override actors, promotion verdict references, artifact fingerprints, trust posture, marketplace readiness, and artifact provenance so operators can pivot between CLI and console views without losing analytics coverage.
 
 ### Policy insights
 
