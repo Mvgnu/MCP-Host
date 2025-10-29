@@ -185,6 +185,87 @@ the promotion orchestration helper to hydrate the latest per-workspace automatio
 delta envelopes now include `promotion_run_deltas`/`removed_promotion_run_ids` so clients can
 diff automation refreshes without dropping cached state.
 
+#### Lifecycle SSE event schema
+
+Lifecycle streaming responses (`GET /api/console/lifecycle/stream`) emit Server-Sent Events with
+the JSON envelope described below. Promotion automation parity hinges on the `promotion_runs`
+collection and the replay-safe `promotion_run_deltas` payload.
+
+```json
+{
+  "type": "snapshot",                 // "snapshot", "heartbeat", or "error"
+  "emitted_at": "2025-12-09T12:00:00Z",
+  "cursor": 42,
+  "page": {
+    "workspaces": [
+      {
+        "workspace": { "id": 17, "workspace_key": "workspace-alpha", "lifecycle_state": "active" },
+        "promotion_runs": [
+          {
+            "id": 321,
+            "status": "pending",
+            "playbook": "verify-automation",
+            "automation_payload": { "lane": "prod" },
+            "promotion_gate_context": { "lane": "prod", "stage": "production" },
+            "metadata": { "notes": ["preflight"] }
+          }
+        ],
+        "promotion_postures": [
+          {
+            "promotion_id": 77,
+            "status": "pending",
+            "allowed": false,
+            "track_name": "stable",
+            "track_tier": "tier-1",
+            "stage": "production",
+            "updated_at": "2025-12-09T00:00:00Z",
+            "remediation_hooks": ["policy_hook:remediation_gate"]
+          }
+        ],
+        "recent_runs": [
+          {
+            "run": { "id": 44, "status": "succeeded", "playbook": "verify-automation" },
+            "trust": { "attestation_status": "trusted", "lifecycle_state": "restored" },
+            "intelligence": [],
+            "marketplace": { "status": "ready", "last_completed_at": "2025-12-08T10:00:00Z" }
+          }
+        ]
+      }
+    ]
+  },
+  "delta": {
+    "workspaces": [
+      {
+        "workspace_id": 17,
+        "promotion_run_deltas": [
+          {
+            "run_id": 321,
+            "status": "succeeded",
+            "automation_payload_changes": [
+              {
+                "field": "promotion_run.automation_payload",
+                "previous": "{\"lane\":\"prod\"}",
+                "current": "{\"lane\":\"prod\",\"result\":\"ok\"}"
+              }
+            ],
+            "gate_context_changes": [],
+            "metadata_changes": []
+          }
+        ],
+        "removed_promotion_run_ids": [222],
+        "promotion_posture_deltas": [],
+        "removed_promotion_ids": []
+      }
+    ]
+  }
+}
+```
+
+Heartbeat events omit the `page` and `delta` payload, carrying only the envelope metadata. CLI and
+frontend consumers should honour the cursor for resume support and replay the delta arrays in
+order, applying `removed_*` identifiers after processing the change lists to preserve cache
+integrity.
+
 ### Backend crate structure
 
 To avoid the duplicate-type compilation failures that occurred when both the library and binary

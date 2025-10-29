@@ -12,6 +12,7 @@ import sys
 from ..client import APIClient, APIError
 from ..renderers import dumps_json, render_table
 from . import evaluations as evaluations_commands
+from . import lifecycle as lifecycle_commands
 from . import remediation as remediation_commands
 
 _RESET = "\033[0m"
@@ -132,6 +133,10 @@ def install_trust(subparsers: _SubParsersAction[ArgumentParser]) -> None:
 
 def install_remediation(subparsers: _SubParsersAction[ArgumentParser]) -> None:
     remediation_commands.install(subparsers, _add_common_arguments)
+
+
+def install_lifecycle(subparsers: _SubParsersAction[ArgumentParser]) -> None:
+    lifecycle_commands.install(subparsers, _add_common_arguments)
 
 
 def install_promotions(subparsers: _SubParsersAction[ArgumentParser]) -> None:
