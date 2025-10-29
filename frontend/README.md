@@ -38,6 +38,11 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to see the
 - Playwright regression coverage for filters, offline resume, and SSE replay semantics lives in `e2e/console.spec.ts`; run
   `npx playwright test e2e/console.spec.ts` against a running development server to capture updated expectations.
 
+### Testing & Coverage
+
+- Install dependencies with `npm install --legacy-peer-deps` to satisfy the current React 19 peer constraints in the testing stack.
+- Run unit tests with coverage via `npm test -- --coverage`. The suite is configured through `tsconfig.jest.json` so Jest can compile the lifecycle console components and their JSX fixtures.
+
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
 ## Learn More

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::convert::Infallible;
 
 use axum::{
@@ -280,11 +281,11 @@ fn parse_instance_id(value: &Value) -> Option<i64> {
     }
 }
 
-fn collect_target_entries(value: Option<&Value>) -> Vec<Value> {
+fn collect_target_entries(value: Option<&Value>, allow_root_targets: bool) -> Vec<Value> {
     let mut targets = Vec::new();
     if let Some(value) = value {
         let context = Map::new();
-        collect_target_entries_recursive(value, &context, &mut targets);
+        collect_target_entries_recursive(value, &context, &mut targets, allow_root_targets);
     }
     targets
 }
@@ -293,18 +294,19 @@ fn collect_target_entries_recursive(
     value: &Value,
     context: &Map<String, Value>,
     targets: &mut Vec<Value>,
+    allow_current: bool,
 ) {
     match value {
         Value::Array(items) => {
             for item in items {
-                collect_target_entries_recursive(item, context, targets);
+                collect_target_entries_recursive(item, context, targets, true);
             }
         }
         Value::Object(map) => {
             let has_instance =
                 map.contains_key("runtime_vm_instance_id") || map.contains_key("instance_id");
 
-            if has_instance {
+            if has_instance && allow_current {
                 let mut snapshot = Map::new();
                 for (key, value) in map {
                     snapshot.insert(key.clone(), value.clone());
@@ -328,14 +330,14 @@ fn collect_target_entries_recursive(
             }
 
             if let Some(targets_value) = map.get("targets") {
-                collect_target_entries_recursive(targets_value, &next_context, targets);
+                collect_target_entries_recursive(targets_value, &next_context, targets, true);
             }
 
             for (key, child) in map {
                 if key == "targets" {
                     continue;
                 }
-                collect_target_entries_recursive(child, &next_context, targets);
+                collect_target_entries_recursive(child, &next_context, targets, true);
             }
         }
         _ => {}
@@ -351,11 +353,29 @@ fn extract_promotion_targets(
     revision: &RuntimeVmRemediationWorkspaceRevision,
 ) -> Vec<PromotionAutomationTarget> {
     let mut entries = Vec::new();
-    entries.extend(collect_target_entries(revision.plan.get("targets")));
-    entries.extend(collect_target_entries(revision.metadata.get("targets")));
-    entries.extend(collect_target_entries(workspace.metadata.get("targets")));
+    entries.extend(collect_target_entries(revision.plan.get("targets"), true));
+    entries.extend(collect_target_entries(workspace.metadata.get("targets"), false));
+    entries.extend(collect_target_entries(revision.metadata.get("targets"), false));
 
-    if entries.is_empty() {
+    let mut deduped_entries = Vec::new();
+    let mut seen_instance_ids = HashSet::new();
+
+    for entry in entries {
+        let instance_id = entry
+            .get("runtime_vm_instance_id")
+            .or_else(|| entry.get("instance_id"))
+            .and_then(parse_instance_id);
+
+        if let Some(id) = instance_id {
+            if seen_instance_ids.insert(id) {
+                deduped_entries.push(entry);
+            }
+        } else {
+            deduped_entries.push(entry);
+        }
+    }
+
+    if deduped_entries.is_empty() {
         if let Some(id) = revision
             .metadata
             .get("runtime_vm_instance_id")
@@ -367,7 +387,7 @@ fn extract_promotion_targets(
                     .and_then(parse_instance_id)
             })
         {
-            entries.push(json!({
+            deduped_entries.push(json!({
                 "runtime_vm_instance_id": id,
                 "source": "workspace-default",
             }));
@@ -383,9 +403,9 @@ fn extract_promotion_targets(
         .map(|value| value.to_string());
 
     let mut targets = Vec::new();
-    trace!(target_count = entries.len(), "processing promotion targets");
+    trace!(target_count = deduped_entries.len(), "processing promotion targets");
 
-    for entry in entries {
+    for entry in deduped_entries {
         let instance_id = entry
             .get("runtime_vm_instance_id")
             .or_else(|| entry.get("instance_id"))

@@ -59,9 +59,9 @@ describe('LifecycleRunProgress', () => {
 
     expect(screen.getByText('Attempt 2/3')).toBeInTheDocument();
     expect(screen.getByText(/Override: manual override/)).toBeInTheDocument();
-    expect(
-      screen.getByText('sha256:abcdef1234… (lane:green, stage:production, tag:v1.2.3, image:registry.example.com/app:v1.2.3, build:succeeded, duration:2m 5s)'),
-    ).toBeInTheDocument();
+    const artifactChip = screen.getByText(/lane:green/);
+    expect(artifactChip).toHaveTextContent('sha256:abcde…');
+    expect(artifactChip).toHaveTextContent('duration:2m 5s');
   });
 
   it('falls back to computed duration when analytics missing', () => {

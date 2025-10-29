@@ -45,8 +45,7 @@
       "^.+\\.(t|j)sx?$": [
         "ts-jest",
         {
-          "tsconfig": "tsconfig.json",
-          "useESM": true
+          "tsconfig": "tsconfig.jest.json"
         }
       ]
     },
