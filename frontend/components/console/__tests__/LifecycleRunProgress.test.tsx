@@ -138,7 +138,16 @@ describe('LifecycleRunProgress', () => {
     });
 
     const onSelect = jest.fn();
-    render(<LifecycleRunProgress run={run} onSelect={onSelect} />);
+    const onApprove = jest.fn();
+    const onReject = jest.fn();
+    render(
+      <LifecycleRunProgress
+        run={run}
+        onSelect={onSelect}
+        onApprove={onApprove}
+        onReject={onReject}
+      />,
+    );
 
     expect(screen.getByText(/Attempt\s+–\/4/)).toBeInTheDocument();
     expect(screen.getByText('5 attempts logged')).toBeInTheDocument();
@@ -146,7 +155,11 @@ describe('LifecycleRunProgress', () => {
     expect(screen.getByText(/force override · actor:ops@example.com/)).toBeInTheDocument();
     expect(screen.getByText(/verdict #555 · blocked · stage:production · track:stable · tier:gold/)).toBeInTheDocument();
     expect(screen.getByText(/Fingerprints:/)).toHaveTextContent(/sha256:abcde…=f47ac10b58cc4372…/);
-    expect(screen.getByText(/Awaiting approval/)).toBeInTheDocument();
+    expect(screen.getByText(/Approval state: pending/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Approve/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Reject/ }));
+    expect(onApprove).toHaveBeenCalledWith(run);
+    expect(onReject).toHaveBeenCalledWith(run);
     expect(screen.getByText(/Failure: exhausted/)).toBeInTheDocument();
     expect(screen.getByText(/Started.*2m 5s/)).toBeInTheDocument();
     expect(

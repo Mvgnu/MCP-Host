@@ -1094,3 +1094,85 @@ def test_keys_list_falls_back_to_notice(
     cli_module.main(["keys", "list", "tenant-2"])
     captured = capsys.readouterr()
     assert "not yet implemented" in captured.err
+
+
+def test_billing_plans_renders_table(capsys: pytest.CaptureFixture[str]) -> None:
+    FakeClient.responses[("GET", "/api/billing/plans")] = [
+        {
+            "id": "plan-1",
+            "code": "starter",
+            "name": "Starter",
+            "billing_period": "monthly",
+            "amount_cents": 9900,
+        }
+    ]
+
+    cli_module.main(["billing", "plans"])
+    output = capsys.readouterr().out
+    assert "starter" in output
+    assert FakeClient.calls[0] == ("GET", "/api/billing/plans", {})
+
+
+def test_billing_assign_resolves_plan_code() -> None:
+    FakeClient.responses[("GET", "/api/billing/plans")] = [
+        {
+            "id": "plan-uuid",
+            "code": "pro",
+            "name": "Pro",
+            "billing_period": "monthly",
+            "amount_cents": 19900,
+        }
+    ]
+    FakeClient.responses[("POST", "/api/billing/organizations/7/subscription")] = {
+        "subscription": {"id": "sub-uuid", "status": "active"},
+        "plan": {"id": "plan-uuid", "name": "Pro"},
+    }
+
+    cli_module.main(
+        [
+            "billing",
+            "assign",
+            "7",
+            "--plan-code",
+            "pro",
+        ]
+    )
+
+    assert FakeClient.calls[0] == ("GET", "/api/billing/plans", {})
+    assert FakeClient.calls[1] == (
+        "POST",
+        "/api/billing/organizations/7/subscription",
+        {"plan_id": "plan-uuid"},
+    )
+
+
+def test_billing_quota_renders_notes(capsys: pytest.CaptureFixture[str]) -> None:
+    FakeClient.responses[(
+        "POST",
+        "/api/billing/organizations/3/quotas/check",
+    )] = {
+        "outcome": {
+            "entitlement_key": "runtime.concurrent_servers",
+            "allowed": True,
+            "limit_quantity": 10,
+            "used_quantity": 4,
+            "remaining_quantity": 6,
+            "notes": ["billing:quota:runtime.concurrent_servers:4/10"],
+        },
+        "recorded": False,
+    }
+
+    cli_module.main(
+        [
+            "billing",
+            "quota",
+            "3",
+            "--entitlement",
+            "runtime.concurrent_servers",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert "runtime.concurrent_servers" in output
+    assert "4" in output
+    assert FakeClient.calls[-1][0] == "POST"

@@ -4,7 +4,7 @@ use axum::{
     extract::{Extension, Path},
     Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sqlx::{PgPool, Row};
 
 #[derive(Serialize)]

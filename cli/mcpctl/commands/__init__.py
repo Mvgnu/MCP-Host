@@ -11,6 +11,7 @@ import sys
 
 from ..client import APIClient, APIError
 from ..renderers import dumps_json, render_table
+from . import billing as billing_commands
 from . import evaluations as evaluations_commands
 from . import keys as keys_commands
 from . import lifecycle as lifecycle_commands
@@ -142,6 +143,10 @@ def install_lifecycle(subparsers: _SubParsersAction[ArgumentParser]) -> None:
 
 def install_keys(subparsers: _SubParsersAction[ArgumentParser]) -> None:
     keys_commands.install(subparsers, _add_common_arguments)
+
+
+def install_billing(subparsers: _SubParsersAction[ArgumentParser]) -> None:
+    billing_commands.install(subparsers, _add_common_arguments)
 
 
 def install_promotions(subparsers: _SubParsersAction[ArgumentParser]) -> None:

@@ -13,8 +13,8 @@ This directory contains reusable UI components used across the MCP Host frontend
 - **Spinner** – small loading indicator
 - **Alert** – error message display
 - **console/**
-  - **LifecycleTimeline** – renders remediation run timeline rows with trust/intelligence overlays
-  - **LifecycleRunProgress** – highlights run status, timing, and approval state metadata
+  - **LifecycleTimeline** – renders remediation run timeline rows with trust/intelligence overlays and wires run-level approvals
+  - **LifecycleRunProgress** – highlights run status, timing, approval state metadata, and now exposes approve/reject controls with optimistic state badges
   - **LifecycleTrustOverlay** – surfaces trust registry, intelligence scores, and marketplace readiness for each run
   - **LifecycleVerdictCard** – summarizes active revision gate snapshots and promotion verdicts
   - **Tests** – `console/__tests__/LifecycleRunProgress.test.tsx` validates analytics chip formatting and duration fallbacks

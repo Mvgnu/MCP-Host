@@ -52,7 +52,16 @@ Lists marketplace artifacts and their active status. Pass `--json` to receive ra
 * `mcpctl keys rotate PROVIDER_ID KEY_ID --attestation PATH --actor-ref REF` – requests a rotation for an active provider key. The CLI hashes the attestation bundle, forwards a base64 signature, and requires an operator reference for downstream audit trails, matching the backend rotation contract.
 * `mcpctl keys bind PROVIDER_ID KEY_ID --type TYPE --target TARGET [--context JSON]` – attaches a provider key to a workload scope (e.g., workspace or runtime), parsing optional JSON context for audit metadata and surfacing the persisted binding record.
 * `mcpctl keys bindings PROVIDER_ID KEY_ID [--json]` – lists active bindings for a provider key, including binding type, target identifiers, and creation timestamps for operators reconciling workload coverage.
+* `mcpctl keys revoke PROVIDER_ID KEY_ID [--reason TEXT] [--compromised] [--json]` – forces an emergency revocation, optionally flagging the key as compromised and streaming the updated posture.
+* `mcpctl keys audit PROVIDER_ID [--key-id KEY] [--state STATE] [--start RFC3339] [--end RFC3339] [--limit N] [--json]` – retrieves provider key audit events with scoped filtering for forensic review.
 * Additional subcommands (`approve-rotation`, `watch`) remain scaffolded placeholders while backend orchestration endpoints are staged.
+
+### Billing and subscriptions
+
+* `mcpctl billing plans [--json]` – list active billing plans, including code, billing period, and pricing metadata. Operators can resolve plan identifiers prior to provisioning tenants.
+* `mcpctl billing subscription ORGANIZATION_ID [--json]` – inspect the active subscription envelope for an organization (plan, status, current period end).
+* `mcpctl billing assign ORGANIZATION_ID (--plan-id UUID | --plan-code CODE) [--status STATE] [--trial-ends RFC3339] [--json]` – bootstrap or update an organization subscription.
+* `mcpctl billing quota ORGANIZATION_ID --entitlement KEY [--quantity N] [--record] [--json]` – evaluate (and optionally record) entitlement usage. Output includes limits, usage, remaining capacity, and outcome notes that mirror runtime policy annotations.
 
 ### Policy insights
 

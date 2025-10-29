@@ -6,6 +6,9 @@ import { LifecycleRunArtifact, LifecycleRunSnapshot } from '../../lib/lifecycle-
 interface Props {
   run: LifecycleRunSnapshot;
   onSelect?: (run: LifecycleRunSnapshot) => void;
+  onApprove?: (run: LifecycleRunSnapshot) => void;
+  onReject?: (run: LifecycleRunSnapshot) => void;
+  pendingApproval?: boolean;
 }
 
 function formatDurationSeconds(durationSeconds?: number | null) {
@@ -157,7 +160,13 @@ function summarizeProviderKey(posture?: LifecycleRunSnapshot['provider_key_postu
   return parts.join(' · ');
 }
 
-export default function LifecycleRunProgress({ run, onSelect }: Props) {
+export default function LifecycleRunProgress({
+  run,
+  onSelect,
+  onApprove,
+  onReject,
+  pendingApproval = false,
+}: Props) {
   const statusBadge = useMemo(() => {
     const status = run.run.status;
     const base = 'px-2 py-1 rounded text-xs font-semibold';
@@ -180,6 +189,10 @@ export default function LifecycleRunProgress({ run, onSelect }: Props) {
     formatDurationSeconds(run.duration_seconds ?? null) ??
     fallbackDuration(startedAt, completedAt);
   const providerKeySummary = summarizeProviderKey(run.provider_key_posture);
+  const awaitingApproval =
+    run.run.approval_required &&
+    (!run.run.approval_state || run.run.approval_state === 'pending');
+  const approvalState = run.run.approval_state ?? 'pending';
 
   return (
     <div className="border border-slate-200 rounded p-3 bg-white shadow-sm">
@@ -208,9 +221,32 @@ export default function LifecycleRunProgress({ run, onSelect }: Props) {
         </p>
       )}
       {run.run.approval_required && (
-        <p className="mt-2 text-xs text-amber-600">
-          Awaiting approval – state: {run.run.approval_state ?? 'pending'}
-        </p>
+        <div className="mt-2 space-y-2">
+          <p className="text-xs text-amber-600">Approval state: {approvalState}</p>
+          {awaitingApproval && (
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                className="px-2 py-1 text-xs font-medium rounded border border-emerald-200 text-emerald-700 hover:bg-emerald-50 disabled:opacity-50"
+                disabled={!onApprove || pendingApproval}
+                onClick={() => onApprove?.(run)}
+              >
+                Approve
+              </button>
+              <button
+                type="button"
+                className="px-2 py-1 text-xs font-medium rounded border border-rose-200 text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                disabled={!onReject || pendingApproval}
+                onClick={() => onReject?.(run)}
+              >
+                Reject
+              </button>
+              {pendingApproval && (
+                <span className="text-[11px] text-slate-500">Submitting…</span>
+              )}
+            </div>
+          )}
+        </div>
       )}
       <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-slate-600">
         {summarizeAttempt(run.retry_attempt ?? null, run.retry_limit ?? null) && (

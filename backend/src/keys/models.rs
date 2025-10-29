@@ -43,6 +43,16 @@ impl ProviderKeyState {
             ProviderKeyState::Compromised => "compromised",
         }
     }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "active" => ProviderKeyState::Active,
+            "rotating" => ProviderKeyState::Rotating,
+            "retired" => ProviderKeyState::Retired,
+            "compromised" => ProviderKeyState::Compromised,
+            _ => ProviderKeyState::PendingRegistration,
+        }
+    }
 }
 
 /// key: provider-keys-binding-scope

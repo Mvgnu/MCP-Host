@@ -10,6 +10,7 @@ import {
   LifecycleRunDelta,
   LifecycleWorkspaceSnapshot,
 } from '../../../lib/lifecycle-console';
+import { useLifecycleActions } from '../../../lib/lifecycle-actions';
 import {
   LifecycleFilterBar,
   LifecycleRunDrilldownModal,
@@ -70,6 +71,15 @@ export default function LifecycleConsolePage() {
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastCursorRef = useRef<number | null>(null);
   const bootstrapRef = useRef<boolean>(false);
+
+  const {
+    pendingPromotions,
+    pendingApprovals,
+    actionError: actionAlert,
+    clearActionError,
+    applyPromotionStatus,
+    updateRunApproval,
+  } = useLifecycleActions({ workspaces, setWorkspaces, setRunDeltas });
 
   const persistCursor = useCallback((cursor: number | null) => {
     lastCursorRef.current = cursor;
@@ -559,21 +569,89 @@ export default function LifecycleConsolePage() {
         onReset={() => setFilters(DEFAULT_FILTERS)}
       />
       {error && <Alert message={error} />}
+      {actionAlert && (
+        <div className="space-y-1">
+          <Alert message={actionAlert} />
+          <button
+            type="button"
+            className="text-xs text-slate-600 underline"
+            onClick={clearActionError}
+          >
+            Dismiss action message
+          </button>
+        </div>
+      )}
       {loading && <Spinner />}
       <section className="space-y-4">
         {orderedWorkspaces.map((snapshot) => (
           <article key={snapshot.workspace.id} className="space-y-3 border border-slate-200 rounded-lg p-4 bg-white shadow-sm">
-            <div className="flex items-center justify-between flex-wrap gap-2">
+            <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
               <div>
                 <h2 className="text-lg font-semibold">{snapshot.workspace.display_name}</h2>
                 <p className="text-sm text-slate-600">State: {snapshot.workspace.lifecycle_state}</p>
               </div>
-              <LifecycleVerdictCard revision={snapshot.active_revision} />
+              <div className="flex flex-col items-stretch gap-2 md:items-end">
+                <LifecycleVerdictCard revision={snapshot.active_revision} />
+                {snapshot.active_revision && (
+                  <div className="flex flex-wrap gap-2 justify-end">
+                    <button
+                      type="button"
+                      className="px-2 py-1 text-xs font-medium rounded border border-emerald-200 text-emerald-700 hover:bg-emerald-50 disabled:opacity-50"
+                      disabled={pendingPromotions[snapshot.workspace.id]}
+                      onClick={() =>
+                        applyPromotionStatus(snapshot.workspace.id, snapshot.active_revision!.revision.id, 'approved', {
+                          notes: ['console-action:approved'],
+                        })
+                      }
+                    >
+                      Approve promotion
+                    </button>
+                    <button
+                      type="button"
+                      className="px-2 py-1 text-xs font-medium rounded border border-slate-200 text-slate-600 hover:bg-slate-100 disabled:opacity-50"
+                      disabled={pendingPromotions[snapshot.workspace.id]}
+                      onClick={() =>
+                        applyPromotionStatus(snapshot.workspace.id, snapshot.active_revision!.revision.id, 'rejected', {
+                          notes: ['console-action:rejected'],
+                        })
+                      }
+                    >
+                      Reject promotion
+                    </button>
+                    <button
+                      type="button"
+                      className="px-2 py-1 text-xs font-medium rounded border border-indigo-200 text-indigo-700 hover:bg-indigo-50 disabled:opacity-50"
+                      disabled={
+                        pendingPromotions[snapshot.workspace.id] ||
+                        snapshot.active_revision.revision.promotion_status === 'completed'
+                      }
+                      onClick={() =>
+                        applyPromotionStatus(snapshot.workspace.id, snapshot.active_revision!.revision.id, 'completed', {
+                          notes: ['console-action:completed'],
+                        })
+                      }
+                    >
+                      Mark completed
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
             <LifecycleTimeline
               runs={snapshot.recent_runs}
               onRunSelect={(run) => setSelectedRun({ workspaceId: snapshot.workspace.id, runId: run.run.id })}
               runDeltas={runDeltas}
+              pendingApprovals={pendingApprovals}
+              onApproveRun={(run) =>
+                updateRunApproval(snapshot.workspace.id, run.run.id, 'approved', {
+                  notes: 'console-approval',
+                })
+              }
+              onRejectRun={(run) =>
+                updateRunApproval(snapshot.workspace.id, run.run.id, 'rejected', {
+                  notes: 'console-rejected',
+                })
+              }
             />
             {snapshot.promotion_postures.length > 0 && (
               <PromotionVerdictTimeline

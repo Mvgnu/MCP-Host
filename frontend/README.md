@@ -28,6 +28,10 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to see the
 - Promotion automation refreshes now appear alongside posture narratives. The console renders the `promotion_runs` table with
   gate lane/stage context, automation payload attempts, and a change summary sourced from SSE `promotion_run_deltas` so
   operators can correlate veto narratives with the remediation orchestration they triggered.
+- Console control loops now expose optimistic actions. Promotion cards ship `Approve`, `Reject`, and `Mark completed` buttons
+  that invoke `/api/trust/remediation/workspaces/:workspace_id/revisions/:revision_id/promotion`, while remediation runs surface
+  `Approve` and `Reject` controls calling `/api/trust/remediation/runs/:run_id/approval`. Optimistic state updates are reconciled
+  by SSE deltas with pending badges and conflict rollbacks.
 - Filter controls (workspace search, promotion lane, severity) feed the backend query parameters and persist to local storage,
   enabling scoped investigations and shared context between browser sessions.
 - Snapshot envelopes include delta metadata. The UI renders recent trust/intelligence/marketplace changes on each run and opens a

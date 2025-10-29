@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
+use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -24,6 +25,22 @@ pub struct ProviderKeyService {
 pub struct ProviderKeyServiceConfig {
     pub notify_channel: String,
     pub feature_flag: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct RotationSlaSnapshot {
+    pub provider_id: Uuid,
+    pub provider_key_id: Uuid,
+    pub rotation_due_at: DateTime<Utc>,
+    pub state: ProviderKeyState,
+    pub event_emitted: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct RotationSlaReport {
+    pub evaluated_at: DateTime<Utc>,
+    pub approaching: Vec<RotationSlaSnapshot>,
+    pub breached: Vec<RotationSlaSnapshot>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -186,6 +203,8 @@ impl ProviderKeyService {
             if let Some(due) = active.rotation_due_at {
                 if due < chrono::Utc::now() {
                     summary.add_veto_note("rotation-overdue");
+                } else if due <= chrono::Utc::now() + Duration::hours(24) {
+                    summary.add_veto_note("rotation-approaching");
                 }
             }
             if active.attestation_verified_at.is_none() {
@@ -297,7 +316,7 @@ impl ProviderKeyService {
         .bind(rotation.requested_at)
         .bind(rotation.approved_at)
         .bind("pending_approval")
-        .bind(rotation.evidence_uri)
+        .bind(rotation.evidence_uri.clone())
         .bind(actor_ref)
         .bind(rotation.approval_actor_ref.clone())
         .bind(rotation.failure_reason.clone())
@@ -351,6 +370,183 @@ impl ProviderKeyService {
         Ok(rotation)
     }
 
+    pub async fn enforce_rotation_slas(
+        &self,
+        warning_window: Duration,
+        dedupe_interval: Duration,
+    ) -> anyhow::Result<RotationSlaReport> {
+        let now = Utc::now();
+        let rows = sqlx::query_as::<_, ProviderKeyRow>(
+            r#"SELECT id, provider_id, alias, state, rotation_due_at, attestation_digest, attestation_signature IS NOT NULL AS attestation_signature_registered, attestation_verified_at, activated_at, retired_at, compromised_at, version, created_at, updated_at FROM provider_keys WHERE rotation_due_at IS NOT NULL AND state IN ('active','rotating')"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut report = RotationSlaReport {
+            evaluated_at: now,
+            approaching: Vec::new(),
+            breached: Vec::new(),
+        };
+
+        for record in rows.into_iter().map(ProviderKeyRecord::from) {
+            let due = match record.rotation_due_at {
+                Some(value) => value,
+                None => continue,
+            };
+            let mut snapshot = RotationSlaSnapshot {
+                provider_id: record.provider_id,
+                provider_key_id: record.id,
+                rotation_due_at: due,
+                state: record.state,
+                event_emitted: false,
+            };
+
+            if due <= now {
+                let event = ProviderKeyAuditEvent {
+                    id: Uuid::new_v4(),
+                    provider_id: record.provider_id,
+                    provider_key_id: Some(record.id),
+                    event_type: ProviderKeyAuditEventType::RotationSlaBreached,
+                    payload: json!({
+                        "rotation_due_at": due,
+                        "state": record.state.as_str(),
+                        "evaluated_at": now,
+                    }),
+                    occurred_at: now,
+                };
+                snapshot.event_emitted = self
+                    .insert_audit_event_if_absent(&event, dedupe_interval)
+                    .await?;
+                report.breached.push(snapshot);
+            } else if due <= now + warning_window {
+                let event = ProviderKeyAuditEvent {
+                    id: Uuid::new_v4(),
+                    provider_id: record.provider_id,
+                    provider_key_id: Some(record.id),
+                    event_type: ProviderKeyAuditEventType::RotationSlaWarning,
+                    payload: json!({
+                        "rotation_due_at": due,
+                        "state": record.state.as_str(),
+                        "warning_window_seconds": warning_window.num_seconds(),
+                        "evaluated_at": now,
+                    }),
+                    occurred_at: now,
+                };
+                snapshot.event_emitted = self
+                    .insert_audit_event_if_absent(&event, dedupe_interval)
+                    .await?;
+                report.approaching.push(snapshot);
+            }
+        }
+
+        Ok(report)
+    }
+
+    pub async fn revoke_key(
+        &self,
+        provider_id: Uuid,
+        key_id: Uuid,
+        reason: Option<String>,
+        mark_compromised: bool,
+    ) -> anyhow::Result<ProviderKeyRecord> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let key_row = sqlx::query_as::<_, ProviderKeyRow>(
+            r#"SELECT id, provider_id, alias, state, rotation_due_at, attestation_digest, attestation_signature IS NOT NULL AS attestation_signature_registered, attestation_verified_at, activated_at, retired_at, compromised_at, version, created_at, updated_at FROM provider_keys WHERE id = $1 FOR UPDATE"#,
+        )
+        .bind(key_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let mut key = key_row.ok_or_else(|| anyhow!("provider key not found for revocation"))?;
+        if key.provider_id != provider_id {
+            bail!("provider mismatch");
+        }
+
+        let previous_state = key.state.clone();
+        let target_state = if mark_compromised {
+            "compromised"
+        } else {
+            "retired"
+        };
+
+        sqlx::query(
+            "UPDATE provider_keys SET state = $1, retired_at = $2, compromised_at = CASE WHEN $1 = 'compromised' THEN $2 ELSE compromised_at END, updated_at = $2, version = version + 1 WHERE id = $3"
+        )
+        .bind(target_state)
+        .bind(now)
+        .bind(key.id)
+        .execute(&mut *tx)
+        .await?;
+
+        let initiated_reason = reason.clone();
+        let initiated = ProviderKeyAuditEvent {
+            id: Uuid::new_v4(),
+            provider_id,
+            provider_key_id: Some(key.id),
+            event_type: ProviderKeyAuditEventType::RevocationInitiated,
+            payload: json!({
+                "previous_state": previous_state,
+                "reason": initiated_reason,
+                "mark_compromised": mark_compromised,
+            }),
+            occurred_at: now,
+        };
+        sqlx::query(
+            "INSERT INTO provider_key_audit_events(id, provider_id, provider_key_id, event_type, payload, occurred_at) VALUES($1,$2,$3,$4,$5,$6)"
+        )
+        .bind(initiated.id)
+        .bind(initiated.provider_id)
+        .bind(initiated.provider_key_id)
+        .bind(initiated.event_type.as_str())
+        .bind(&initiated.payload)
+        .bind(initiated.occurred_at)
+        .execute(&mut *tx)
+        .await?;
+
+        let completed = ProviderKeyAuditEvent {
+            id: Uuid::new_v4(),
+            provider_id,
+            provider_key_id: Some(key.id),
+            event_type: ProviderKeyAuditEventType::RevocationCompleted,
+            payload: json!({
+                "final_state": target_state,
+                "reason": reason,
+            }),
+            occurred_at: now,
+        };
+        sqlx::query(
+            "INSERT INTO provider_key_audit_events(id, provider_id, provider_key_id, event_type, payload, occurred_at) VALUES($1,$2,$3,$4,$5,$6)"
+        )
+        .bind(completed.id)
+        .bind(completed.provider_id)
+        .bind(completed.provider_key_id)
+        .bind(completed.event_type.as_str())
+        .bind(&completed.payload)
+        .bind(completed.occurred_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        self.dispatch_notification(&initiated).await?;
+        self.dispatch_notification(&completed).await?;
+
+        let mut updated: ProviderKeyRecord = key.into();
+        updated.state = if mark_compromised {
+            ProviderKeyState::Compromised
+        } else {
+            ProviderKeyState::Retired
+        };
+        updated.retired_at = Some(now);
+        if mark_compromised {
+            updated.compromised_at = Some(now);
+        }
+        updated.updated_at = now;
+
+        Ok(updated)
+    }
+
     pub async fn record_runtime_veto(
         &self,
         provider_id: Uuid,
@@ -382,14 +578,7 @@ impl ProviderKeyService {
         .execute(&self.pool)
         .await?;
 
-        if !self.config.notify_channel.is_empty() {
-            let payload = serde_json::to_string(&event)?;
-            sqlx::query("SELECT pg_notify($1, $2)")
-                .bind(&self.config.notify_channel)
-                .bind(payload)
-                .execute(&self.pool)
-                .await?;
-        }
+        self.dispatch_notification(&event).await?;
 
         Ok(())
     }
@@ -524,6 +713,48 @@ impl ProviderKeyService {
             .into_iter()
             .map(ProviderKeyBindingRecord::from)
             .collect())
+    }
+
+    async fn insert_audit_event_if_absent(
+        &self,
+        event: &ProviderKeyAuditEvent,
+        dedupe_interval: Duration,
+    ) -> anyhow::Result<bool> {
+        let key_id = event
+            .provider_key_id
+            .ok_or_else(|| anyhow!("provider key id required for deduplicated audit event"))?;
+        let threshold = event.occurred_at - dedupe_interval;
+        let result = sqlx::query(
+            "WITH candidate AS (SELECT $1::uuid AS id, $2::uuid AS provider_id, $3::uuid AS provider_key_id, $4::text AS event_type, $5::jsonb AS payload, $6::timestamptz AS occurred_at) INSERT INTO provider_key_audit_events(id, provider_id, provider_key_id, event_type, payload, occurred_at) SELECT id, provider_id, provider_key_id, event_type, payload, occurred_at FROM candidate WHERE NOT EXISTS (SELECT 1 FROM provider_key_audit_events WHERE provider_key_id = $3 AND event_type = $4 AND occurred_at >= $7)"
+        )
+        .bind(event.id)
+        .bind(event.provider_id)
+        .bind(key_id)
+        .bind(event.event_type.as_str())
+        .bind(&event.payload)
+        .bind(event.occurred_at)
+        .bind(threshold)
+        .execute(&self.pool)
+        .await?;
+        let inserted = result.rows_affected() > 0;
+        if inserted {
+            self.dispatch_notification(event).await?;
+        }
+        Ok(inserted)
+    }
+
+    async fn dispatch_notification(&self, event: &ProviderKeyAuditEvent) -> anyhow::Result<()> {
+        if self.config.notify_channel.is_empty() {
+            return Ok(());
+        }
+        let payload =
+            serde_json::to_string(event).context("serialize audit event for notification")?;
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(&self.config.notify_channel)
+            .bind(payload)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
