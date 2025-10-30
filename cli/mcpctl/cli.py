@@ -20,6 +20,7 @@ from .commands import (
     install_promotions,
     install_remediation,
     install_scaffold,
+    install_vector_dbs,
     install_trust,
 )
 
@@ -50,6 +51,7 @@ def build_parser() -> ArgumentParser:
     install_lifecycle(subparsers)
     install_keys(subparsers)
     install_billing(subparsers)
+    install_vector_dbs(subparsers)
     install_remediation(subparsers)
     install_trust(subparsers)
     install_scaffold(subparsers)

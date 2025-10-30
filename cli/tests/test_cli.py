@@ -114,6 +114,252 @@ def test_marketplace_list_outputs_table(capsys: pytest.CaptureFixture[str]) -> N
     assert "Beta" in captured
 
 
+def test_marketplace_submissions_list_summarizes_latest_evaluation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    FakeClient.responses[(
+        "GET",
+        "/api/marketplace/providers/11111111-1111-1111-1111-111111111111/submissions",
+    )] = [
+        {
+            "submission": {
+                "id": "sub-1",
+                "tier": "standard",
+                "status": "pending",
+                "posture_vetoed": False,
+                "posture_notes": ["warn"],
+                "updated_at": "2025-01-02T00:00:00Z",
+            },
+            "evaluations": [
+                {
+                    "evaluation": {
+                        "id": "eval-9",
+                        "evaluation_type": "security",
+                        "status": "running",
+                        "posture_vetoed": False,
+                        "posture_notes": [],
+                        "updated_at": "2025-01-02T00:00:00Z",
+                    },
+                    "promotions": [],
+                }
+            ],
+        }
+    ]
+
+    cli_module.main(
+        [
+            "marketplace",
+            "submissions",
+            "list",
+            "11111111-1111-1111-1111-111111111111",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert "sub-1" in output
+    assert "notes:1" in output
+    assert "security:running" in output
+
+
+def test_marketplace_submissions_create_reads_metadata_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    metadata_file = tmp_path / "meta.json"
+    metadata_file.write_text("{\n  \"git\": {\"commit\": \"abc\"}\n}")
+    notes_file = tmp_path / "notes.txt"
+    notes_file.write_text("Release notes")
+
+    FakeClient.responses[(
+        "POST",
+        "/api/marketplace/providers/22222222-2222-2222-2222-222222222222/submissions",
+    )] = {
+        "id": "sub-2",
+        "status": "pending",
+        "tier": "gold",
+    }
+
+    cli_module.main(
+        [
+            "marketplace",
+            "submissions",
+            "create",
+            "22222222-2222-2222-2222-222222222222",
+            "--tier",
+            "gold",
+            "--manifest-uri",
+            "registry.example/app:latest",
+            "--artifact-digest",
+            "sha256:deadbeef",
+            "--release-notes-file",
+            str(notes_file),
+            "--metadata",
+            metadata_file.read_text(),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert "Created submission" in output
+    method, path, body = FakeClient.calls[-1]
+    assert method == "POST"
+    assert path.endswith("/submissions")
+    assert body["tier"] == "gold"
+    assert body["manifest_uri"].startswith("registry.example")
+    assert body["artifact_digest"] == "sha256:deadbeef"
+    assert body["release_notes"] == "Release notes"
+    assert body["metadata"]["git"]["commit"] == "abc"
+
+
+def test_marketplace_evaluations_start_forwards_payload(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    FakeClient.responses[(
+        "POST",
+        "/api/marketplace/providers/33333333-3333-3333-3333-333333333333/submissions/sub-3/evaluations",
+    )] = {
+        "id": "eval-1",
+        "status": "running",
+        "evaluation_type": "security",
+    }
+
+    cli_module.main(
+        [
+            "marketplace",
+            "evaluations",
+            "start",
+            "33333333-3333-3333-3333-333333333333",
+            "sub-3",
+            "security",
+            "--status",
+            "running",
+            "--evaluator-ref",
+            "automation",
+            "--result",
+            '{"score": 0.92}',
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert "Started evaluation eval-1" in output
+    method, path, body = FakeClient.calls[-1]
+    assert method == "POST"
+    assert path.endswith("/evaluations")
+    assert body["evaluation_type"] == "security"
+    assert body["evaluator_ref"] == "automation"
+    assert body["result"]["score"] == 0.92
+
+
+def test_marketplace_promotions_create_sends_notes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    provider_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    evaluation_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    FakeClient.responses[(
+        "POST",
+        f"/api/marketplace/providers/{provider_id}/evaluations/{evaluation_id}/promotions",
+    )] = {
+        "id": "promo-1",
+        "gate": "gauntlet",
+        "status": "pending",
+    }
+
+    cli_module.main(
+        [
+            "marketplace",
+            "promotions",
+            "create",
+            provider_id,
+            evaluation_id,
+            "--gate",
+            "gauntlet",
+            "--status",
+            "pending",
+            "--note",
+            "ready",
+            "--note",
+            "security cleared",
+        ]
+    )
+
+    method, path, body = FakeClient.calls[-1]
+    assert method == "POST"
+    assert path.endswith("/promotions")
+    assert body["gate"] == "gauntlet"
+    assert body["status"] == "pending"
+    assert body["notes"] == ["ready", "security cleared"]
+
+    captured = capsys.readouterr().out
+    assert "Created promotion" in captured
+
+
+def test_marketplace_promotions_transition_omits_notes_when_absent(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    provider_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    promotion_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    FakeClient.responses[(
+        "POST",
+        f"/api/marketplace/providers/{provider_id}/promotions/{promotion_id}/transition",
+    )] = {
+        "id": promotion_id,
+        "status": "approved",
+    }
+
+    cli_module.main(
+        [
+            "marketplace",
+            "promotions",
+            "transition",
+            provider_id,
+            promotion_id,
+            "--status",
+            "approved",
+            "--closed-at",
+            "2025-01-02T03:04:05Z",
+        ]
+    )
+
+    method, path, body = FakeClient.calls[-1]
+    assert method == "POST"
+    assert path.endswith("/transition")
+    assert body == {
+        "status": "approved",
+        "closed_at": "2025-01-02T03:04:05Z",
+    }
+
+    captured = capsys.readouterr().out
+    assert "Transitioned promotion" in captured
+
+
+def test_marketplace_watch_renders_event_summary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stream_path = "/api/marketplace/providers/44444444-4444-4444-4444-444444444444/events/stream"
+    FakeClient.streams[stream_path] = [
+        json.dumps(
+            {
+                "event_type": "submission_created",
+                "occurred_at": "2025-03-01T00:00:00Z",
+                "submission_id": "sub-4",
+                "payload": {"status": "pending"},
+            }
+        )
+    ]
+
+    cli_module.main(
+        [
+            "marketplace",
+            "watch",
+            "44444444-4444-4444-4444-444444444444",
+            "--max-events",
+            "1",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert "submission_created" in output
+    assert "submission=sub-4" in output
+
+
 def test_promotions_schedule_returns_json(capsys: pytest.CaptureFixture[str]) -> None:
     FakeClient.responses[("POST", "/api/promotions/schedule")] = {
         "id": 22,
@@ -1176,3 +1422,73 @@ def test_billing_quota_renders_notes(capsys: pytest.CaptureFixture[str]) -> None
     assert "runtime.concurrent_servers" in output
     assert "4" in output
     assert FakeClient.calls[-1][0] == "POST"
+
+def test_vector_dbs_attachments_detach_renders_reason(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    FakeClient.responses[(
+        "PATCH",
+        "/api/vector-dbs/7/attachments/att-1",
+    )] = {
+        "id": "att-1",
+        "vector_db_id": 7,
+        "detached_at": "2025-03-01T00:00:00Z",
+        "detached_reason": "sunset",
+    }
+
+    cli_module.main(
+        [
+            "vector-dbs",
+            "attachments",
+            "detach",
+            "7",
+            "att-1",
+            "--reason",
+            "sunset",
+        ]
+    )
+
+    assert ("PATCH", "/api/vector-dbs/7/attachments/att-1", {"reason": "sunset"}) in FakeClient.calls
+    output = capsys.readouterr().out
+    assert "sunset" in output
+    assert "att-1" in output
+
+
+def test_vector_dbs_incidents_resolve_parses_json_notes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    FakeClient.responses[(
+        "PATCH",
+        "/api/vector-dbs/9/incidents/inc-2",
+    )] = {
+        "id": "inc-2",
+        "vector_db_id": 9,
+        "resolved_at": "2025-03-05T10:00:00Z",
+        "summary": "Resolved",
+    }
+
+    cli_module.main(
+        [
+            "vector-dbs",
+            "incidents",
+            "resolve",
+            "9",
+            "inc-2",
+            "--summary",
+            "Rotation complete",
+            "--notes",
+            '{"actor":"ops","ticket":"GOV-42"}',
+        ]
+    )
+
+    assert (
+        "PATCH",
+        "/api/vector-dbs/9/incidents/inc-2",
+        {
+            "resolution_summary": "Rotation complete",
+            "resolution_notes": {"actor": "ops", "ticket": "GOV-42"},
+        },
+    ) in FakeClient.calls
+    output = capsys.readouterr().out
+    assert "Resolved" in output
+    assert "inc-2" in output

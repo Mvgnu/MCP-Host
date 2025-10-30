@@ -1,20 +1,11 @@
+use backend::proxy::{conf_dir, ensure_tls, reload};
 use dotenvy::dotenv;
 use regex::Regex;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::SystemTime;
 use tokio::fs;
 use tokio::time::{sleep, Duration};
-
-#[path = "../proxy.rs"]
-mod proxy;
-use proxy::{ensure_tls, reload};
-
-fn conf_dir() -> PathBuf {
-    std::env::var("PROXY_CONF_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("./proxy_conf"))
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

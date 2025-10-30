@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -88,8 +89,12 @@ impl ProviderKeyService {
             .ok_or_else(|| anyhow!("attestation signature required"))?;
 
         // Ensure both digest and signature are valid base64 payloads before persisting.
-        base64::decode(&attestation_digest).context("invalid attestation digest encoding")?;
-        base64::decode(&attestation_signature).context("invalid attestation signature encoding")?;
+        STANDARD
+            .decode(&attestation_digest)
+            .context("invalid attestation digest encoding")?;
+        STANDARD
+            .decode(&attestation_signature)
+            .context("invalid attestation signature encoding")?;
 
         let state = ProviderKeyState::Active;
         let activated_at = Some(now);
@@ -261,8 +266,12 @@ impl ProviderKeyService {
             .ok_or_else(|| anyhow!("rotation actor reference required"))?
             .to_string();
 
-        base64::decode(&attestation_digest).context("invalid attestation digest encoding")?;
-        base64::decode(&attestation_signature).context("invalid attestation signature encoding")?;
+        STANDARD
+            .decode(&attestation_digest)
+            .context("invalid attestation digest encoding")?;
+        STANDARD
+            .decode(&attestation_signature)
+            .context("invalid attestation signature encoding")?;
 
         let now = chrono::Utc::now();
         let metadata = json!({
@@ -904,7 +913,7 @@ mod tests {
         let provider_id = Uuid::new_v4();
         let service = ProviderKeyService::new(pool.clone(), ProviderKeyServiceConfig::default());
 
-        let attestation = base64::encode(b"runtime-veto-test");
+        let attestation = STANDARD.encode(b"runtime-veto-test");
         let record = service
             .register_key(
                 provider_id,
@@ -961,7 +970,7 @@ mod tests {
         let provider_id = Uuid::new_v4();
         let service = ProviderKeyService::new(pool.clone(), ProviderKeyServiceConfig::default());
 
-        let attestation = base64::encode(b"binding-test");
+        let attestation = STANDARD.encode(b"binding-test");
         let key = service
             .register_key(
                 provider_id,

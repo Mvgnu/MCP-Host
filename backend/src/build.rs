@@ -8,9 +8,10 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as Base64Engine;
 use base64::Engine;
 use bollard::body_full;
-use bollard::image::BuildImageOptions;
 use bollard::models::PushImageInfo;
-use bollard::query_parameters::{PushImageOptionsBuilder, TagImageOptionsBuilder};
+use bollard::query_parameters::{
+    BuildImageOptionsBuilder, PushImageOptionsBuilder, TagImageOptionsBuilder,
+};
 use bollard::Docker;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -2172,19 +2173,18 @@ pub async fn build_from_git(
             let pool_ref = pool;
             async move {
                 let local_tag = format!("{base_name}-{}", target.slug);
-                let mut build_options = BuildImageOptions::<String> {
-                    dockerfile: "Dockerfile".into(),
-                    t: local_tag.clone(),
-                    pull: true,
-                    nocache: cache_config.nocache(),
-                    rm: true,
-                    forcerm: true,
-                    platform: target.spec.clone(),
-                    ..Default::default()
-                };
+                let mut build_options_builder = BuildImageOptionsBuilder::default()
+                    .dockerfile("Dockerfile")
+                    .t(&local_tag)
+                    .pull("true")
+                    .nocache(cache_config.nocache())
+                    .rm(true)
+                    .forcerm(true)
+                    .platform(&target.spec);
                 if let Some(cache_from) = cache_config.cache_sources() {
-                    build_options.cachefrom = cache_from;
+                    build_options_builder = build_options_builder.cachefrom(&cache_from);
                 }
+                let build_options = build_options_builder.build();
 
                 let mut build_stream = docker.build_image(
                     build_options,

@@ -23,6 +23,17 @@ Deployments must install the libvirt daemon and ensure the runtime has permissio
 
 Enabling the libvirt executor also requires building the backend with the `libvirt-executor` cargo feature so the native driver is compiled in.
 
+## Self-service onboarding APIs
+
+To support SaaS administrators bootstrapping their own workspaces, the organizations module now exposes invitation management in addition to the existing organization CRUD surface:
+
+- `GET /api/orgs` — list organizations for the authenticated user (owner or member).
+- `POST /api/orgs` — create a new organization; the caller is persisted as the owner and organization member.
+- `POST /api/orgs/:id/members` — add an existing user to an organization (owners only).
+- `GET /api/orgs/:id/invitations` — list pending and accepted invitations for an organization (owners only).
+- `POST /api/orgs/:id/invitations` — create a pending invitation with an expiring token so invitees can join after registering.
+- `POST /api/orgs/invitations/:token/accept` — accept a pending invitation; requires authentication with the matching invite email and automatically persists the user as an organization member.
+
 ## Secret Rotation
 Passwords can be rotated without restarts by updating `LIBVIRT_PASSWORD_FILE` to point at the new secret and sending a SIGHUP (or restarting the process). The runtime records only sanitized snapshots of credentials in `runtime_vm_instances`, ensuring API consumers see whether secrets were supplied without exposing raw values.
 
@@ -43,13 +54,48 @@ A new `backend/src/audit.rs` module provides `ProviderKeyAuditFilter` and `query
 
 Runtime policy now honors BYOK requirements declared in the `provider_tiers` table (migration `0042_provider_tier_requirements.sql`). Each row maps a tier string to a provider UUID plus a `byok_required` flag so compliance-sensitive stages can demand active keys. Decisions persisted in `runtime_policy_decisions` include a `key_posture` JSON payload (see `key: provider-keys-decision-posture`) describing the evaluated key, rotation deadline, veto notes, and whether the launch was blocked. The policy engine annotates decisions with `provider-key:*` notes whenever BYOK posture contributes to a veto, allowing lifecycle analytics, CLI streaming, and SSE consumers to surface key health alongside governance and evaluation metadata.
 
+## Provider marketplace submissions
+
+Migration `0045_provider_marketplace.sql` (`key: migration-provider-marketplace`) adds durable tables for provider submissions, evaluation runs, promotion gates, and marketplace audit events. The Axum module in `backend/src/marketplace.rs` exposes a `routes()` helper that wires the existing catalog listing alongside new BYOK-gated submission APIs:
+
+- `POST /api/marketplace/providers/:provider_id/submissions` accepts a manifest URI, tier, and optional digest/notes, validates the provider's BYOK posture via `ProviderKeyService::summarize_for_policy`, and records posture notes with `key: marketplace-provider-submissions` metadata. Successful calls emit a `submission_created` audit event.
+- `POST /api/marketplace/providers/:provider_id/submissions/:submission_id/evaluations` and `POST /api/marketplace/providers/:provider_id/evaluations/:evaluation_id/transition` create and advance evaluation runs while persisting posture snapshots for downstream tooling.
+- `POST /api/marketplace/providers/:provider_id/evaluations/:evaluation_id/promotions` paired with `POST /api/marketplace/providers/:provider_id/promotions/:promotion_id/transition` creates promotion gates, tracks status/notes, and emits auditable transitions that console/CLI surfaces can stream without polling.
+- `GET /api/marketplace/providers/:provider_id/submissions` returns nested submission → evaluation → promotion summaries so operator consoles can render progress timelines.
+- `GET /api/marketplace/providers/:provider_id/events/stream` exposes a credentialed SSE feed carrying `ProviderMarketplaceStreamEvent` payloads (submission/evaluation/promotion transitions) so consoles and CLI watchers stay synchronized without polling.
+
+SQLx-backed regression coverage in `backend/src/marketplace.rs` exercises the happy path (submission → evaluation → promotion) and posture-veto safeguards to guarantee the API refuses providers that lack active BYOK keys while still emitting the expected audit events for compliant flows.
+
 The runtime orchestrator now respects the recorded BYOK posture before launching workloads. When the policy engine reports a vetoed posture, the orchestrator halts the launch, updates the server lifecycle to `pending-key-registration`, `pending-key-activation`, or `pending-key-rotation` (based on posture notes), and emits a `runtime_veto` audit event via `ProviderKeyService::record_runtime_veto`. These audit entries reuse the service's notification channel so forthcoming SSE streams can react without additional plumbing.
+
+## Federated vector DB governance
+
+Migration `0046_vector_db_governance.sql` (`key: migration-vector-db-governance`) extends the managed vector database fabric with residency policies, BYOK-aware attachments, and structured incident logging:
+
+- `vector_db_residency_policies` enforces unique `(vector_db_id, region)` combinations, captures data classification + enforcement mode metadata, and tracks active posture flags so downstream attachments can require compliant residency envelopes.
+- `vector_db_attachments` persists federated service attachments with mandatory `provider_key_binding_id` references. The `vector-dbs-attachment` contract in `backend/src/vector_dbs.rs` validates that bindings target `vector_db` scopes and that the selected residency policy remains active before persisting metadata.
+- `vector_db_incident_logs` records compliance events (breaches, remediations, etc.) with optional attachment references, severity tags, and structured JSON notes. Listings expose the durable audit trail for console and operator tooling.
+
+The vector DB Axum module now surfaces a governance surface area alongside the existing CRUD endpoints:
+
+- `POST /api/vector-dbs/:id/residency-policies` upserts residency envelopes using the `vector-dbs-residency-policy` contract while scoping access to the owning operator.
+- `POST /api/vector-dbs/:id/attachments` requires an active residency policy and an unrevoked `provider_key_binding_id` targeting `vector_db` scopes before creating a federated attachment record. `GET` on the same route returns attachment metadata for dashboards, including joined provider key identifiers and rotation deadlines.
+- `PATCH /api/vector-dbs/:id/attachments/:attachment_id` records detachment metadata (`detached_at`, `detached_reason`) once remediation or credential rotation unlinks the workload while leaving the audit trail intact.
+- `POST /api/vector-dbs/:id/incidents` logs residency or compliance incidents with optional attachment references and structured JSON notes, while `GET` lists the timeline ordered by occurrence time.
+- `PATCH /api/vector-dbs/:id/incidents/:incident_id` stamps `resolved_at`, applies optional resolution summaries/notes, and preserves unresolved conflicts via `409` responses.
+- `POST /api/vector-dbs/:id/incidents` records incident payloads, verifying that referenced attachments belong to the same vector DB. `GET /api/vector-dbs/:id/incidents` streams the compliance timeline ordered by occurrence timestamp.
+
+SQLx-backed regression coverage in `backend/tests/vector_dbs.rs` (`key: vector-dbs-tests -> residency,attachments`) seeds residency policies, simulates invalid bindings, and asserts that attachments/incident logging respect residency posture and BYOK binding requirements before persisting audit state. New tests also verify detachment idempotency and incident resolution semantics.
 
 The lifecycle console aggregation layer (`backend/src/lifecycle_console/mod.rs`) now loads the latest `runtime_policy_decisions` posture for every workspace run surfaced in SSE snapshots. Each `LifecycleRunSnapshot` carries an optional `provider_key_posture` mirror of the backend contract, and deltas include a `provider_key_changes` array that tracks state, rotation deadlines, attestation signals, and veto transitions. Downstream UI components consume the serialized posture to render BYOK badges and change logs alongside trust, intelligence, and marketplace analytics.
 
 ## SaaS Billing Foundations
 
-Migration `0044_billing_foundations.sql` introduces normalized tables for SaaS commercialization: `billing_plans`, `billing_plan_entitlements`, `organization_subscriptions`, and `subscription_usage_ledger`. The `BillingService` (`key: billing-service -> subscription lifecycle`) in `backend/src/billing/` manages active subscriptions, enforces entitlement quotas, and records usage windows with cron-safe deduplication. HTTP handlers in `backend/src/billing/api.rs` surface plan listings, subscription bootstrap/update, and quota checks via `/api/billing/plans`, `/api/billing/organizations/:id/subscription`, and `/api/billing/organizations/:id/quotas/check`. Runtime policy now consults `BillingService::enforce_quota` before approving placements, annotating decisions with `billing:*` notes and requiring governance when entitlements block launches. Stubbed provider adapters (`StripeLikeAdapter`) and webhook scaffolding ensure future billing providers can reconcile subscriptions without diverging from the core service contract.
+Migration `0044_billing_foundations.sql` introduces normalized tables for SaaS commercialization: `billing_plans`, `billing_plan_entitlements`, `organization_subscriptions`, and `subscription_usage_ledger`. The `BillingService` (`key: billing-service -> subscription lifecycle`) in `backend/src/billing/` manages active subscriptions, enforces entitlement quotas, records usage windows with cron-safe deduplication, and exposes downgrade/suspension helpers for overdue accounts. HTTP handlers in `backend/src/billing/api.rs` surface plan listings, subscription bootstrap/update, and quota checks via `/api/billing/plans`, `/api/billing/organizations/:id/subscription`, and `/api/billing/organizations/:id/quotas/check`. Runtime policy now consults `BillingService::enforce_quota` before approving placements, annotating decisions with `billing:*` notes and requiring governance when entitlements block launches. Stubbed provider adapters (`StripeLikeAdapter`) feed an async reconciliation worker so future billing providers can reconcile subscriptions and usage without diverging from the core service contract.
+
+Integration coverage in `backend/tests/billing.rs` (`key: billing-tests -> multi-entitlements,quota-gates`) seeds multi-entitlement plans, asserts quota ledger writes, and verifies that veto messaging (`billing:quota-exceeded:*`, `billing:subscription-missing`) remains actionable for runtime policy and console surfaces. These SQLx-backed tests run against the full migration set to guarantee schema alignment across quota enforcement, reconciliation, and downgrade flows.
+
+The renewal automation loop lives in `backend/src/billing/scheduler.rs` (`key: billing-renewal-scheduler -> automate overdue handling`). It scans active/trialing subscriptions at a configurable cadence (`BILLING_RENEWAL_SCAN_INTERVAL_SECS`, default `300`) and marks overdue accounts `past_due` when the computed renewal window or trial end lapses. After the configurable grace period (`BILLING_PAST_DUE_GRACE_DAYS`, default `3`), the scheduler will downgrade to the optional fallback plan defined by `BILLING_FALLBACK_PLAN_CODE` or suspend the subscription in-place. SQLx-backed regression coverage in `backend/tests/billing_scheduler.rs` (`key: billing-scheduler-tests -> automated renewal flows`) exercises overdue detection, fallback downgrades, and suspension behavior end-to-end so operators can trust the automation before wiring a production billing provider.
 
 ## Troubleshooting Console Access
 If log retrieval returns empty output, verify `LIBVIRT_CONSOLE_SOURCE` matches the domain's serial device configuration and that `LIBVIRT_LOG_TAIL` is large enough to capture recent lines. The new streaming test covers channel setup end-to-end; if streaming fails in production, confirm `virtlogd` is running and that SELinux/AppArmor policies allow read access to the console device.

@@ -79,3 +79,10 @@ pub struct BillingQuotaOutcome {
     pub remaining_quantity: Option<i64>,
     pub notes: Vec<String>,
 }
+
+/// key: billing-models -> plan catalog envelope
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BillingPlanCatalogEntry {
+    pub plan: BillingPlan,
+    pub entitlements: Vec<PlanEntitlement>,
+}

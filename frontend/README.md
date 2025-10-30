@@ -1,55 +1,56 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# MCP Host Frontend
+
+This Next.js application powers the operator console, provider marketplace, and customer-facing onboarding surfaces for the MCP Host platform.
 
 ## Getting Started
 
-First, run the development server:
+Install dependencies:
+
+```bash
+npm install
+```
+
+Run the development server:
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
-### Lifecycle Console
+The project uses the Next.js App Router. Pages live under `app/` and load client components as needed.
 
-- Navigate to `/console/lifecycle` to view the remediation lifecycle console. The page orchestrates REST pagination with an SSE
-  stream exposed at `/api/console/lifecycle/stream`, reconnecting automatically with cursor resumption metadata.
-- Snapshot events drive workspace cards that surface promotion gate verdicts, recent remediation runs, trust registry states,
-  capability intelligence scores, and marketplace readiness in a single view.
-- Promotion verdict metadata now renders through the `PromotionVerdictTimeline` component, highlighting the latest
-  `promotion_postures` array (track, stage, allowed flag, veto reasons, remediation hooks, and signal JSON) with delta badges
-  whenever SSE events update the posture.
-- Promotion automation refreshes now appear alongside posture narratives. The console renders the `promotion_runs` table with
-  gate lane/stage context, automation payload attempts, and a change summary sourced from SSE `promotion_run_deltas` so
-  operators can correlate veto narratives with the remediation orchestration they triggered.
-- Console control loops now expose optimistic actions. Promotion cards ship `Approve`, `Reject`, and `Mark completed` buttons
-  that invoke `/api/trust/remediation/workspaces/:workspace_id/revisions/:revision_id/promotion`, while remediation runs surface
-  `Approve` and `Reject` controls calling `/api/trust/remediation/runs/:run_id/approval`. Optimistic state updates are reconciled
-  by SSE deltas with pending badges and conflict rollbacks.
-- Filter controls (workspace search, promotion lane, severity) feed the backend query parameters and persist to local storage,
-  enabling scoped investigations and shared context between browser sessions.
-- Snapshot envelopes include delta metadata. The UI renders recent trust/intelligence/marketplace changes on each run and opens a
-  drill-down modal with threaded timelines, metadata, and replay context.
-- BYOK posture arrives alongside run analytics. `LifecycleRunSnapshot` now exposes `provider_key_posture` so progress cards,
-  drill-down modals, and trust overlays render provider key badges, veto states, attestation signals, and change logs directly
-  from the SSE contract.
-- When streaming is unavailable or the browser goes offline the UI falls back to a 15s REST polling loop. Cursor state, filters,
-  recent snapshots, and run deltas hydrate from local storage so operators can resume where they left off once connectivity
-  returns.
-- Playwright regression coverage for filters, offline resume, and SSE replay semantics lives in `e2e/console.spec.ts`; run
-  `npx playwright test e2e/console.spec.ts` against a running development server to capture updated expectations.
+## Feature surfaces
+
+### Billing onboarding wizard
+
+- Navigate to `/console/billing/<organizationId>` to launch the operator subscription wizard. The page consumes the billing plan catalog (`/api/billing/catalog`), active subscription envelope, and quota evaluation endpoint so operators can compare plans, toggle trials, and surface `BillingQuotaOutcome` notes without recording usage.
+- Plan comparisons reuse the `BillingPlanComparison` component to highlight entitlement limits and metadata sourced from `billing_plan_entitlements.metadata` JSON.
+- Trial activations default to 14 days but can be tuned per organization; the wizard computes ISO timestamps for `BillingService::upsert_subscription` so operators can stage or extend trials before converting to an active subscription.
+- Entitlement selectors automatically invoke `/api/billing/organizations/:id/quotas/check` with `record_usage=false` to render billing notes, helping operators validate downgrade, suspension, or overage scenarios prior to runtime enforcement changes.
+
+### Self-service onboarding portal
+
+- Navigate to `/onboarding` to create an account, bootstrap an organization, assign a billing plan, and invite teammates without relying on operator actions. The route renders the `SelfServiceOnboarding` multi-step component.
+- Registration posts to `/api/register` then immediately authenticates against `/api/login`, wiring cookies for subsequent organization and billing calls.
+- Organization creation persists through `/api/orgs`, fetches the billing plan catalog, and advances to plan selection with optional trial windows. Successful plan assignments call `/api/billing/organizations/:id/subscription`.
+- Teammate invitations persist through `/api/orgs/:id/invitations`, listing pending invites with shareable tokens so invitees can accept via `/api/orgs/invitations/:token/accept` after registering with the matching email.
+- Invitees can redeem their token at `/onboarding/invite/[token]`, which renders `AcceptInvitation` to guide registration or sign-in before calling the acceptance API.
+
+### Provider marketplace dashboard
+
+- Navigate to `/console/marketplace/providerdashboard` to review provider submissions, posture badges, evaluation timelines, and promotion gates. The page consumes `/api/marketplace/providers/:provider_id/submissions` for bootstrapping and listens to the SSE stream at `/api/marketplace/providers/:provider_id/events/stream` to refresh cards without manual reloads.
+- Artifact uploads reuse the console form controls and invoke `/api/marketplace/providers/:provider_id/submissions`, surfacing submission errors inline so operators can correct posture issues before retrying.
+
+### Federated vector DB governance
+
+- Navigate to `/console/vector-dbs/governance` to administer residency policies, attachments, and incident logs for managed vector databases. The console bootstraps data from `/api/vector-dbs` and scoped residency/attachment/incident endpoints, reloading sections after each control action.
+- The governance page reuses `VectorDbResidencyCard`, `VectorDbAttachmentList`, and `VectorDbIncidentTimeline` components to capture residency posture, credential rotation prompts, and incident remediation state.
+- Attachment creation validates JSON metadata locally before calling `/api/vector-dbs/:id/attachments`, while incident logging persists remediation context through `/api/vector-dbs/:id/incidents` and resolves incidents via the new PATCH handler.
 
 ### Provider BYOK staging
 
-- Shared helper stubs in `frontend/lib/byok.ts` define the provider key contract (`ProviderKeyRecord`, posture helpers) and
-  currently throw a descriptive error until the backend endpoints ship. Console and provider portal features should consume these
-  helpers so the contract remains centralized.
+- Shared helper stubs in `frontend/lib/byok.ts` define the provider key contract (`ProviderKeyRecord`, posture helpers) and currently throw a descriptive error until the backend endpoints ship. Console and provider portal features should consume these helpers so the contract remains centralized.
 - `ProviderKeyDecisionPosture` mirrors the backend `key_posture` payload persisted with runtime policy decisions so SSE consumers can render BYOK state (active/rotating, rotation deadlines, signature verification posture, veto notes) without duplicating contract mapping.
 - Jest coverage in `frontend/lib/byok.test.ts` asserts rotation posture helpers behave deterministically before UI wiring lands.
 

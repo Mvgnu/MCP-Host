@@ -5,7 +5,7 @@ use backend::runtime::vm::libvirt::LibvirtVmProvisioner;
 #[cfg(feature = "libvirt-executor")]
 use backend::runtime::RealLibvirtDriver;
 use backend::{
-    config, evaluations, governance, ingestion,
+    billing, config, evaluations, governance, ingestion,
     job_queue::start_worker,
     policy::{RuntimeBackend, RuntimePolicyEngine},
     remediation,
@@ -196,6 +196,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     evaluations::scheduler::spawn(pool.clone(), job_tx.clone());
     trust::spawn_trust_listener(pool.clone(), job_tx.clone());
     remediation::spawn(pool.clone());
+    let reconciliation_handle = billing::start_reconciliation_worker(pool.clone());
+    billing::spawn_billing_scheduler(pool.clone());
     ingestion::start_ingestion_worker(pool.clone());
     let (prometheus_layer, metrics_handle) = PrometheusMetricLayer::pair();
     let app = Router::new()
@@ -210,7 +212,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(job_tx.clone()))
         .layer(Extension(runtime.clone()))
         .layer(Extension(policy_engine.clone()))
-        .layer(Extension(governance_engine.clone()));
+        .layer(Extension(governance_engine.clone()))
+        .layer(Extension(reconciliation_handle.clone()));
 
     let addr: SocketAddr = format!("{}:{}", config::BIND_ADDRESS.as_str(), *config::BIND_PORT)
         .parse()

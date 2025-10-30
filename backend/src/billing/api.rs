@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{BillingPlan, BillingQuotaOutcome, BillingService, OrganizationSubscription};
+use super::{
+    BillingPlan, BillingPlanCatalogEntry, BillingQuotaOutcome, BillingService,
+    OrganizationSubscription,
+};
 
 /// key: billing-api -> rest endpoints
 pub async fn list_plans(
@@ -22,6 +25,17 @@ pub async fn list_plans(
     .map_err(|_| StatusCode::NOT_IMPLEMENTED)?;
 
     Ok(Json(plans))
+}
+
+pub async fn list_plan_catalog(
+    Extension(pool): Extension<PgPool>,
+) -> Result<Json<Vec<BillingPlanCatalogEntry>>, StatusCode> {
+    let service = BillingService::new(pool);
+    let catalog = service
+        .plan_catalog()
+        .await
+        .map_err(|_| StatusCode::NOT_IMPLEMENTED)?;
+    Ok(Json(catalog))
 }
 
 pub async fn get_subscription(

@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import json
 from argparse import ArgumentParser, _SubParsersAction
-from typing import Any, Callable, Dict
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable
 
 import sys
 
@@ -16,6 +17,7 @@ from . import evaluations as evaluations_commands
 from . import keys as keys_commands
 from . import lifecycle as lifecycle_commands
 from . import remediation as remediation_commands
+from . import vector_dbs as vector_db_commands
 
 _RESET = "\033[0m"
 _GREEN = "\033[32m"
@@ -37,6 +39,186 @@ def install_marketplace(subparsers: _SubParsersAction[ArgumentParser]) -> None:
     list_parser = marketplace_sub.add_parser("list", help="List marketplace offerings")
     list_parser.set_defaults(handler=_marketplace_list)
     _add_common_arguments(list_parser)
+
+    watch_parser = marketplace_sub.add_parser(
+        "watch", help="Stream provider marketplace events in real time"
+    )
+    watch_parser.add_argument("provider_id", help="Provider identifier (UUID)")
+    watch_parser.add_argument(
+        "--max-events",
+        dest="max_events",
+        type=int,
+        default=0,
+        help="Stop after emitting N events (0 = infinite)",
+    )
+    watch_parser.set_defaults(handler=_marketplace_watch)
+    _add_common_arguments(watch_parser)
+
+    submissions_parser = marketplace_sub.add_parser(
+        "submissions", help="Manage provider marketplace submissions"
+    )
+    submissions_sub = submissions_parser.add_subparsers(
+        dest="marketplace_submissions_cmd", required=True
+    )
+
+    submissions_list = submissions_sub.add_parser(
+        "list", help="List submissions and evaluation summaries for a provider"
+    )
+    submissions_list.add_argument("provider_id", help="Provider identifier (UUID)")
+    submissions_list.set_defaults(handler=_marketplace_submissions_list)
+    _add_common_arguments(submissions_list)
+
+    submissions_create = submissions_sub.add_parser(
+        "create", help="Create a new provider submission"
+    )
+    submissions_create.add_argument("provider_id", help="Provider identifier (UUID)")
+    submissions_create.add_argument(
+        "--tier", required=True, help="Marketplace tier for the submission"
+    )
+    submissions_create.add_argument(
+        "--manifest-uri",
+        required=True,
+        dest="manifest_uri",
+        help="Artifact manifest URI (e.g. registry path)",
+    )
+    submissions_create.add_argument(
+        "--artifact-digest", dest="artifact_digest", help="Optional manifest digest"
+    )
+    submissions_create.add_argument(
+        "--release-notes",
+        dest="release_notes",
+        help="Inline release notes to attach to the submission",
+    )
+    submissions_create.add_argument(
+        "--release-notes-file",
+        dest="release_notes_file",
+        help="Path to a file containing release notes",
+    )
+    submissions_create.add_argument(
+        "--metadata",
+        help="Additional submission metadata as JSON (e.g. {'git': {...}})",
+    )
+    submissions_create.set_defaults(handler=_marketplace_submissions_create)
+    _add_common_arguments(submissions_create)
+
+    evaluations_parser = marketplace_sub.add_parser(
+        "evaluations", help="Manage submission evaluation runs"
+    )
+    evaluations_sub = evaluations_parser.add_subparsers(
+        dest="marketplace_evaluations_cmd", required=True
+    )
+
+    evaluations_list = evaluations_sub.add_parser(
+        "list", help="List evaluations for a provider or specific submission"
+    )
+    evaluations_list.add_argument("provider_id", help="Provider identifier (UUID)")
+    evaluations_list.add_argument(
+        "--submission-id",
+        dest="submission_id",
+        help="Filter evaluations to a specific submission",
+    )
+    evaluations_list.set_defaults(handler=_marketplace_evaluations_list)
+    _add_common_arguments(evaluations_list)
+
+    evaluations_start = evaluations_sub.add_parser(
+        "start", help="Start a new evaluation run for a submission"
+    )
+    evaluations_start.add_argument("provider_id", help="Provider identifier (UUID)")
+    evaluations_start.add_argument("submission_id", help="Submission identifier (UUID)")
+    evaluations_start.add_argument(
+        "evaluation_type", help="Evaluation type identifier (e.g. security)"
+    )
+    evaluations_start.add_argument(
+        "--status", help="Optional evaluation status (defaults to running)"
+    )
+    evaluations_start.add_argument(
+        "--evaluator-ref",
+        dest="evaluator_ref",
+        help="Optional evaluator reference for audit trail",
+    )
+    evaluations_start.add_argument(
+        "--result", help="Optional JSON payload containing evaluation metadata"
+    )
+    evaluations_start.set_defaults(handler=_marketplace_evaluations_start)
+    _add_common_arguments(evaluations_start)
+
+    evaluations_transition = evaluations_sub.add_parser(
+        "transition", help="Transition an evaluation run"
+    )
+    evaluations_transition.add_argument("provider_id", help="Provider identifier (UUID)")
+    evaluations_transition.add_argument(
+        "evaluation_id", help="Evaluation identifier (UUID)"
+    )
+    evaluations_transition.add_argument(
+        "--status",
+        required=True,
+        help="New evaluation status (e.g. completed, failed)",
+    )
+    evaluations_transition.add_argument(
+        "--completed-at",
+        dest="completed_at",
+        help="Completion timestamp (RFC3339)",
+    )
+    evaluations_transition.add_argument(
+        "--result",
+        help="Optional JSON payload describing evaluation results",
+    )
+    evaluations_transition.set_defaults(handler=_marketplace_evaluations_transition)
+    _add_common_arguments(evaluations_transition)
+
+    promotions_parser = marketplace_sub.add_parser(
+        "promotions", help="Manage provider promotion gates"
+    )
+    promotions_sub = promotions_parser.add_subparsers(
+        dest="marketplace_promotions_cmd", required=True
+    )
+
+    promotions_create = promotions_sub.add_parser(
+        "create", help="Create a promotion gate for an evaluation"
+    )
+    promotions_create.add_argument("provider_id", help="Provider identifier (UUID)")
+    promotions_create.add_argument("evaluation_id", help="Evaluation identifier (UUID)")
+    promotions_create.add_argument("--gate", required=True, help="Promotion gate label")
+    promotions_create.add_argument(
+        "--status",
+        help="Initial promotion status (defaults to pending)",
+    )
+    promotions_create.add_argument(
+        "--note",
+        dest="notes",
+        action="append",
+        default=None,
+        help="Attach a review note (repeat for multiple)",
+    )
+    promotions_create.set_defaults(handler=_marketplace_promotions_create)
+    _add_common_arguments(promotions_create)
+
+    promotions_transition = promotions_sub.add_parser(
+        "transition", help="Transition a promotion gate"
+    )
+    promotions_transition.add_argument(
+        "provider_id", help="Provider identifier (UUID)"
+    )
+    promotions_transition.add_argument(
+        "promotion_id", help="Promotion identifier (UUID)"
+    )
+    promotions_transition.add_argument(
+        "--status", required=True, help="New promotion status (e.g. approved)"
+    )
+    promotions_transition.add_argument(
+        "--closed-at",
+        dest="closed_at",
+        help="Closure timestamp (RFC3339) for completed promotions",
+    )
+    promotions_transition.add_argument(
+        "--note",
+        dest="notes",
+        action="append",
+        default=None,
+        help="Replace promotion notes (repeat for multiple entries)",
+    )
+    promotions_transition.set_defaults(handler=_marketplace_promotions_transition)
+    _add_common_arguments(promotions_transition)
 
 
 def install_policy(subparsers: _SubParsersAction[ArgumentParser]) -> None:
@@ -233,6 +415,10 @@ def install_evaluations(subparsers: _SubParsersAction[ArgumentParser]) -> None:
     evaluations_commands.install(subparsers, _add_common_arguments)
 
 
+def install_vector_dbs(subparsers: _SubParsersAction[ArgumentParser]) -> None:
+    vector_db_commands.install(subparsers, _add_common_arguments)
+
+
 def install_scaffold(subparsers: _SubParsersAction[ArgumentParser]) -> None:
     parser = subparsers.add_parser("scaffold", help="Agent scaffolding helpers")
     scaffold_sub = parser.add_subparsers(dest="scaffold_cmd", required=True)
@@ -285,6 +471,332 @@ def _marketplace_list(client: APIClient, as_json: bool, _: Dict[str, object]) ->
             "status": item.get("status", item.get("state", "unknown")),
         })
     print(render_table(rows, columns))
+
+
+def _marketplace_submissions_list(
+    client: APIClient, as_json: bool, args: Dict[str, object]
+) -> None:
+    provider_id = args["provider_id"]
+    path = f"/api/marketplace/providers/{provider_id}/submissions"
+    payload = client.get(path)
+    if as_json:
+        print(dumps_json(payload))
+        return
+
+    rows = []
+    for entry in payload:
+        submission = entry.get("submission", {})
+        evaluations: Iterable[Dict[str, Any]] = entry.get("evaluations", [])
+        latest_eval = None
+        if evaluations:
+            latest_eval = evaluations[0].get("evaluation", {})
+        rows.append(
+            {
+                "submission": submission.get("id"),
+                "tier": submission.get("tier"),
+                "status": submission.get("status"),
+                "posture": _summarize_posture(submission),
+                "latest_eval": _summarize_evaluation(latest_eval),
+                "updated_at": submission.get("updated_at"),
+            }
+        )
+
+    columns = ["submission", "tier", "status", "posture", "latest_eval", "updated_at"]
+    print(render_table(rows, columns))
+
+
+def _marketplace_submissions_create(
+    client: APIClient, as_json: bool, args: Dict[str, object]
+) -> None:
+    provider_id = args["provider_id"]
+    metadata = _loads_optional_json(args.get("metadata"))
+    release_notes = _resolve_release_notes(
+        args.get("release_notes"), args.get("release_notes_file")
+    )
+    payload: Dict[str, Any] = {
+        "tier": args["tier"],
+        "manifest_uri": args["manifest_uri"],
+    }
+    if args.get("artifact_digest"):
+        payload["artifact_digest"] = args["artifact_digest"]
+    if release_notes:
+        payload["release_notes"] = release_notes
+    if metadata is not None:
+        payload["metadata"] = metadata
+
+    submission = client.post(
+        f"/api/marketplace/providers/{provider_id}/submissions",
+        json_body=payload,
+    )
+    if as_json:
+        print(dumps_json(submission))
+        return
+
+    message = (
+        f"Created submission {submission.get('id')} "
+        f"status={submission.get('status')} tier={submission.get('tier')}"
+    )
+    print(message)
+
+
+def _marketplace_evaluations_list(
+    client: APIClient, as_json: bool, args: Dict[str, object]
+) -> None:
+    provider_id = args["provider_id"]
+    submission_filter = args.get("submission_id")
+    payload = client.get(f"/api/marketplace/providers/{provider_id}/submissions")
+    evaluations_rows = []
+    for entry in payload:
+        submission = entry.get("submission", {})
+        submission_id = submission.get("id")
+        if submission_filter and submission_filter != submission_id:
+            continue
+        for evaluation_entry in entry.get("evaluations", []):
+            evaluation = evaluation_entry.get("evaluation", {})
+            promotions = evaluation_entry.get("promotions", [])
+            evaluations_rows.append(
+                {
+                    "submission": submission_id,
+                    "evaluation": evaluation.get("id"),
+                    "type": evaluation.get("evaluation_type"),
+                    "status": evaluation.get("status"),
+                    "posture": _summarize_posture(evaluation),
+                    "promotions": ",".join(
+                        filter(None, (promo.get("status") for promo in promotions))
+                    ),
+                    "updated_at": evaluation.get("updated_at"),
+                }
+            )
+
+    if as_json:
+        print(dumps_json(evaluations_rows))
+        return
+
+    columns = [
+        "submission",
+        "evaluation",
+        "type",
+        "status",
+        "posture",
+        "promotions",
+        "updated_at",
+    ]
+    print(render_table(evaluations_rows, columns))
+
+
+def _marketplace_evaluations_start(
+    client: APIClient, as_json: bool, args: Dict[str, object]
+) -> None:
+    provider_id = args["provider_id"]
+    submission_id = args["submission_id"]
+    payload: Dict[str, Any] = {
+        "evaluation_type": args["evaluation_type"],
+    }
+    if args.get("status"):
+        payload["status"] = args["status"]
+    if args.get("evaluator_ref"):
+        payload["evaluator_ref"] = args["evaluator_ref"]
+    if args.get("result"):
+        payload["result"] = _loads_json(args["result"])
+
+    evaluation = client.post(
+        f"/api/marketplace/providers/{provider_id}/submissions/{submission_id}/evaluations",
+        json_body=payload,
+    )
+    if as_json:
+        print(dumps_json(evaluation))
+        return
+    print(
+        f"Started evaluation {evaluation.get('id')} "
+        f"status={evaluation.get('status')} type={evaluation.get('evaluation_type')}"
+    )
+
+
+def _marketplace_evaluations_transition(
+    client: APIClient, as_json: bool, args: Dict[str, object]
+) -> None:
+    provider_id = args["provider_id"]
+    evaluation_id = args["evaluation_id"]
+    payload: Dict[str, Any] = {"status": args["status"]}
+    if args.get("completed_at"):
+        payload["completed_at"] = args["completed_at"]
+    if args.get("result"):
+        payload["result"] = _loads_json(args["result"])
+
+    evaluation = client.post(
+        f"/api/marketplace/providers/{provider_id}/evaluations/{evaluation_id}/transition",
+        json_body=payload,
+    )
+    if as_json:
+        print(dumps_json(evaluation))
+        return
+    print(
+        f"Transitioned evaluation {evaluation.get('id')} "
+        f"status={evaluation.get('status')}"
+    )
+
+
+def _marketplace_promotions_create(
+    client: APIClient, as_json: bool, args: Dict[str, object]
+) -> None:
+    provider_id = args["provider_id"]
+    evaluation_id = args["evaluation_id"]
+    payload: Dict[str, Any] = {"gate": args["gate"]}
+    if args.get("status"):
+        payload["status"] = args["status"]
+    notes = _normalize_notes(args.get("notes"))
+    if notes is not None:
+        payload["notes"] = notes
+
+    promotion = client.post(
+        f"/api/marketplace/providers/{provider_id}/evaluations/{evaluation_id}/promotions",
+        json_body=payload,
+    )
+    if as_json:
+        print(dumps_json(promotion))
+        return
+
+    print(
+        f"Created promotion {promotion.get('id')} "
+        f"gate={promotion.get('gate')} status={promotion.get('status')}"
+    )
+
+
+def _marketplace_promotions_transition(
+    client: APIClient, as_json: bool, args: Dict[str, object]
+) -> None:
+    provider_id = args["provider_id"]
+    promotion_id = args["promotion_id"]
+    payload: Dict[str, Any] = {"status": args["status"]}
+    if args.get("closed_at"):
+        payload["closed_at"] = args["closed_at"]
+    notes = _normalize_notes(args.get("notes"))
+    if notes is not None:
+        payload["notes"] = notes
+
+    promotion = client.post(
+        f"/api/marketplace/providers/{provider_id}/promotions/{promotion_id}/transition",
+        json_body=payload,
+    )
+    if as_json:
+        print(dumps_json(promotion))
+        return
+
+    print(
+        f"Transitioned promotion {promotion.get('id')} "
+        f"status={promotion.get('status')}"
+    )
+
+
+def _marketplace_watch(client: APIClient, as_json: bool, args: Dict[str, object]) -> None:
+    provider_id = args["provider_id"]
+    max_events = int(args.get("max_events") or 0)
+    stream_path = f"/api/marketplace/providers/{provider_id}/events/stream"
+    count = 0
+    try:
+        for raw_line in client.stream_sse(stream_path):
+            if as_json:
+                print(raw_line)
+            else:
+                print(_summarize_marketplace_event(raw_line))
+            count += 1
+            if max_events and count >= max_events:
+                break
+    except KeyboardInterrupt:  # pragma: no cover - user interruption
+        pass
+
+
+def _summarize_marketplace_event(raw_line: str) -> str:
+    try:
+        event = json.loads(raw_line)
+    except json.JSONDecodeError:
+        return raw_line
+
+    event_type = event.get("event_type", "event")
+    occurred_at = event.get("occurred_at", "?")
+    submission = event.get("submission_id")
+    evaluation = event.get("evaluation_id")
+    promotion = event.get("promotion_id")
+    payload = event.get("payload", {}) if isinstance(event.get("payload"), dict) else {}
+    status = payload.get("status") or payload.get("state")
+    pieces = [f"[{occurred_at}]", event_type]
+    if submission:
+        pieces.append(f"submission={submission}")
+    if evaluation:
+        pieces.append(f"evaluation={evaluation}")
+    if promotion:
+        pieces.append(f"promotion={promotion}")
+    if status:
+        pieces.append(f"status={status}")
+    actor = event.get("actor_ref")
+    if actor:
+        pieces.append(f"actor={actor}")
+    notes = payload.get("notes")
+    if isinstance(notes, list) and notes:
+        pieces.append(f"notes={len(notes)}")
+    return " ".join(pieces)
+
+
+def _summarize_posture(record: Dict[str, Any]) -> str:
+    if record.get("posture_vetoed"):
+        return "vetoed"
+    notes = record.get("posture_notes") or []
+    if notes:
+        return f"notes:{len(notes)}"
+    return "clear"
+
+
+def _summarize_evaluation(record: Dict[str, Any] | None) -> str:
+    if not record:
+        return "—"
+    status = record.get("status", "unknown")
+    eval_type = record.get("evaluation_type", "?")
+    return f"{eval_type}:{status}"
+
+
+def _loads_optional_json(value: object) -> Dict[str, Any] | list[Any] | None:
+    if not value:
+        return None
+    return _loads_json(value)
+
+
+def _loads_json(value: object) -> Any:
+    if value is None:
+        raise ValueError("JSON payload cannot be None")
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:  # pragma: no cover - defensive path
+            raise ValueError(f"Invalid JSON payload: {exc}") from exc
+    raise ValueError("Unsupported JSON payload type")
+
+
+def _resolve_release_notes(text: object, file_path: object) -> str | None:
+    if file_path:
+        path = Path(str(file_path))
+        content = path.read_text(encoding="utf-8").strip()
+        if not content:
+            raise ValueError("Release notes file is empty")
+        return content
+    if text:
+        return str(text)
+    return None
+
+
+def _normalize_notes(value: object) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        notes = [str(entry).strip() for entry in value if str(entry).strip()]
+        return notes if notes else None
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return [cleaned] if cleaned else None
+    raise ValueError(
+        "Notes must be provided as repeated --note arguments or string values"
+    )
 
 
 def _promotions_list_tracks(client: APIClient, as_json: bool, _: Dict[str, object]) -> None:

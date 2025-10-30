@@ -16,9 +16,20 @@ The editable install exposes the `mcpctl` console entry point. Authentication de
 
 ```bash
 mcpctl marketplace list
+mcpctl marketplace submissions list PROVIDER_ID [--json]
+mcpctl marketplace submissions create PROVIDER_ID --tier TIER --manifest-uri URI [options]
+mcpctl marketplace evaluations list PROVIDER_ID [--submission-id UUID]
+mcpctl marketplace evaluations start PROVIDER_ID SUBMISSION_ID EVALUATION_TYPE [options]
+mcpctl marketplace evaluations transition PROVIDER_ID EVALUATION_ID --status STATUS [options]
+mcpctl marketplace promotions create PROVIDER_ID EVALUATION_ID --gate NAME [options]
+mcpctl marketplace promotions transition PROVIDER_ID PROMOTION_ID --status STATUS [options]
+mcpctl marketplace watch PROVIDER_ID [--max-events N]
 ```
 
-Lists marketplace artifacts and their active status. Pass `--json` to receive raw JSON responses.
+Use `marketplace submissions create` to push manifests (optionally attaching release notes or metadata),
+`marketplace evaluations` commands to monitor or transition evaluation runs, and `marketplace promotions`
+commands to open or progress promotion gates tied to an evaluation. The `marketplace watch` command streams
+SSE marketplace events for headless providers that need real-time visibility.
 
 ### Promotions
 
@@ -59,9 +70,14 @@ Lists marketplace artifacts and their active status. Pass `--json` to receive ra
 ### Billing and subscriptions
 
 * `mcpctl billing plans [--json]` – list active billing plans, including code, billing period, and pricing metadata. Operators can resolve plan identifiers prior to provisioning tenants.
-* `mcpctl billing subscription ORGANIZATION_ID [--json]` – inspect the active subscription envelope for an organization (plan, status, current period end).
+* `mcpctl billing subscription ORGANIZATION_ID [--json]` – inspect the active subscription envelope for an organization (plan, status, current period end). 
 * `mcpctl billing assign ORGANIZATION_ID (--plan-id UUID | --plan-code CODE) [--status STATE] [--trial-ends RFC3339] [--json]` – bootstrap or update an organization subscription.
 * `mcpctl billing quota ORGANIZATION_ID --entitlement KEY [--quantity N] [--record] [--json]` – evaluate (and optionally record) entitlement usage. Output includes limits, usage, remaining capacity, and outcome notes that mirror runtime policy annotations.
+
+### Vector DB governance
+
+* `mcpctl vector-dbs attachments detach VECTOR_DB_ID ATTACHMENT_ID [--reason TEXT]` – detach a managed workload or binding from a federated vector DB while persisting the operator-supplied reason.
+* `mcpctl vector-dbs incidents resolve VECTOR_DB_ID INCIDENT_ID [--summary TEXT] [--notes JSON]` – mark compliance incidents as resolved with optional summaries and structured resolution notes, mirroring the new API surface.
 
 ### Policy insights
 

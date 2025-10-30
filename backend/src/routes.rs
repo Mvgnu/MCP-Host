@@ -12,7 +12,7 @@ use crate::{
 
 pub fn api_routes() -> Router {
     Router::new()
-        .route("/api/marketplace", get(marketplace::list_marketplace))
+        .merge(marketplace::routes())
         .route(
             "/api/console/lifecycle",
             get(lifecycle_console::list_snapshots),
@@ -26,6 +26,10 @@ pub fn api_routes() -> Router {
         .route("/api/logout", post(auth::logout_user))
         .route("/api/me", get(auth::current_user))
         .route("/api/webhooks/billing", post(webhooks::billing_webhook))
+        .route(
+            "/api/billing/catalog",
+            get(billing::billing_list_plan_catalog),
+        )
         .route("/api/billing/plans", get(billing::billing_list_plans))
         .route(
             "/api/billing/organizations/:organization_id/subscription",
@@ -107,6 +111,28 @@ pub fn api_routes() -> Router {
             get(vector_dbs::list_vector_dbs).post(vector_dbs::create_vector_db),
         )
         .route("/api/vector-dbs/:id", delete(vector_dbs::delete_vector_db))
+        .route(
+            "/api/vector-dbs/:id/residency-policies",
+            get(vector_dbs::list_vector_db_residency_policies)
+                .post(vector_dbs::upsert_vector_db_residency_policy),
+        )
+        .route(
+            "/api/vector-dbs/:id/attachments",
+            get(vector_dbs::list_vector_db_attachments)
+                .post(vector_dbs::create_vector_db_attachment),
+        )
+        .route(
+            "/api/vector-dbs/:id/attachments/:attachment_id",
+            patch(vector_dbs::detach_vector_db_attachment),
+        )
+        .route(
+            "/api/vector-dbs/:id/incidents",
+            get(vector_dbs::list_vector_db_incidents).post(vector_dbs::log_vector_db_incident),
+        )
+        .route(
+            "/api/vector-dbs/:id/incidents/:incident_id",
+            patch(vector_dbs::resolve_vector_db_incident),
+        )
         .route(
             "/api/ingestion-jobs",
             get(ingestion::list_jobs).post(ingestion::create_job),
