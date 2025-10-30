@@ -1,45 +1,70 @@
-# Commercialization Foundations
+# SaaS Commercialization Overview
 
-`key: commercialization-doc -> billing,subscriptions`
+This document captures the technical design for commercializing the MCP Host platform, spanning billing, onboarding, and provider marketplace surfaces. The goal is to expose self-service paths while preserving compliance, auditability, and runtime policy integrity.
 
-## Objectives
+## Self-service onboarding portal
 
-- Provide a minimal-yet-complete SaaS onboarding loop: define plans, attach subscriptions to organizations, and expose entitlement checks to runtime policy.
-- Keep telemetry surface area narrow by recording only entitlement usage windows required for compliance.
-- Support pluggable billing providers while defaulting to a stub adapter for offline development.
+The public `/onboarding` funnel layers on top of the billing and organizations APIs so new administrators can self-serve the commercialization loop:
 
-## Data Model
-
-Migration `0044_billing_foundations.sql` introduces four core tables:
-
-| Table | Purpose |
-| --- | --- |
-| `billing_plans` | Catalog of sellable plans (code, price, billing period, active flag). |
-| `billing_plan_entitlements` | Per-plan entitlements with optional quantity limits and reset cadence. |
-| `organization_subscriptions` | Active subscription metadata for each organization, including trial windows and current period boundaries. |
-| `subscription_usage_ledger` | Aggregated entitlement consumption per subscription + window (daily/weekly/monthly) to support quota checks and audit exports. |
-
-## Service Layer
-
-`BillingService` centralizes subscription lifecycle, quota enforcement, and usage ledger upserts. Highlights:
-
-- `active_subscription` fetches the latest subscription + plan for runtime policy, returning `None` when status is not `active`/`trialing` or the period expired.
-- `enforce_quota` evaluates requested usage against plan entitlements, returning a structured `BillingQuotaOutcome` with `billing:*` notes for downstream UX. When `record_usage` is true, the ledger increments atomically within the entitlement window.
-- `upsert_subscription` seeds bootstrap flows while preserving optimistic locking via the subscription ID.
-
-## API Surface
-
-Handlers in `backend/src/billing/api.rs` expose:
-
-- `GET /api/billing/plans` for plan discovery.
-- `GET/POST /api/billing/organizations/:id/subscription` for onboarding and plan changes.
-- `POST /api/billing/organizations/:id/quotas/check` to evaluate entitlements (optionally recording usage).
-
-CLI parity arrives via `mcpctl billing ...` commands so operators can bootstrap tenants, inspect plan posture, and sanity-check quotas without touching SQL.
+- Registration calls `/api/register` and `/api/login` to establish an authenticated session.
+- Organization provisioning posts to `/api/orgs` before fetching `/api/billing/catalog` for plan comparison.
+- Plan selection writes through `/api/billing/organizations/:id/subscription` with optional trial windows.
+- Teammate invites post to `/api/orgs/:id/invitations` and can be redeemed via `/api/orgs/invitations/:token/accept`.
+- Invitees launch `/onboarding/invite/[token]`, where the `AcceptInvitation` component guides registration or sign-in before invoking the acceptance API and surfacing success state.
 
 ## Policy Integration
 
 Runtime policy now calls `BillingService::enforce_quota` when computing placement decisions. Failures produce `billing:subscription-missing`, `billing:quota-exceeded:*`, or `billing:error:*` notes and flip `evaluation_required`/`governance_required` flags to block launches until entitlements are restored.
+
+## Subscription Lifecycle Diagrams
+
+```mermaid
+flowchart LR
+    subgraph Provisioning
+        P0[Plan selected] --> P1[BillingService::upsert_subscription]
+        P1 --> P2{Trial?}
+        P2 -- yes --> P3[Set trial_ends_at]
+        P2 -- no --> P4[Mark active]
+        P3 --> P5[Emit billing:onboarding note]
+        P4 --> P5
+        P5 --> P6[Expose via /api/billing/organizations/:id/subscription]
+    end
+```
+
+```mermaid
+flowchart TD
+    subgraph Renewal
+        R0[Usage reconciled] --> R1[subscription_usage_ledger update]
+        R1 --> R2[Evaluate BillingQuotaOutcome]
+        R2 --> R3{Past due?}
+        R3 -- yes --> R4[BillingService::mark_subscription_overdue]
+        R3 -- no --> R5[Maintain active status]
+        R4 --> R6[Emit billing:quota-exceeded:* notes]
+        R5 --> R7[Emit billing:quota:* notes]
+        R6 --> R8[Runtime policy gates launches]
+        R7 --> R8
+    end
+```
+
+```mermaid
+flowchart LR
+    subgraph Cancellation
+        C0[Operator/Provider request] --> C1[BillingService::suspend_subscription]
+        C1 --> C2{Downgrade plan?}
+        C2 -- yes --> C3[Apply fallback plan]
+        C2 -- no --> C4[Set status canceled]
+        C3 --> C5[Reset current_period_start]
+        C4 --> C5
+        C5 --> C6[Publish billing:cancellation note]
+        C6 --> C7[Console wizard + CLI reflect new posture]
+    end
+```
+
+These diagrams mirror the console onboarding wizard and CLI contracts so operators can trace plan changes from provisioning through suspension without combing through raw SQL joins.
+
+## Renewal Automation
+
+`backend/src/billing/scheduler.rs` (`key: billing-renewal-scheduler -> automate overdue handling`) drives a lightweight renewal worker that replaces placeholder provider callbacks. The job runs every `BILLING_RENEWAL_SCAN_INTERVAL_SECS` seconds (default: 300), marks active/trialing subscriptions `past_due` once their computed renewal window or trial end elapses, and enforces a grace window controlled by `BILLING_PAST_DUE_GRACE_DAYS` (default: 3). When the grace window expires the worker downgrades organizations to the optional fallback plan specified by `BILLING_FALLBACK_PLAN_CODE`; if no fallback is configured it suspends the subscription in-place. SQLx-backed coverage in `backend/tests/billing_scheduler.rs` validates overdue detection, fallback downgrades, and suspension flows end-to-end so the automation can graduate alongside the provider integrations.
 
 ## Provider Integration
 

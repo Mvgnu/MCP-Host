@@ -1,11 +1,13 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, TimeZone, Timelike, Utc};
 use sqlx::{PgPool, Row};
+use std::collections::HashMap;
 use uuid::Uuid;
 
+use super::adapters::UsageReconciliationRecord;
 use super::models::{
-    BillingPlan, BillingQuotaOutcome, OrganizationSubscription, PlanEntitlement,
-    SubscriptionUsageWindow,
+    BillingPlan, BillingPlanCatalogEntry, BillingQuotaOutcome, OrganizationSubscription,
+    PlanEntitlement, SubscriptionUsageWindow,
 };
 
 /// key: billing-service -> subscription lifecycle
@@ -17,6 +19,42 @@ pub struct BillingService {
 impl BillingService {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    pub async fn plan_catalog(&self) -> Result<Vec<BillingPlanCatalogEntry>> {
+        let plans = sqlx::query_as::<_, BillingPlan>(
+            "SELECT * FROM billing_plans WHERE active = TRUE ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let plan_ids: Vec<Uuid> = plans.iter().map(|plan| plan.id).collect();
+        let mut entitlements_by_plan: HashMap<Uuid, Vec<PlanEntitlement>> = HashMap::new();
+        if !plan_ids.is_empty() {
+            let entitlements = sqlx::query_as::<_, PlanEntitlement>(
+                "SELECT * FROM billing_plan_entitlements WHERE plan_id = ANY($1)
+                 ORDER BY plan_id ASC, entitlement_key ASC",
+            )
+            .bind(&plan_ids)
+            .fetch_all(&self.pool)
+            .await?;
+
+            for entitlement in entitlements {
+                entitlements_by_plan
+                    .entry(entitlement.plan_id)
+                    .or_default()
+                    .push(entitlement);
+            }
+        }
+
+        let mut catalog = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let mut entitlements = entitlements_by_plan.remove(&plan.id).unwrap_or_default();
+            entitlements.sort_by(|a, b| a.entitlement_key.cmp(&b.entitlement_key));
+            catalog.push(BillingPlanCatalogEntry { plan, entitlements });
+        }
+
+        Ok(catalog)
     }
 
     pub async fn active_subscription(
@@ -265,6 +303,131 @@ impl BillingService {
         Ok(row)
     }
 
+    pub async fn settle_usage(
+        &self,
+        organization_id: i32,
+        record: UsageReconciliationRecord,
+    ) -> Result<SubscriptionUsageWindow> {
+        if record.quantity < 0 {
+            return Err(anyhow!("usage quantity must be non-negative"));
+        }
+
+        let Some(subscription) = self
+            .latest_subscription_by_id(record.subscription_id)
+            .await?
+        else {
+            return Err(anyhow!(
+                "subscription {} missing for usage reconciliation",
+                record.subscription_id
+            ));
+        };
+
+        if subscription.organization_id != organization_id {
+            return Err(anyhow!("usage subscription organization mismatch"));
+        }
+
+        self.record_usage(
+            subscription.id,
+            &record.entitlement_key,
+            record.window_start,
+            record.window_end,
+            record.quantity,
+        )
+        .await
+    }
+
+    pub async fn mark_subscription_overdue(
+        &self,
+        organization_id: i32,
+    ) -> Result<Option<OrganizationSubscription>> {
+        let Some(subscription) = self.latest_subscription(organization_id).await? else {
+            return Ok(None);
+        };
+
+        let record = sqlx::query_as::<_, OrganizationSubscription>(
+            r#"
+            UPDATE organization_subscriptions
+            SET status = 'past_due', updated_at = NOW()
+            WHERE id = $1
+            RETURNING *
+            "#,
+        )
+        .bind(subscription.id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(record)
+    }
+
+    pub async fn suspend_subscription(
+        &self,
+        organization_id: i32,
+    ) -> Result<Option<OrganizationSubscription>> {
+        let Some(subscription) = self.latest_subscription(organization_id).await? else {
+            return Ok(None);
+        };
+
+        let record = sqlx::query_as::<_, OrganizationSubscription>(
+            r#"
+            UPDATE organization_subscriptions
+            SET status = 'suspended', current_period_end = NOW(), updated_at = NOW()
+            WHERE id = $1
+            RETURNING *
+            "#,
+        )
+        .bind(subscription.id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(record)
+    }
+
+    pub async fn downgrade_subscription(
+        &self,
+        organization_id: i32,
+        plan_code: &str,
+    ) -> Result<Option<OrganizationSubscription>> {
+        let plan = sqlx::query_as::<_, BillingPlan>(
+            r#"
+            SELECT * FROM billing_plans
+            WHERE code = $1 AND active = TRUE
+            ORDER BY created_at ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(plan_code)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(plan) = plan else {
+            return Err(anyhow!("billing plan {plan_code} not found"));
+        };
+
+        let Some(subscription) = self.latest_subscription(organization_id).await? else {
+            return Ok(None);
+        };
+
+        let record = sqlx::query_as::<_, OrganizationSubscription>(
+            r#"
+            UPDATE organization_subscriptions
+            SET
+                plan_id = $1,
+                status = 'active',
+                current_period_start = NOW(),
+                current_period_end = NULL,
+                updated_at = NOW()
+            WHERE id = $2
+            RETURNING *
+            "#,
+        )
+        .bind(plan.id)
+        .bind(subscription.id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(record)
+    }
+
     async fn plan_entitlement(
         &self,
         plan_id: Uuid,
@@ -300,6 +463,37 @@ impl BillingService {
         .bind(entitlement_key)
         .bind(window_start)
         .bind(window_end)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
+    async fn latest_subscription(
+        &self,
+        organization_id: i32,
+    ) -> Result<Option<OrganizationSubscription>> {
+        let record = sqlx::query_as::<_, OrganizationSubscription>(
+            r#"
+            SELECT * FROM organization_subscriptions
+            WHERE organization_id = $1
+            ORDER BY updated_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(organization_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
+    async fn latest_subscription_by_id(
+        &self,
+        subscription_id: Uuid,
+    ) -> Result<Option<OrganizationSubscription>> {
+        let record = sqlx::query_as::<_, OrganizationSubscription>(
+            "SELECT * FROM organization_subscriptions WHERE id = $1",
+        )
+        .bind(subscription_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(record)

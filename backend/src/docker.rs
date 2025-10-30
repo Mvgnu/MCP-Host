@@ -2,11 +2,11 @@ use crate::capabilities;
 use crate::policy::{PolicyDecision, RuntimeBackend};
 use crate::proxy;
 use crate::servers::{add_metric, set_status};
-use bollard::container::{
-    Config as ContainerConfig, CreateContainerOptions, RemoveContainerOptions,
-    StartContainerOptions, StopContainerOptions,
+use bollard::models::{ContainerCreateBody, HostConfig};
+use bollard::query_parameters::{
+    CreateContainerOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
+    StopContainerOptionsBuilder,
 };
-use bollard::models::HostConfig;
 use bollard::Docker;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -83,15 +83,15 @@ pub fn spawn_server_task(
         };
         let name = format!("mcp-server-{server_id}");
         let _ = docker
-            .stop_container(&name, Some(StopContainerOptions { t: 5 }))
+            .stop_container(
+                &name,
+                Some(StopContainerOptionsBuilder::default().t(5).build()),
+            )
             .await;
         let _ = docker
             .remove_container(
                 &name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
             )
             .await;
 
@@ -161,10 +161,7 @@ pub fn spawn_server_task(
             }
         }
 
-        let create_opts = CreateContainerOptions {
-            name: &name,
-            platform: None,
-        };
+        let create_opts = CreateContainerOptionsBuilder::default().name(&name).build();
         let mut host_cfg = HostConfig {
             auto_remove: Some(true),
             ..Default::default()
@@ -177,7 +174,7 @@ pub fn spawn_server_task(
                 ..Default::default()
             }]);
         }
-        let container_cfg = ContainerConfig::<String> {
+        let container_cfg = ContainerCreateBody {
             image: Some(image.clone()),
             host_config: Some(host_cfg),
             env: Some(build_env_vars(&api_key, config.as_ref())),
@@ -189,7 +186,10 @@ pub fn spawn_server_task(
         {
             Ok(info) => {
                 if docker
-                    .start_container(&info.id, None::<StartContainerOptions<String>>)
+                    .start_container(
+                        &info.id,
+                        None::<bollard::query_parameters::StartContainerOptions>,
+                    )
                     .await
                     .is_ok()
                 {
@@ -233,7 +233,10 @@ pub fn stop_server_task(server_id: i32, pool: PgPool) {
 
         let name = format!("mcp-server-{server_id}");
         let _ = docker
-            .stop_container(&name, Some(StopContainerOptions { t: 5 }))
+            .stop_container(
+                &name,
+                Some(StopContainerOptionsBuilder::default().t(5).build()),
+            )
             .await;
 
         set_status_with_context(&pool, server_id, "stopped", "container stopped").await;
@@ -257,15 +260,15 @@ pub fn delete_server_task(server_id: i32, pool: PgPool) {
 
         let name = format!("mcp-server-{server_id}");
         let _ = docker
-            .stop_container(&name, Some(StopContainerOptions { t: 5 }))
+            .stop_container(
+                &name,
+                Some(StopContainerOptionsBuilder::default().t(5).build()),
+            )
             .await;
         let _ = docker
             .remove_container(
                 &name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
             )
             .await;
 
@@ -295,25 +298,19 @@ pub fn spawn_vector_db_task(id: i32, db_type: String, pool: PgPool) {
         let _ = docker
             .remove_container(
                 &name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
             )
             .await;
         let image = match db_type.as_str() {
             "chroma" => "ghcr.io/chroma-core/chroma:latest",
             _ => "ghcr.io/chroma-core/chroma:latest",
         };
-        let create_opts = CreateContainerOptions {
-            name: &name,
-            platform: None,
-        };
+        let create_opts = CreateContainerOptionsBuilder::default().name(&name).build();
         let host_cfg = HostConfig {
             auto_remove: Some(true),
             ..Default::default()
         };
-        let container_cfg = ContainerConfig::<String> {
+        let container_cfg = ContainerCreateBody {
             image: Some(image.into()),
             host_config: Some(host_cfg),
             ..Default::default()
@@ -324,7 +321,10 @@ pub fn spawn_vector_db_task(id: i32, db_type: String, pool: PgPool) {
         {
             Ok(info) => {
                 if docker
-                    .start_container(&info.id, None::<StartContainerOptions<String>>)
+                    .start_container(
+                        &info.id,
+                        None::<bollard::query_parameters::StartContainerOptions>,
+                    )
                     .await
                     .is_ok()
                 {
@@ -361,10 +361,7 @@ pub fn delete_vector_db_task(id: i32, pool: PgPool) {
         let _ = docker
             .remove_container(
                 &name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
             )
             .await;
         let _ = sqlx::query("DELETE FROM vector_dbs WHERE id = $1")
@@ -377,21 +374,21 @@ pub fn delete_vector_db_task(id: i32, pool: PgPool) {
 
 /// Fetch the latest logs for a container.
 pub async fn fetch_logs(server_id: i32) -> Result<String, bollard::errors::Error> {
-    use bollard::container::LogsOptions;
     use futures_util::StreamExt;
 
     let docker = Docker::connect_with_local_defaults()?;
     let name = format!("mcp-server-{server_id}");
     let mut stream = docker.logs(
         &name,
-        Some(LogsOptions::<String> {
-            stdout: true,
-            stderr: true,
-            follow: false,
-            timestamps: false,
-            tail: "100".into(),
-            ..Default::default()
-        }),
+        Some(
+            LogsOptionsBuilder::default()
+                .stdout(true)
+                .stderr(true)
+                .follow(false)
+                .timestamps(false)
+                .tail("100")
+                .build(),
+        ),
     );
 
     let mut out = String::new();
@@ -415,19 +412,19 @@ pub fn stream_logs_task(server_id: i32, pool: PgPool) -> Option<Receiver<String>
     };
 
     tokio::spawn(async move {
-        use bollard::container::LogsOptions;
         use futures_util::StreamExt;
 
         let mut stream = docker.logs(
             &format!("mcp-server-{server_id}"),
-            Some(LogsOptions::<String> {
-                stdout: true,
-                stderr: true,
-                follow: true,
-                timestamps: false,
-                tail: "0".into(),
-                ..Default::default()
-            }),
+            Some(
+                LogsOptionsBuilder::default()
+                    .stdout(true)
+                    .stderr(true)
+                    .follow(true)
+                    .timestamps(false)
+                    .tail("0")
+                    .build(),
+            ),
         );
 
         while let Some(item) = stream.next().await {

@@ -84,6 +84,28 @@ pub static ALLOW_MIGRATION_FAILURE: Lazy<bool> = Lazy::new(|| {
         .unwrap_or(false)
 });
 
+/// key: billing-config -> renewal scan cadence
+pub static BILLING_RENEWAL_SCAN_INTERVAL_SECS: Lazy<u64> = Lazy::new(|| {
+    std::env::var("BILLING_RENEWAL_SCAN_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(300)
+});
+
+/// key: billing-config -> grace window before suspension/downgrade
+pub static BILLING_PAST_DUE_GRACE_DAYS: Lazy<i64> = Lazy::new(|| {
+    std::env::var("BILLING_PAST_DUE_GRACE_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(3)
+});
+
+/// key: billing-config -> optional fallback plan code for automatic downgrades
+pub static BILLING_FALLBACK_PLAN_CODE: Lazy<Option<String>> =
+    Lazy::new(|| read_optional_env("BILLING_FALLBACK_PLAN_CODE"));
+
 /// Base URL used to contact the confidential VM hypervisor control plane.
 pub static VM_HYPERVISOR_ENDPOINT: Lazy<String> = Lazy::new(|| {
     std::env::var("VM_HYPERVISOR_ENDPOINT")
